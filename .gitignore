@@ -6,9 +6,8 @@ Cargo.lock.orig
 # macOS
 .DS_Store
 
-# Large baked assets (keep small samples in-repo; bake big ones locally)
-/assets/processed/*.bin
-/assets/processed/*.postcard
+# Large baked assets (regenerable via data-pipeline / batch)
+/crates/app-interactive/assets/processed/
 
 # Raw data snapshots are large; keep the provenance manifest, ignore the payloads
 /data/snapshots/**/*.csv

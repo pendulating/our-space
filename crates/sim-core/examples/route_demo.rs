@@ -18,12 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let proj = EnuProjection::default();
-    let graph_path = std::env::var("GRAPH")
-        .unwrap_or_else(|_| "assets/processed/graph_manhattan.postcard".to_string());
+    let base = "crates/app-interactive/assets/processed";
+    let graph_path = std::env::var("GRAPH").unwrap_or_else(|_| format!("{base}/graph_manhattan.osgraph"));
     let graph = StreetGraph::from_asset(GraphAsset::from_bytes(&std::fs::read(&graph_path)?)?);
-    let layer = FixedSensorLayer::from_bytes(&std::fs::read(
-        "assets/processed/cameras_fixed.postcard",
-    )?)?;
+    let layer = FixedSensorLayer::from_bytes(&std::fs::read(format!("{base}/cameras_fixed.oscam"))?)?;
 
     let recall = layer.recall.unwrap_or(1.0);
     let sensors = sensors_from_layer(&layer, FixedCameraDefaults::default());
@@ -35,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Departure hour from env (default 5pm) and the mobile classes on at defaults.
     let departure_hour: f64 = std::env::var("HOUR").ok().and_then(|s| s.parse().ok()).unwrap_or(17.0);
     let mut mobile = MobileScenario::fields_only(); // dashcam + glasses
-    if let Ok(bytes) = std::fs::read("assets/processed/ace_corridors.postcard") {
+    if let Ok(bytes) = std::fs::read(format!("{base}/ace_corridors.osace")) {
         if let Ok(ace) = AceCorridorLayer::from_bytes(&bytes) {
             let segs = ace
                 .segments

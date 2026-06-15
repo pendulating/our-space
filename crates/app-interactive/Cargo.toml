@@ -7,15 +7,40 @@ license.workspace = true
 description = "Interactive single-route our-space app (native window for dev; WebGPU WASM for the public build)."
 
 [dependencies]
-sim-core = { workspace = true, features = ["ecs"] }
-# Declared directly (not via workspace) so we get Bevy's default desktop feature
-# set; the wasm build will swap to a curated feature set in Phase 4.
-bevy = "0.18"
+sim-core = { workspace = true }
 bevy_egui = { workspace = true }
 bevy_prototype_lyon = { workspace = true }
-bevy_ecs_tilemap = { workspace = true }
-leafwing-input-manager = { workspace = true }
 earcutr = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+anyhow = { workspace = true }
 
+# Base Bevy feature set, shared by native + web. Declared in [dependencies] (not
+# only in target tables) so Bevy's derive macros resolve crate paths correctly.
+# Cargo unions these with the per-target features below.
+[dependencies.bevy]
+version = "0.18"
+default-features = false
+features = [
+    "std",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_sprite",
+    "bevy_color",
+    "bevy_asset",
+    "bevy_log",
+    "async_executor",
+]
+
+# Native extras (desktop windowing + parallelism). x11/wayland are Linux-only and
+# harmless elsewhere; the native backend (Metal/Vulkan/DX) is auto-selected.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.18", features = ["x11", "wayland", "multi_threaded"] }
+
+# Web: WebGPU backend + wasm glue.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# wasm interop bridge wired up in Phase 4.
+bevy = { version = "0.18", features = ["webgpu", "web"] }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"

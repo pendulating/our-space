@@ -17,9 +17,11 @@ use sim_core::{
     SensorInstance, Vec2 as Enu,
 };
 
-const GRAPH_PATH: &str = "assets/processed/graph_manhattan.postcard";
-const CAMERAS_PATH: &str = "assets/processed/cameras_fixed.postcard";
-const ACE_PATH: &str = "assets/processed/ace_corridors.postcard";
+// Canonical asset location is the app crate's `assets/` (Bevy's asset root);
+// run batch from the workspace root.
+const GRAPH_PATH: &str = "crates/app-interactive/assets/processed/graph_manhattan.osgraph";
+const CAMERAS_PATH: &str = "crates/app-interactive/assets/processed/cameras_fixed.oscam";
+const ACE_PATH: &str = "crates/app-interactive/assets/processed/ace_corridors.osace";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

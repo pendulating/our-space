@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>our-space — NYC sensing exposure</title>
+  <meta name="description" content="An interactive, honest estimate of how many cameras and sensing devices could capture you on a walk through Manhattan." />
+  <style>
+    :root { --bg: #0d0f14; --panel: #161a22; --fg: #e6e8ee; --muted: #9aa3b2; --accent: #ffaa5a; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { display: flex; flex-direction: column; height: 100%; }
+    header { padding: 10px 16px; border-bottom: 1px solid #232838; }
+    header h1 { margin: 0; font-size: 17px; letter-spacing: .2px; }
+    header p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+    #stage { position: relative; flex: 1; min-height: 0; }
+    #bevy-canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+    #overlay { position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+      background: radial-gradient(circle at 50% 40%, #14171f, #0d0f14); padding: 24px; }
+    #overlay .card { max-width: 560px; }
+    .spinner { width: 34px; height: 34px; margin: 0 auto 16px; border: 3px solid #2a3142;
+      border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    footer { padding: 8px 16px; border-top: 1px solid #232838; color: var(--muted); font-size: 12px; }
+    footer a { color: var(--accent); text-decoration: none; }
+    .pill { display:inline-block; padding:1px 7px; border:1px solid #2a3142; border-radius:999px; margin-right:6px; }
+    code { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>our-space — how much of your walk is watched</h1>
+      <p>An <strong>estimate</strong>, not a surveillance map. Pick two points in Manhattan; see the cameras and sensing devices that could capture you. Your route never leaves your browser.</p>
+    </header>
+
+    <div id="stage">
+      <canvas id="bevy-canvas" tabindex="0"></canvas>
+      <div id="overlay">
+        <div class="card">
+          <div class="spinner" id="spinner"></div>
+          <h2 id="ov-title">Loading the simulation…</h2>
+          <p id="ov-msg" style="color:var(--muted)">Fetching the Manhattan street network, camera layer, ACE corridors, and exposure heatmap (~30&nbsp;MB).</p>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <span class="pill">A · mapped</span><span class="pill">B · estimated</span><span class="pill">C · modeled</span><span class="pill">D · speculative</span>
+      Streets © OpenStreetMap (ODbL) · Fixed CCTV: Dahir et al. 2025 (CC BY 4.0, recall ~0.63) · ACE: MTA GTFS + NY OpenData · diversity: US Census ACS. Dashcams &amp; smart glasses are tunable <em>scenario</em> models, not measurements.
+    </footer>
+  </div>
+
+  <script type="module">
+    const overlay = document.getElementById('overlay');
+    const title = document.getElementById('ov-title');
+    const msg = document.getElementById('ov-msg');
+    const spinner = document.getElementById('spinner');
+
+    function fail(heading, detail) {
+      spinner.style.display = 'none';
+      title.textContent = heading;
+      msg.innerHTML = detail;
+    }
+
+    if (!('gpu' in navigator)) {
+      fail('WebGPU not available',
+        'This visualization needs <strong>WebGPU</strong>. Try the latest Chrome, Edge, Firefox, or Safari&nbsp;26+ on a desktop, over <code>https</code> or <code>localhost</code>.');
+    } else {
+      import('./app-interactive.js')
+        .then((mod) => mod.default())
+        .then(() => {
+          // wasm is running; the in-canvas panel now shows asset-loading status.
+          overlay.style.transition = 'opacity .5s';
+          overlay.style.opacity = '0';
+          setTimeout(() => (overlay.style.display = 'none'), 600);
+          document.getElementById('bevy-canvas').focus();
+        })
+        .catch((err) => {
+          console.error(err);
+          fail('Failed to start', 'Something went wrong loading the app. See the browser console for details.');
+        });
+    }
+  </script>
+</body>
+</html>

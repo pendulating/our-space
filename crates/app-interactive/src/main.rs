@@ -6,6 +6,7 @@
 //! smart glasses) is evaluated over the walk on a clock. Scenario sliders and the
 //! departure hour re-evaluate the existing route live.
 
+mod loading;
 mod ui;
 mod world;
 
@@ -14,7 +15,8 @@ use bevy::math::primitives::Circle;
 use bevy::prelude::*;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use sim_core::assets::{AceCorridorLayer, EquityLayer, FixedSensorLayer, GraphAsset, HeatmapLayer};
+use loading::{AceRes, CamerasRes, EquityRes, GraphAssetRes, HeatmapRes, LoadingHandles};
+use sim_core::assets::{EquityLayer, FixedSensorLayer, HeatmapLayer};
 use sim_core::simulation::SimParams;
 use sim_core::{
     AceConfig, DashcamConfig, FixedCameraDefaults, GlassesConfig, MobileScenario, Route,
@@ -23,11 +25,13 @@ use sim_core::{
 
 const WALK_SPEED: f64 = sim_core::graph::DEFAULT_WALK_SPEED_MPS;
 
-const GRAPH_PATH: &str = "assets/processed/graph_manhattan.postcard";
-const CAMERAS_PATH: &str = "assets/processed/cameras_fixed.postcard";
-const ACE_PATH: &str = "assets/processed/ace_corridors.postcard";
-const HEATMAP_PATH: &str = "assets/processed/heatmap.postcard";
-const EQUITY_PATH: &str = "assets/processed/equity.postcard";
+// Paths relative to the AssetServer root (`assets/`); works native + web.
+// Distinct extensions disambiguate the per-type postcard loaders.
+const GRAPH_PATH: &str = "processed/graph_manhattan.osgraph";
+const CAMERAS_PATH: &str = "processed/cameras_fixed.oscam";
+const ACE_PATH: &str = "processed/ace_corridors.osace";
+const HEATMAP_PATH: &str = "processed/heatmap.osheat";
+const EQUITY_PATH: &str = "processed/equity.osequity";
 
 /// Max Shannon entropy over 5 groups = ln(5), for normalizing the choropleth.
 const MAX_ENTROPY: f64 = 1.6094379;
@@ -137,37 +141,46 @@ struct Walker {
 // --------------------------------------------------------------------- main ---
 
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "our-space — Manhattan sensing exposure".into(),
-                ..default()
-            }),
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "our-space — Manhattan sensing exposure".into(),
+            // Web: bind to the page's canvas and fill its parent. Ignored natively.
+            canvas: Some("#bevy-canvas".into()),
+            fit_canvas_to_parent: true,
+            prevent_default_event_handling: true,
             ..default()
-        }))
-        .add_plugins(EguiPlugin::default())
-        .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
-        .init_resource::<RouteState>()
-        .init_resource::<Params>()
-        .init_resource::<EguiWantsPointer>()
-        .init_resource::<ResetRequested>()
-        .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            (
-                camera_control,
-                handle_click,
-                recompute_on_change,
-                animate_walker,
-                sync_visibility,
-                rebuild_heatmap,
-                rebuild_equity,
-                apply_reset,
-                smoke_exit,
-            ),
-        )
-        .add_systems(EguiPrimaryContextPass, ui::ui_panel)
-        .run();
+        }),
+        ..default()
+    }))
+    .add_plugins(EguiPlugin::default())
+    .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
+    .init_resource::<RouteState>()
+    .init_resource::<Params>()
+    .init_resource::<EguiWantsPointer>()
+    .init_resource::<ResetRequested>()
+    .add_systems(Startup, start_loading)
+    .add_systems(
+        Update,
+        (
+            build_world,
+            camera_control,
+            handle_click,
+            recompute_on_change,
+            animate_walker,
+            sync_visibility,
+            rebuild_heatmap,
+            rebuild_equity,
+            apply_reset,
+            smoke_exit,
+        ),
+    )
+    .add_systems(EguiPrimaryContextPass, ui::ui_panel);
+    loading::register(&mut app);
+    app.run();
 }
 
 // ----------------------------------------------------------------- helpers ----
@@ -208,36 +221,64 @@ fn sim_params(sim: &Sim) -> SimParams {
 
 // ------------------------------------------------------------------- startup --
 
-fn setup(
+/// Spawn the camera and request the baked layers via the AssetServer.
+fn start_loading(mut commands: Commands, asset_server: Res<AssetServer>, mut route: ResMut<RouteState>) {
+    commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(6.0))));
+    commands.insert_resource(LoadingHandles {
+        graph: asset_server.load(GRAPH_PATH),
+        cameras: asset_server.load(CAMERAS_PATH),
+        ace: asset_server.load(ACE_PATH),
+        heatmap: asset_server.load(HEATMAP_PATH),
+        equity: asset_server.load(EQUITY_PATH),
+        built: false,
+    });
+    route.status = "Loading Manhattan map data…".into();
+}
+
+/// Once all baked layers have loaded, build the simulation world + map meshes.
+#[allow(clippy::too_many_arguments)]
+fn build_world(
+    mut handles: ResMut<LoadingHandles>,
+    graphs: Res<Assets<GraphAssetRes>>,
+    cams: Res<Assets<CamerasRes>>,
+    aces: Res<Assets<AceRes>>,
+    heatmaps: Res<Assets<HeatmapRes>>,
+    equities: Res<Assets<EquityRes>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut route: ResMut<RouteState>,
 ) {
-    commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(6.0))));
+    if handles.built {
+        return;
+    }
+    let (Some(g), Some(c), Some(a), Some(h), Some(e)) = (
+        graphs.get(&handles.graph),
+        cams.get(&handles.cameras),
+        aces.get(&handles.ace),
+        heatmaps.get(&handles.heatmap),
+        equities.get(&handles.equity),
+    ) else {
+        return; // still loading
+    };
 
-    let graph_bytes = std::fs::read(GRAPH_PATH)
-        .unwrap_or_else(|e| panic!("could not read {GRAPH_PATH} ({e}). Bake assets first (see README)."));
-    let graph = StreetGraph::from_asset(GraphAsset::from_bytes(&graph_bytes).expect("decoding graph"));
-
-    let cam_bytes = std::fs::read(CAMERAS_PATH)
-        .unwrap_or_else(|e| panic!("could not read {CAMERAS_PATH} ({e}). Bake assets first."));
-    let layer = FixedSensorLayer::from_bytes(&cam_bytes).expect("decoding camera layer");
+    let graph = StreetGraph::from_asset(g.0.clone());
+    let layer = c.0.clone();
     let sensors = sim_core::sensors_from_layer(&layer, FixedCameraDefaults::default());
-
-    // Optional ACE corridors.
-    let (ace_segments, ace_routes): (Vec<[Enu; 2]>, Vec<String>) = std::fs::read(ACE_PATH)
-        .ok()
-        .and_then(|b| AceCorridorLayer::from_bytes(&b).ok())
-        .map(|l| {
-            let segs = l
-                .segments
-                .iter()
-                .map(|s| [Enu::new(s[0][0], s[0][1]), Enu::new(s[1][0], s[1][1])])
-                .collect();
-            (segs, l.routes)
-        })
-        .unwrap_or_default();
+    let ace_segments: Vec<[Enu; 2]> = a
+        .0
+        .segments
+        .iter()
+        .map(|s| [Enu::new(s[0][0], s[0][1]), Enu::new(s[1][0], s[1][1])])
+        .collect();
+    let ace_routes = a.0.routes.clone();
+    let heatmap = Some(h.0.clone());
+    let equity = Some(e.0.clone());
+    let equity_corr = {
+        let xs: Vec<f64> = e.0.block_groups.iter().filter(|b| b.population > 0).map(|b| b.entropy).collect();
+        let ys: Vec<f64> = e.0.block_groups.iter().filter(|b| b.population > 0).map(|b| b.camera_count as f64).collect();
+        pearson(&xs, &ys)
+    };
 
     // Streets.
     let street_mesh = meshes.add(world::line_list_mesh(world::street_line_positions(graph.asset())));
@@ -301,6 +342,7 @@ fn setup(
         ace_routes.len(),
     );
     route.status = "Click the map to set a start point (A).".into();
+    info!("equity: diversity ~ detected cameras  r = {:?}", equity_corr);
 
     if std::env::var("OURSPACE_SMOKE").is_ok() {
         let _ = std::fs::write(
@@ -314,22 +356,6 @@ fn setup(
         );
     }
 
-    let heatmap = std::fs::read(HEATMAP_PATH)
-        .ok()
-        .and_then(|b| HeatmapLayer::from_bytes(&b).ok());
-
-    let equity = std::fs::read(EQUITY_PATH)
-        .ok()
-        .and_then(|b| EquityLayer::from_bytes(&b).ok());
-    // The Dahir tie-in: correlation between diversity and detected camera count
-    // across populated block groups.
-    let equity_corr = equity.as_ref().and_then(|e| {
-        let xs: Vec<f64> = e.block_groups.iter().filter(|b| b.population > 0).map(|b| b.entropy).collect();
-        let ys: Vec<f64> = e.block_groups.iter().filter(|b| b.population > 0).map(|b| b.camera_count as f64).collect();
-        pearson(&xs, &ys)
-    });
-    info!("equity: diversity ~ detected cameras  r = {:?}", equity_corr);
-
     commands.insert_resource(Sim {
         graph,
         sensors,
@@ -340,6 +366,7 @@ fn setup(
         equity,
         equity_corr,
     });
+    handles.built = true;
 }
 
 /// Pearson correlation coefficient, or None if undefined.
@@ -683,20 +710,28 @@ fn rebuild_equity(
 
 /// In `OURSPACE_SMOKE` mode, exit after a few rendered frames so headless runs
 /// can confirm the render loop ticked without panicking.
-fn smoke_exit(mut frames: Local<u32>, mut exit: MessageWriter<AppExit>, mut params: ResMut<Params>) {
+fn smoke_exit(
+    mut frames: Local<u32>,
+    mut exit: MessageWriter<AppExit>,
+    mut params: ResMut<Params>,
+    sim: Option<Res<Sim>>,
+) {
     if std::env::var("OURSPACE_SMOKE").is_err() {
         return;
+    }
+    if sim.is_none() {
+        return; // wait until the world is built (async asset load)
     }
     *frames += 1;
     // Exercise the heatmap + equity render paths before exiting.
     if *frames == 3 {
         params.heatmap_on = true;
     }
-    if *frames == 4 {
+    if *frames == 5 {
         params.heatmap_on = false;
         params.equity_on = true;
     }
-    if *frames == 8 {
+    if *frames == 12 {
         let _ = std::fs::write("/tmp/ourspace_frames.txt", format!("frames_ok={}\n", *frames));
         exit.write(AppExit::Success);
     }

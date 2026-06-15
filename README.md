@@ -52,7 +52,11 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   overlay** — block-group **Shannon diversity** (Census ACS) as a choropleth,
   with detected cameras joined by point-in-polygon and the live diversity↔camera
   correlation, framed by the Dahir et al. finding.
-- ⏳ Phase 4 (WebGPU web embed).
+- ✅ **Phase 4**: the app compiles to **WebGPU/WASM** (cross-platform asset
+  loading via `AssetServer`; per-target Bevy features). `web/build.sh` produces a
+  static `web/dist/` bundle (wasm-bindgen + wasm-opt) with `web/index.html` doing
+  WebGPU-support detection, a loading screen, and the "estimate, not a
+  surveillance map" + route-stays-client-side framing.
 
 ## Quick start
 
@@ -76,7 +80,22 @@ HOUR=8 cargo run -p sim-core --example route_demo -- 40.7330 -73.9830 40.7160 -7
 
 # Interactive map (native window)
 cargo run -p app-interactive
+
+# Web build (WebGPU/WASM) — one-time tooling, then build + serve
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.125   # match the wasm-bindgen crate
+brew install binaryen                              # wasm-opt
+./web/build.sh
+python3 -m http.server -d web/dist 8080           # open http://localhost:8080 (WebGPU browser)
 ```
+
+### Hosting
+
+`web/dist/` is a fully static bundle — deploy it to any static host with HTTPS
+(WebGPU requires a secure context): Cloudflare Pages, GitHub Pages, Netlify,
+Vercel. No server, API keys, or backend: the route is computed entirely in the
+browser and never transmitted. Note the ~30 MB asset payload (graph + layers);
+the page shows a loading screen while it fetches.
 
 ### Interactive controls
 
