@@ -15,6 +15,7 @@ bevy_egui = { workspace = true }
 bevy_prototype_lyon = { workspace = true }
 bevy_ecs_tilemap = { workspace = true }
 leafwing-input-manager = { workspace = true }
+earcutr = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # wasm interop bridge wired up in Phase 4.

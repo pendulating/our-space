@@ -8,6 +8,7 @@
 
 mod ace;
 mod cameras_dahir;
+mod equity;
 mod graph_osm;
 mod graph_synth;
 
@@ -43,6 +44,15 @@ fn run() -> anyhow::Result<()> {
             let out = args.get(4).context(USAGE)?;
             ensure_parent(out)?;
             ace::bake(gtfs_dir, ace_json, out)?;
+            Ok(())
+        }
+        Some("bake-equity") => {
+            let geojson = args.get(2).context(USAGE)?;
+            let acs = args.get(3).context(USAGE)?;
+            let csv = args.get(4).context(USAGE)?;
+            let out = args.get(5).context(USAGE)?;
+            ensure_parent(out)?;
+            equity::bake(geojson, acs, csv, out)?;
             Ok(())
         }
         _ => bail!(USAGE),
@@ -94,4 +104,5 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-graph --synthetic <rows> <cols> <spacing_m> <out.postcard>\n  \
     data-pipeline bake-graph --overpass-json <walk.json> <out.postcard>\n  \
     data-pipeline bake-cameras <map_data.csv> <out.postcard>\n  \
-    data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard>";
+    data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard>\n  \
+    data-pipeline bake-equity <bg.geojson> <acs.json> <map_data.csv> <out.postcard>";

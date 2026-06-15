@@ -46,7 +46,13 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   modeled field), and **smart glasses** (Tier-D scenario). Departure-hour
   scrubber + penetration/adoption sliders re-evaluate the route live; per-source
   breakdown tagged by confidence tier with Poisson P(seen).
-- ⏳ Phase 3 (batch heatmap + equity overlay), Phase 4 (WebGPU web embed).
+- ✅ **Phase 3**: native headless `batch` computes a **citywide exposure heatmap**
+  (per-class expected devices/min for all 220k street edges, rstar-accelerated,
+  ~0.1s) rendered in-app as a class-selectable heat overlay; plus an **equity
+  overlay** — block-group **Shannon diversity** (Census ACS) as a choropleth,
+  with detected cameras joined by point-in-polygon and the live diversity↔camera
+  correlation, framed by the Dahir et al. finding.
+- ⏳ Phase 4 (WebGPU web embed).
 
 ## Quick start
 
@@ -60,6 +66,10 @@ cargo test -p sim-core --no-default-features
 cargo run -p data-pipeline -- bake-graph   --overpass-json data/snapshots/osm/manhattan_walk.json assets/processed/graph_manhattan.postcard
 cargo run -p data-pipeline -- bake-cameras data/snapshots/dahir/map_data.csv                       assets/processed/cameras_fixed.postcard
 cargo run -p data-pipeline -- bake-ace     data/snapshots/gtfs/gtfs_m data/snapshots/gtfs/ace_routes.json assets/processed/ace_corridors.postcard
+cargo run -p data-pipeline -- bake-equity  data/snapshots/census/blockgroups.geojson data/snapshots/census/acs.json data/snapshots/dahir/map_data.csv assets/processed/equity.postcard
+
+# Citywide exposure heatmap (per-edge intensities; arg = reference hour 0..23)
+cargo run -p batch --release -- heatmap assets/processed/heatmap.postcard 17
 
 # Headless end-to-end exposure demo (lat lon lat lon; HOUR=0..23 sets departure time)
 HOUR=8 cargo run -p sim-core --example route_demo -- 40.7330 -73.9830 40.7160 -73.9810
@@ -95,6 +105,7 @@ curl -L --create-dirs -o data/snapshots/dahir/map_data.csv \
 | Walk graph | OpenStreetMap via Overpass API | ODbL 1.0 |
 | Fixed CCTV | Dahir et al. 2025, Stanford Digital Repository (`map_data.csv`) | CC BY 4.0 |
 | ACE corridors | MTA GTFS (route geometry) + data.ny.gov `ki2b-sg5y` (ACE route list) | MTA / OPEN-NY ToU |
+| Block groups | Census TIGERweb (geometry) + Census Reporter API (ACS 5-year B03002, keyless) | Census public domain |
 
 Dashcam and smart-glasses layers are **scenario models** (Tier C/D), not datasets —
 their intensities are user-tunable assumptions, surfaced as such in the UI.

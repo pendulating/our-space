@@ -109,6 +109,72 @@ impl AceCorridorLayer {
     }
 }
 
+/// A citywide exposure heatmap: per-class intensity per graph edge, in the
+/// **same order** as the `GraphAsset.edges` it was computed from. Each value is
+/// the expected number of devices that would capture you per minute of presence
+/// on that segment (at `reference_hour`). Classes are kept separate so a uniform
+/// field (dashcams) doesn't wash out the spatial signal of fixed cameras / ACE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeatmapLayer {
+    pub reference_hour: f64,
+    pub fixed: Vec<f64>,
+    pub ace: Vec<f64>,
+    pub dashcam: Vec<f64>,
+    pub glasses: Vec<f64>,
+    pub provenance: Provenance,
+}
+
+impl HeatmapLayer {
+    pub fn len(&self) -> usize {
+        self.fixed.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.fixed.is_empty()
+    }
+    /// Total expected devices/min for edge `i` across all classes.
+    pub fn total(&self, i: usize) -> f64 {
+        self.fixed[i] + self.ace[i] + self.dashcam[i] + self.glasses[i]
+    }
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
+/// One census block group: its boundary (ENU exterior ring), Shannon diversity
+/// entropy, population, and detected-camera count — for the Dahir equity overlay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockGroup {
+    pub geoid: String,
+    /// Exterior boundary ring in ENU meters (no holes; block groups rarely have any).
+    pub exterior: Vec<[f64; 2]>,
+    /// Shannon entropy over white/Black/Asian/Hispanic/other (0 = homogeneous).
+    pub entropy: f64,
+    pub population: u32,
+    /// Detected fixed cameras whose point falls in this block group.
+    pub camera_count: u32,
+}
+
+/// The block-group equity overlay (diversity vs. camera density), mirroring
+/// Dahir et al. Aggregated at block-group level only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EquityLayer {
+    pub origin: GeoOrigin,
+    pub block_groups: Vec<BlockGroup>,
+    pub provenance: Provenance,
+}
+
+impl EquityLayer {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

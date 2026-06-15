@@ -36,4 +36,7 @@ pub use projection::{EnuProjection, GeoOrigin};
 pub use scenario::{
     run_route, sensors_from_layer, summarize, FixedCameraDefaults, RouteSummary, SourceBreakdown,
 };
-pub use simulation::{simulate_fixed, simulate_full, SensorInstance, SimParams};
+pub use simulation::{
+    exposure_rates_per_minute, simulate_fixed, simulate_full, ExposureRates, SensorInstance,
+    SimParams,
+};

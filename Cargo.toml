@@ -37,6 +37,7 @@ geo = "0.29"
 geo-types = "0.7"
 geojson = "0.24"
 rstar = "0.12"
+earcutr = "0.4"
 
 # --- transit / data ---
 gtfs-structures = { version = "0.48", default-features = false }

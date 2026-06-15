@@ -14,7 +14,7 @@ use bevy::math::primitives::Circle;
 use bevy::prelude::*;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use sim_core::assets::{AceCorridorLayer, FixedSensorLayer, GraphAsset};
+use sim_core::assets::{AceCorridorLayer, EquityLayer, FixedSensorLayer, GraphAsset, HeatmapLayer};
 use sim_core::simulation::SimParams;
 use sim_core::{
     AceConfig, DashcamConfig, FixedCameraDefaults, GlassesConfig, MobileScenario, Route,
@@ -26,6 +26,30 @@ const WALK_SPEED: f64 = sim_core::graph::DEFAULT_WALK_SPEED_MPS;
 const GRAPH_PATH: &str = "assets/processed/graph_manhattan.postcard";
 const CAMERAS_PATH: &str = "assets/processed/cameras_fixed.postcard";
 const ACE_PATH: &str = "assets/processed/ace_corridors.postcard";
+const HEATMAP_PATH: &str = "assets/processed/heatmap.postcard";
+const EQUITY_PATH: &str = "assets/processed/equity.postcard";
+
+/// Max Shannon entropy over 5 groups = ln(5), for normalizing the choropleth.
+const MAX_ENTROPY: f64 = 1.6094379;
+
+/// Which heatmap layer to display.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeatClass {
+    Total,
+    Fixed,
+    Ace,
+    Dashcam,
+}
+impl HeatClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            HeatClass::Total => "All sources",
+            HeatClass::Fixed => "Fixed CCTV",
+            HeatClass::Ace => "ACE buses",
+            HeatClass::Dashcam => "Dashcams",
+        }
+    }
+}
 
 // ---------------------------------------------------------------- resources ---
 
@@ -37,6 +61,10 @@ pub struct Sim {
     pub layer: FixedSensorLayer,
     pub ace_segments: Vec<[Enu; 2]>,
     pub ace_routes: Vec<String>,
+    pub heatmap: Option<HeatmapLayer>,
+    pub equity: Option<EquityLayer>,
+    /// Pearson r between block-group diversity entropy and detected camera count.
+    pub equity_corr: Option<f64>,
 }
 
 #[derive(Resource, Default)]
@@ -59,6 +87,9 @@ pub struct Params {
     pub glasses_on: bool,
     pub dashcam_penetration: f32,
     pub glasses_per_1000: f32,
+    pub heatmap_on: bool,
+    pub heatmap_class: HeatClass,
+    pub equity_on: bool,
 }
 impl Default for Params {
     fn default() -> Self {
@@ -71,6 +102,9 @@ impl Default for Params {
             glasses_on: true,
             dashcam_penetration: 0.40,
             glasses_per_1000: 10.0,
+            heatmap_on: false,
+            heatmap_class: HeatClass::Fixed,
+            equity_on: false,
         }
     }
 }
@@ -84,11 +118,15 @@ pub struct ResetRequested(pub bool);
 // --------------------------------------------------------------- components ---
 
 #[derive(Component)]
-struct MapEntity;
+struct BaseMap; // streets + camera dots (hidden in heatmap mode)
 #[derive(Component)]
 struct FovWedge;
 #[derive(Component)]
 struct AceVis;
+#[derive(Component)]
+struct HeatmapVis;
+#[derive(Component)]
+struct EquityVis;
 #[derive(Component)]
 struct RouteVis;
 #[derive(Component)]
@@ -121,7 +159,9 @@ fn main() {
                 handle_click,
                 recompute_on_change,
                 animate_walker,
-                sync_layer_visibility,
+                sync_visibility,
+                rebuild_heatmap,
+                rebuild_equity,
                 apply_reset,
                 smoke_exit,
             ),
@@ -206,7 +246,7 @@ fn setup(
         Mesh2d(street_mesh),
         MeshMaterial2d(street_mat),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        MapEntity,
+        BaseMap,
     ));
 
     // ACE corridors (teal), above streets.
@@ -222,7 +262,6 @@ fn setup(
             Mesh2d(ace_mesh),
             MeshMaterial2d(ace_mat),
             Transform::from_xyz(0.0, 0.0, 0.2),
-            MapEntity,
             AceVis,
         ));
     }
@@ -237,7 +276,7 @@ fn setup(
             Mesh2d(cam_circle.clone()),
             MeshMaterial2d(cam_mat.clone()),
             Transform::from_translation(world::to_world(apex, 1.0)),
-            MapEntity,
+            BaseMap,
         ));
         let wedge = meshes.add(world::wedge_mesh(
             s.wedge.heading_rad as f32,
@@ -249,7 +288,6 @@ fn setup(
             Mesh2d(wedge),
             MeshMaterial2d(wedge_mat.clone()),
             Transform::from_translation(world::to_world(apex, 0.5)),
-            MapEntity,
             FovWedge,
         ));
     }
@@ -276,13 +314,58 @@ fn setup(
         );
     }
 
+    let heatmap = std::fs::read(HEATMAP_PATH)
+        .ok()
+        .and_then(|b| HeatmapLayer::from_bytes(&b).ok());
+
+    let equity = std::fs::read(EQUITY_PATH)
+        .ok()
+        .and_then(|b| EquityLayer::from_bytes(&b).ok());
+    // The Dahir tie-in: correlation between diversity and detected camera count
+    // across populated block groups.
+    let equity_corr = equity.as_ref().and_then(|e| {
+        let xs: Vec<f64> = e.block_groups.iter().filter(|b| b.population > 0).map(|b| b.entropy).collect();
+        let ys: Vec<f64> = e.block_groups.iter().filter(|b| b.population > 0).map(|b| b.camera_count as f64).collect();
+        pearson(&xs, &ys)
+    });
+    info!("equity: diversity ~ detected cameras  r = {:?}", equity_corr);
+
     commands.insert_resource(Sim {
         graph,
         sensors,
         layer,
         ace_segments,
         ace_routes,
+        heatmap,
+        equity,
+        equity_corr,
     });
+}
+
+/// Pearson correlation coefficient, or None if undefined.
+fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    let n = xs.len();
+    if n < 2 || n != ys.len() {
+        return None;
+    }
+    let nf = n as f64;
+    let mx = xs.iter().sum::<f64>() / nf;
+    let my = ys.iter().sum::<f64>() / nf;
+    let mut sxy = 0.0;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    for i in 0..n {
+        let (dx, dy) = (xs[i] - mx, ys[i] - my);
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    let denom = (sxx * syy).sqrt();
+    if denom <= f64::EPSILON {
+        None
+    } else {
+        Some(sxy / denom)
+    }
 }
 
 // ----------------------------------------------------------------- systems ----
@@ -438,22 +521,97 @@ fn animate_walker(time: Res<Time>, route: Res<RouteState>, mut q: Query<(&mut Tr
     }
 }
 
-fn sync_layer_visibility(
-    params: Res<Params>,
-    mut fov: Query<&mut Visibility, (With<FovWedge>, Without<AceVis>)>,
-    mut ace: Query<&mut Visibility, (With<AceVis>, Without<FovWedge>)>,
-) {
-    let fov_target = if params.show_fov { Visibility::Inherited } else { Visibility::Hidden };
-    for mut v in fov.iter_mut() {
-        if *v != fov_target {
-            *v = fov_target;
+fn set_vis<F: bevy::ecs::query::QueryFilter>(q: &mut Query<&mut Visibility, F>, on: bool) {
+    let target = if on { Visibility::Inherited } else { Visibility::Hidden };
+    for mut v in q.iter_mut() {
+        if *v != target {
+            *v = target;
         }
     }
-    let ace_target = if params.show_ace { Visibility::Inherited } else { Visibility::Hidden };
-    for mut v in ace.iter_mut() {
-        if *v != ace_target {
-            *v = ace_target;
+}
+
+/// In heatmap mode the base map / cameras / wedges / ACE lines are hidden so the
+/// colored exposure overlay reads cleanly; otherwise FOV and ACE follow toggles.
+fn sync_visibility(
+    params: Res<Params>,
+    mut base: Query<&mut Visibility, (With<BaseMap>, Without<FovWedge>, Without<AceVis>)>,
+    mut fov: Query<&mut Visibility, (With<FovWedge>, Without<BaseMap>, Without<AceVis>)>,
+    mut ace: Query<&mut Visibility, (With<AceVis>, Without<BaseMap>, Without<FovWedge>)>,
+) {
+    let hm = params.heatmap_on;
+    set_vis(&mut base, !hm);
+    set_vis(&mut fov, params.show_fov && !hm);
+    set_vis(&mut ace, params.show_ace && !hm);
+}
+
+/// Heat gradient from low (dim) to high (red).
+const HEAT_COLORS: [Color; 6] = [
+    Color::srgb(0.14, 0.15, 0.19),
+    Color::srgb(0.18, 0.34, 0.55),
+    Color::srgb(0.16, 0.62, 0.56),
+    Color::srgb(0.78, 0.74, 0.24),
+    Color::srgb(0.92, 0.55, 0.20),
+    Color::srgb(0.96, 0.26, 0.20),
+];
+
+/// Rebuild the colored heatmap meshes when the mode/class changes.
+#[allow(clippy::type_complexity)]
+fn rebuild_heatmap(
+    params: Res<Params>,
+    sim: Option<Res<Sim>>,
+    mut last: Local<Option<(bool, u8)>>,
+    existing: Query<Entity, With<HeatmapVis>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    let class_id = params.heatmap_class as u8;
+    let cur = (params.heatmap_on, class_id);
+    if *last == Some(cur) {
+        return;
+    }
+    *last = Some(cur);
+
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    if !params.heatmap_on {
+        return;
+    }
+    let Some(sim) = sim else { return };
+    let Some(hm) = &sim.heatmap else { return };
+    let edges = &sim.graph.asset().edges;
+    let n = hm.len().min(edges.len());
+
+    let value = |i: usize| match params.heatmap_class {
+        HeatClass::Total => hm.total(i),
+        HeatClass::Fixed => hm.fixed[i],
+        HeatClass::Ace => hm.ace[i],
+        HeatClass::Dashcam => hm.dashcam[i],
+    };
+    let max_v = (0..n).map(value).fold(0.0_f64, f64::max).max(1e-9);
+
+    let mut buckets: [Vec<[f32; 3]>; 6] = std::array::from_fn(|_| Vec::new());
+    for (i, e) in edges.iter().take(n).enumerate() {
+        let norm = (value(i) / max_v).clamp(0.0, 1.0);
+        let b = ((norm * 6.0).floor() as usize).min(5);
+        for w in e.polyline.windows(2) {
+            buckets[b].push([w[0][0] as f32, w[0][1] as f32, 0.15]);
+            buckets[b].push([w[1][0] as f32, w[1][1] as f32, 0.15]);
         }
+    }
+    for (b, positions) in buckets.into_iter().enumerate() {
+        if positions.is_empty() {
+            continue;
+        }
+        let mesh = meshes.add(world::line_list_mesh(positions));
+        let mat = materials.add(HEAT_COLORS[b]);
+        commands.spawn((
+            Mesh2d(mesh),
+            MeshMaterial2d(mat),
+            Transform::from_xyz(0.0, 0.0, 0.15),
+            HeatmapVis,
+        ));
     }
 }
 
@@ -476,13 +634,68 @@ fn apply_reset(
     };
 }
 
+/// Rebuild the block-group diversity choropleth when toggled on/off.
+fn rebuild_equity(
+    params: Res<Params>,
+    sim: Option<Res<Sim>>,
+    mut last: Local<Option<bool>>,
+    existing: Query<Entity, With<EquityVis>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    if *last == Some(params.equity_on) {
+        return;
+    }
+    *last = Some(params.equity_on);
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    if !params.equity_on {
+        return;
+    }
+    let Some(sim) = sim else { return };
+    let Some(eq) = &sim.equity else { return };
+
+    for bg in &eq.block_groups {
+        if bg.population == 0 {
+            continue;
+        }
+        let Some(mesh) = world::filled_polygon_mesh(&bg.exterior, -0.3) else {
+            continue;
+        };
+        // Diversity ramp: dim slate (low) -> bright magenta (high), translucent.
+        let t = (bg.entropy / MAX_ENTROPY).clamp(0.0, 1.0) as f32;
+        let color = Color::srgba(
+            0.12 + 0.70 * t,
+            0.13 + 0.10 * t,
+            0.20 + 0.65 * t,
+            0.55,
+        );
+        commands.spawn((
+            Mesh2d(meshes.add(mesh)),
+            MeshMaterial2d(materials.add(color)),
+            Transform::from_xyz(0.0, 0.0, -0.3),
+            EquityVis,
+        ));
+    }
+}
+
 /// In `OURSPACE_SMOKE` mode, exit after a few rendered frames so headless runs
 /// can confirm the render loop ticked without panicking.
-fn smoke_exit(mut frames: Local<u32>, mut exit: MessageWriter<AppExit>) {
+fn smoke_exit(mut frames: Local<u32>, mut exit: MessageWriter<AppExit>, mut params: ResMut<Params>) {
     if std::env::var("OURSPACE_SMOKE").is_err() {
         return;
     }
     *frames += 1;
+    // Exercise the heatmap + equity render paths before exiting.
+    if *frames == 3 {
+        params.heatmap_on = true;
+    }
+    if *frames == 4 {
+        params.heatmap_on = false;
+        params.equity_on = true;
+    }
     if *frames == 8 {
         let _ = std::fs::write("/tmp/ourspace_frames.txt", format!("frames_ok={}\n", *frames));
         exit.write(AppExit::Success);

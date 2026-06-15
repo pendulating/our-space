@@ -134,6 +134,64 @@ pub fn simulate_full(
     tally
 }
 
+/// Per-class expected devices that would capture you **per minute of presence**
+/// at a point (the citywide-heatmap intensity, kept per class so a uniform field
+/// like dashcams doesn't wash out the spatial signal of fixed cameras / ACE).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExposureRates {
+    pub fixed: f64,
+    pub ace: f64,
+    pub dashcam: f64,
+    pub glasses: f64,
+}
+
+impl ExposureRates {
+    pub fn total(&self) -> f64 {
+        self.fixed + self.ace + self.dashcam + self.glasses
+    }
+}
+
+/// Per-minute exposure rate at a point, at `hour`, split by class.
+///
+/// `nearby_fixed` should already be spatially culled to candidate cameras by the
+/// caller (e.g. an R-tree query); `near_ace` indicates the point is within an
+/// ACE corridor's capture range. Fixed cameras covering the point contribute one
+/// device each (recall-corrected); mobile classes contribute their per-minute
+/// encounter rate at the given hour.
+pub fn exposure_rates_per_minute(
+    point: Vec2,
+    hour: f64,
+    nearby_fixed: &[SensorInstance],
+    occluders: &[OccluderEdge],
+    near_ace: bool,
+    mobile: &MobileScenario,
+    recall_factor: f64,
+) -> ExposureRates {
+    let mut r = ExposureRates::default();
+
+    r.fixed = nearby_fixed
+        .iter()
+        .filter(|s| captures(&s.wedge, point, occluders))
+        .count() as f64
+        * recall_factor;
+
+    if near_ace {
+        if let Some(ace) = &mobile.ace {
+            let headway_s = (bus_headway_minutes(hour) * 60.0 * ace.headway_scale).max(1.0);
+            r.ace = (ace.directions / headway_s) * 60.0;
+        }
+    }
+    if let Some(d) = &mobile.dashcam {
+        let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour);
+        r.dashcam = veh_per_s * d.penetration * d.capture_prob * 60.0;
+    }
+    if let Some(g) = &mobile.glasses {
+        let peds_per_s = (g.peds_per_min_peak / 60.0) * pedestrian_multiplier(hour);
+        r.glasses = peds_per_s * (g.per_1000_pedestrians / 1000.0) * g.p_recording * g.capture_prob * 60.0;
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +302,25 @@ mod tests {
             .devices;
         assert!(night > 0.0);
         assert!(peak > night, "peak {peak} should exceed night {night}");
+    }
+
+    #[test]
+    fn per_minute_rate_adds_classes() {
+        // Camera at (0,5) looking south covers the origin (5 m away, in range).
+        let cam = cam_at(0.0, 5.0, 180.0);
+        let fixed_only =
+            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &[], false, &MobileScenario::default(), 1.0);
+        assert!((fixed_only.fixed - 1.0).abs() < 1e-9, "one covering camera, got {}", fixed_only.fixed);
+        assert_eq!(fixed_only.ace, 0.0);
+
+        let mobile = MobileScenario {
+            ace: Some(AceConfig::new(vec![])),
+            dashcam: Some(DashcamConfig::default()),
+            glasses: None,
+        };
+        let with_mobile =
+            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &[], true, &mobile, 1.0);
+        assert!(with_mobile.ace > 0.0 && with_mobile.dashcam > 0.0);
+        assert!(with_mobile.total() > fixed_only.total());
     }
 }

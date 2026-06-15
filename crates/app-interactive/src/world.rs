@@ -63,6 +63,31 @@ pub fn wedge_mesh(heading_rad: f32, half_fov_rad: f32, range_m: f32, segments: u
     mesh
 }
 
+/// A filled polygon mesh from an ENU exterior ring, triangulated with ear
+/// clipping (handles concave block-group boundaries). Returns `None` if the ring
+/// is degenerate.
+pub fn filled_polygon_mesh(ring: &[[f64; 2]], z: f32) -> Option<Mesh> {
+    // Drop a duplicated closing vertex if present.
+    let ring = if ring.len() >= 2 && ring.first() == ring.last() {
+        &ring[..ring.len() - 1]
+    } else {
+        ring
+    };
+    if ring.len() < 3 {
+        return None;
+    }
+    let flat: Vec<f64> = ring.iter().flat_map(|p| [p[0], p[1]]).collect();
+    let indices = earcutr::earcut(&flat, &[], 2).ok()?;
+    if indices.is_empty() {
+        return None;
+    }
+    let positions: Vec<[f32; 3]> = ring.iter().map(|p| [p[0] as f32, p[1] as f32, z]).collect();
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_indices(Indices::U32(indices.iter().map(|&i| i as u32).collect()));
+    Some(mesh)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +116,12 @@ mod tests {
         };
         // 2 segments -> 4 line-list vertices.
         assert_eq!(street_line_positions(&asset).len(), 4);
+    }
+
+    #[test]
+    fn polygon_triangulates() {
+        let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let mesh = filled_polygon_mesh(&ring, 0.0).expect("square triangulates");
+        assert_eq!(mesh.count_vertices(), 4); // closing vertex dropped
     }
 }

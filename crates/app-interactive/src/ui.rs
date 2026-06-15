@@ -6,7 +6,17 @@ use bevy_egui::{egui, EguiContexts};
 
 use sim_core::ConfidenceTier;
 
-use crate::{EguiWantsPointer, Params, ResetRequested, RouteState};
+use crate::{EguiWantsPointer, HeatClass, Params, ResetRequested, RouteState, Sim};
+
+/// egui legend colors mirroring the map's heat gradient (low -> high).
+const LEGEND: [egui::Color32; 6] = [
+    egui::Color32::from_rgb(36, 38, 48),
+    egui::Color32::from_rgb(46, 87, 140),
+    egui::Color32::from_rgb(41, 158, 143),
+    egui::Color32::from_rgb(199, 189, 61),
+    egui::Color32::from_rgb(235, 140, 51),
+    egui::Color32::from_rgb(245, 66, 51),
+];
 
 /// Short label + accent color for a confidence tier.
 fn tier_style(tier: ConfidenceTier) -> (&'static str, egui::Color32) {
@@ -24,7 +34,9 @@ pub fn ui_panel(
     mut params: ResMut<Params>,
     mut reset: ResMut<ResetRequested>,
     mut wants: ResMut<EguiWantsPointer>,
+    sim: Option<bevy::prelude::Res<Sim>>,
 ) {
+    let corr = sim.as_ref().and_then(|s| s.equity_corr);
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
@@ -119,6 +131,59 @@ pub fn ui_panel(
                         .text("/1k peds"),
                 );
             });
+
+            ui.separator();
+            ui.label(egui::RichText::new("Citywide heatmap").strong());
+            ui.checkbox(&mut params.heatmap_on, "Show exposure heatmap");
+            if params.heatmap_on {
+                egui::ComboBox::from_label("layer")
+                    .selected_text(params.heatmap_class.label())
+                    .show_ui(ui, |ui| {
+                        for c in [
+                            HeatClass::Fixed,
+                            HeatClass::Ace,
+                            HeatClass::Dashcam,
+                            HeatClass::Total,
+                        ] {
+                            ui.selectable_value(&mut params.heatmap_class, c, c.label());
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("low");
+                    for c in LEGEND {
+                        ui.colored_label(c, "■");
+                    }
+                    ui.label("high");
+                });
+                ui.label(egui::RichText::new("expected devices/min of presence · baked @ 17:00").weak());
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("Equity overlay").strong());
+            ui.checkbox(&mut params.equity_on, "Show neighborhood diversity");
+            if params.equity_on {
+                ui.label(
+                    egui::RichText::new("Block-group Shannon diversity (dim = homogeneous, bright = diverse)")
+                        .weak(),
+                );
+                if let Some(r) = corr {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "In this data, diversity vs. detected cameras correlate r = {r:+.2}."
+                        ))
+                        .color(egui::Color32::from_rgb(200, 160, 230)),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Dahir et al. (2025): cameras are most prevalent in racially diverse \
+                         neighborhoods — diversity predicts cameras more than crime does, and \
+                         %Black is negatively associated after controls. This is a published \
+                         correlation, not causation for any one block.",
+                    )
+                    .weak(),
+                );
+            }
 
             ui.separator();
             ui.checkbox(&mut params.show_ace, "Show ACE corridors (teal)");
