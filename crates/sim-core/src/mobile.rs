@@ -70,12 +70,15 @@ impl AceConfig {
     }
 }
 
-/// Dashcam field exposure (Tier C: modeled field × assumed penetration).
+/// Rideshare-camera (dashcam) exposure. NYC requires for-hire vehicles to carry
+/// in-vehicle cameras, so this models the cameras riding in Uber/Lyft vehicles;
+/// the spatial density comes from real TLC High-Volume FHV trip records (a
+/// [`crate::assets::DashcamFieldLayer`]), scaled by the penetration assumption.
 #[derive(Debug, Clone, Copy)]
 pub struct DashcamConfig {
-    /// Fraction of passing vehicles with a forward-facing dashcam.
+    /// Fraction of passing rideshare vehicles whose camera captures the street.
     pub penetration: f64,
-    /// Passing vehicles per minute on a typical street at peak traffic.
+    /// Baseline passing rideshare vehicles/min in a *typical-density* zone at peak.
     pub vehicles_per_min_peak: f64,
     /// P(walker falls in a passing vehicle's dashcam FOV).
     pub capture_prob: f64,
@@ -85,11 +88,12 @@ pub struct DashcamConfig {
 
 impl Default for DashcamConfig {
     fn default() -> Self {
-        // Urban ownership ~40% (single non-peer-reviewed survey; tunable).
+        // Baseline is for a MEDIAN-density taxi zone at peak (the field scales it
+        // by local rideshare density, up to ~8× in Midtown). ~40% camera fitting.
         DashcamConfig {
             penetration: 0.40,
-            vehicles_per_min_peak: 30.0,
-            capture_prob: 0.5,
+            vehicles_per_min_peak: 12.0,
+            capture_prob: 0.40,
             frames_per_pass: 5.0,
         }
     }

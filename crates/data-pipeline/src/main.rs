@@ -7,7 +7,9 @@
 //!   data-pipeline bake-cameras <map_data.csv> <out.postcard>
 
 mod ace;
+mod alpr;
 mod cameras_dahir;
+mod dashcam;
 mod equity;
 mod graph_osm;
 mod graph_synth;
@@ -53,6 +55,21 @@ fn run() -> anyhow::Result<()> {
             let out = args.get(5).context(USAGE)?;
             ensure_parent(out)?;
             equity::bake(geojson, acs, csv, out)?;
+            Ok(())
+        }
+        Some("bake-dashcam-field") => {
+            let geojson = args.get(2).context(USAGE)?;
+            let trips = args.get(3).context(USAGE)?;
+            let out = args.get(4).context(USAGE)?;
+            ensure_parent(out)?;
+            dashcam::bake(geojson, trips, out)?;
+            Ok(())
+        }
+        Some("bake-alpr") => {
+            let json = args.get(2).context(USAGE)?;
+            let out = args.get(3).context(USAGE)?;
+            ensure_parent(out)?;
+            alpr::bake(json, out)?;
             Ok(())
         }
         _ => bail!(USAGE),
@@ -105,4 +122,6 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-graph --overpass-json <walk.json> <out.postcard>\n  \
     data-pipeline bake-cameras <map_data.csv> <out.postcard>\n  \
     data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard>\n  \
-    data-pipeline bake-equity <bg.geojson> <acs.json> <map_data.csv> <out.postcard>";
+    data-pipeline bake-equity <bg.geojson> <acs.json> <map_data.csv> <out.postcard>\n  \
+    data-pipeline bake-dashcam-field <taxi_zones.geojson> <zone_trips.csv> <out.postcard>\n  \
+    data-pipeline bake-alpr <alpr_overpass.json> <out.postcard>";

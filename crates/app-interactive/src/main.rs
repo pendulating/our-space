@@ -10,13 +10,18 @@ mod loading;
 mod ui;
 mod world;
 
-use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::math::primitives::Circle;
 use bevy::prelude::*;
+use bevy::window::CursorMoved;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use loading::{AceRes, CamerasRes, EquityRes, GraphAssetRes, HeatmapRes, LoadingHandles};
-use sim_core::assets::{EquityLayer, FixedSensorLayer, HeatmapLayer};
+use bevy::math::primitives::Rectangle;
+use loading::{
+    AceRes, AlprRes, CamerasRes, DashcamFieldRes, EquityRes, GraphAssetRes, HeatmapRes,
+    LoadingHandles,
+};
+use sim_core::assets::{DashcamFieldLayer, EquityLayer, FixedSensorLayer, HeatmapLayer};
 use sim_core::simulation::SimParams;
 use sim_core::{
     AceConfig, DashcamConfig, FixedCameraDefaults, GlassesConfig, MobileScenario, Route,
@@ -25,6 +30,12 @@ use sim_core::{
 
 const WALK_SPEED: f64 = sim_core::graph::DEFAULT_WALK_SPEED_MPS;
 
+// Zoom feel: gentle multiplicative zoom per normalized scroll notch.
+const ZOOM_PER_NOTCH: f32 = 0.06;
+const ZOOM_PIXEL_DIVISOR: f32 = 160.0;
+const ZOOM_MIN: f32 = 0.4;
+const ZOOM_MAX: f32 = 30.0;
+
 // Paths relative to the AssetServer root (`assets/`); works native + web.
 // Distinct extensions disambiguate the per-type postcard loaders.
 const GRAPH_PATH: &str = "processed/graph_manhattan.osgraph";
@@ -32,9 +43,21 @@ const CAMERAS_PATH: &str = "processed/cameras_fixed.oscam";
 const ACE_PATH: &str = "processed/ace_corridors.osace";
 const HEATMAP_PATH: &str = "processed/heatmap.osheat";
 const EQUITY_PATH: &str = "processed/equity.osequity";
+const DASHCAM_FIELD_PATH: &str = "processed/dashcam_field.osfield";
+const ALPR_PATH: &str = "processed/alpr.osalpr";
 
 /// Max Shannon entropy over 5 groups = ln(5), for normalizing the choropleth.
 const MAX_ENTROPY: f64 = 1.6094379;
+
+/// Interaction mode: route between two points, or a one-point walkshed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Route,
+    Walkshed,
+}
+
+/// Walkshed time budget (seconds) — a 10-minute walk.
+const WALKSHED_SECONDS: f64 = 600.0;
 
 /// Which heatmap layer to display.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,9 +71,9 @@ impl HeatClass {
     pub fn label(self) -> &'static str {
         match self {
             HeatClass::Total => "All sources",
-            HeatClass::Fixed => "Fixed CCTV",
+            HeatClass::Fixed => "Fixed cameras (CCTV + ALPR)",
             HeatClass::Ace => "ACE buses",
-            HeatClass::Dashcam => "Dashcams",
+            HeatClass::Dashcam => "Rideshare cams",
         }
     }
 }
@@ -69,6 +92,8 @@ pub struct Sim {
     pub equity: Option<EquityLayer>,
     /// Pearson r between block-group diversity entropy and detected camera count.
     pub equity_corr: Option<f64>,
+    /// Spatial rideshare-camera density field (from real TLC trips).
+    pub dashcam_field: DashcamFieldLayer,
 }
 
 #[derive(Resource, Default)]
@@ -94,6 +119,7 @@ pub struct Params {
     pub heatmap_on: bool,
     pub heatmap_class: HeatClass,
     pub equity_on: bool,
+    pub mode: Mode,
 }
 impl Default for Params {
     fn default() -> Self {
@@ -109,15 +135,42 @@ impl Default for Params {
             heatmap_on: false,
             heatmap_class: HeatClass::Fixed,
             equity_on: false,
+            mode: Mode::Route,
         }
     }
 }
 
+/// Whether egui currently wants pointer / keyboard input (so map controls yield).
 #[derive(Resource, Default)]
-pub struct EguiWantsPointer(pub bool);
+pub struct EguiWants {
+    pub pointer: bool,
+    pub keyboard: bool,
+}
+
+/// Tracks an in-progress left-drag so we can tell a pan from a click.
+#[derive(Resource, Default)]
+pub struct DragState {
+    pub moved_px: f32,
+    pub last_cursor: Option<Vec2>,
+}
 
 #[derive(Resource, Default)]
 pub struct ResetRequested(pub bool);
+
+/// Live tally for the animated walk: distinct cameras the walker has passed
+/// through this loop (climbs, resets each pass).
+#[derive(Resource, Default)]
+pub struct WalkLive {
+    pub seen: std::collections::HashSet<u64>,
+    pub count: u32,
+    pub last_progress: f64,
+}
+
+/// The current one-point walkshed result (for the panel).
+#[derive(Resource, Default)]
+pub struct WalkshedState {
+    pub summary: Option<sim_core::WalkshedSummary>,
+}
 
 // --------------------------------------------------------------- components ---
 
@@ -133,6 +186,15 @@ struct HeatmapVis;
 struct EquityVis;
 #[derive(Component)]
 struct RouteVis;
+/// Walkshed visuals (reachable streets + in-shed camera rings + center) — cleared per query.
+#[derive(Component)]
+struct WalkshedVis;
+/// A fixed-camera dot; carries its sensor id and a flash pulse for the animated walk.
+#[derive(Component)]
+struct CameraDot {
+    id: u64,
+    flash: f32,
+}
 #[derive(Component)]
 struct Walker {
     progress_m: f64,
@@ -157,11 +219,14 @@ fn main() {
         ..default()
     }))
     .add_plugins(EguiPlugin::default())
-    .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
+    .insert_resource(ClearColor(Color::srgb_u8(0xe7, 0xdc, 0xc4))) // parchment
     .init_resource::<RouteState>()
     .init_resource::<Params>()
-    .init_resource::<EguiWantsPointer>()
+    .init_resource::<EguiWants>()
+    .init_resource::<DragState>()
     .init_resource::<ResetRequested>()
+    .init_resource::<WalkLive>()
+    .init_resource::<WalkshedState>()
     .add_systems(Startup, start_loading)
     .add_systems(
         Update,
@@ -171,6 +236,9 @@ fn main() {
             handle_click,
             recompute_on_change,
             animate_walker,
+            walk_capture_events,
+            camera_flash_decay,
+            sync_mode,
             sync_visibility,
             rebuild_heatmap,
             rebuild_equity,
@@ -230,6 +298,8 @@ fn start_loading(mut commands: Commands, asset_server: Res<AssetServer>, mut rou
         ace: asset_server.load(ACE_PATH),
         heatmap: asset_server.load(HEATMAP_PATH),
         equity: asset_server.load(EQUITY_PATH),
+        dashcam: asset_server.load(DASHCAM_FIELD_PATH),
+        alpr: asset_server.load(ALPR_PATH),
         built: false,
     });
     route.status = "Loading Manhattan map data…".into();
@@ -244,6 +314,8 @@ fn build_world(
     aces: Res<Assets<AceRes>>,
     heatmaps: Res<Assets<HeatmapRes>>,
     equities: Res<Assets<EquityRes>>,
+    dashcams: Res<Assets<DashcamFieldRes>>,
+    alprs: Res<Assets<AlprRes>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -252,19 +324,28 @@ fn build_world(
     if handles.built {
         return;
     }
-    let (Some(g), Some(c), Some(a), Some(h), Some(e)) = (
+    let (Some(g), Some(c), Some(a), Some(h), Some(e), Some(df), Some(al)) = (
         graphs.get(&handles.graph),
         cams.get(&handles.cameras),
         aces.get(&handles.ace),
         heatmaps.get(&handles.heatmap),
         equities.get(&handles.equity),
+        dashcams.get(&handles.dashcam),
+        alprs.get(&handles.alpr),
     ) else {
         return; // still loading
     };
 
     let graph = StreetGraph::from_asset(g.0.clone());
     let layer = c.0.clone();
-    let sensors = sim_core::sensors_from_layer(&layer, FixedCameraDefaults::default());
+    // Combine fixed-camera layers: Dahir CCTV + DeFlock ALPRs, re-indexing ids to
+    // the combined-vector position (used as the distinct-device key + dot index).
+    let mut sensors = sim_core::sensors_from_layer(&layer, FixedCameraDefaults::default());
+    let cctv_count = sensors.len();
+    sensors.extend(sim_core::sensors_from_layer(&al.0, FixedCameraDefaults::default()));
+    for (i, s) in sensors.iter_mut().enumerate() {
+        s.id = i as u64;
+    }
     let ace_segments: Vec<[Enu; 2]> = a
         .0
         .segments
@@ -274,6 +355,7 @@ fn build_world(
     let ace_routes = a.0.routes.clone();
     let heatmap = Some(h.0.clone());
     let equity = Some(e.0.clone());
+    let dashcam_field = df.0.clone();
     let equity_corr = {
         let xs: Vec<f64> = e.0.block_groups.iter().filter(|b| b.population > 0).map(|b| b.entropy).collect();
         let ys: Vec<f64> = e.0.block_groups.iter().filter(|b| b.population > 0).map(|b| b.camera_count as f64).collect();
@@ -282,7 +364,7 @@ fn build_world(
 
     // Streets.
     let street_mesh = meshes.add(world::line_list_mesh(world::street_line_positions(graph.asset())));
-    let street_mat = materials.add(Color::srgb(0.26, 0.28, 0.34));
+    let street_mat = materials.add(Color::srgb_u8(0x8a, 0x75, 0x50)); // warm ink linework
     commands.spawn((
         Mesh2d(street_mesh),
         MeshMaterial2d(street_mat),
@@ -298,7 +380,7 @@ fn build_world(
             pos.push([b.x as f32, b.y as f32, 0.2]);
         }
         let ace_mesh = meshes.add(world::line_list_mesh(pos));
-        let ace_mat = materials.add(Color::srgb(0.20, 0.85, 0.60));
+        let ace_mat = materials.add(Color::srgb_u8(0x72, 0x87, 0xa4)); // cold steel corridor
         commands.spawn((
             Mesh2d(ace_mesh),
             MeshMaterial2d(ace_mat),
@@ -307,17 +389,26 @@ fn build_world(
         ));
     }
 
-    // Camera dots + translucent FOV wedges.
-    let cam_circle = meshes.add(Circle::new(11.0));
-    let cam_mat = materials.add(Color::srgb(0.95, 0.27, 0.27));
-    let wedge_mat = materials.add(Color::srgba(0.95, 0.4, 0.25, 0.10));
+    // Camera markers + translucent FOV wedges. CCTV = slate circles, ALPRs =
+    // steel squares (shape + hue redundancy); both cold/foreign on the warm map.
+    let cctv_circle = meshes.add(Circle::new(11.0));
+    let alpr_square = meshes.add(Rectangle::new(17.0, 17.0));
+    let cctv_mat = materials.add(Color::srgb_u8(0x2a, 0x3a, 0x52)); // cold panopticon ink
+    let alpr_mat = materials.add(Color::srgb_u8(0x41, 0x60, 0x7e)); // steel plate-reader
+    let wedge_mat = materials.add(Color::srgba(0.11, 0.21, 0.40, 0.34)); // cold projected cone
     for s in &sensors {
         let apex = s.wedge.apex;
+        let (mesh, mat) = if s.kind == sim_core::SourceKind::Alpr {
+            (alpr_square.clone(), alpr_mat.clone())
+        } else {
+            (cctv_circle.clone(), cctv_mat.clone())
+        };
         commands.spawn((
-            Mesh2d(cam_circle.clone()),
-            MeshMaterial2d(cam_mat.clone()),
+            Mesh2d(mesh),
+            MeshMaterial2d(mat),
             Transform::from_translation(world::to_world(apex, 1.0)),
             BaseMap,
+            CameraDot { id: s.id, flash: 0.0 },
         ));
         let wedge = meshes.add(world::wedge_mesh(
             s.wedge.heading_rad as f32,
@@ -334,10 +425,11 @@ fn build_world(
     }
 
     info!(
-        "loaded {} nodes / {} edges, {} cameras, {} ACE segments ({} routes)",
+        "loaded {} nodes / {} edges, {} CCTV + {} ALPR cameras, {} ACE segments ({} routes)",
         graph.node_count(),
         graph.edge_count(),
-        sensors.len(),
+        cctv_count,
+        sensors.len() - cctv_count,
         ace_segments.len(),
         ace_routes.len(),
     );
@@ -365,6 +457,7 @@ fn build_world(
         heatmap,
         equity,
         equity_corr,
+        dashcam_field,
     });
     handles.built = true;
 }
@@ -397,63 +490,159 @@ fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
 
 // ----------------------------------------------------------------- systems ----
 
-/// Right-drag to pan, scroll to zoom (no built-in PanCamera in Bevy 0.18).
+/// Drag (left or right mouse) to pan, scroll to zoom, WASD/arrows to pan.
+#[allow(clippy::too_many_arguments)]
 fn camera_control(
     mut scroll: MessageReader<MouseWheel>,
-    mut motion: MessageReader<MouseMotion>,
+    mut cursor: MessageReader<CursorMoved>,
     buttons: Res<ButtonInput<MouseButton>>,
-    wants: Res<EguiWantsPointer>,
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    wants: Res<EguiWants>,
+    mut drag: ResMut<DragState>,
     mut q: Query<&mut Transform, With<Camera2d>>,
 ) {
     let Ok(mut t) = q.single_mut() else {
         return;
     };
 
-    let mut zoom = 0.0f32;
+    // Zoom (scroll). Normalize wheel "lines" vs trackpad "pixels" so both feel
+    // the same, then apply gentle exponential zoom (multiplicative, smooth).
+    let mut notches = 0.0f32;
     for e in scroll.read() {
-        zoom += e.y;
+        notches += match e.unit {
+            MouseScrollUnit::Line => e.y,
+            MouseScrollUnit::Pixel => e.y / ZOOM_PIXEL_DIVISOR,
+        };
     }
-    if zoom != 0.0 && !wants.0 {
-        let factor = (1.0 - zoom * 0.12).clamp(0.6, 1.6);
-        t.scale = (t.scale * Vec3::new(factor, factor, 1.0)).clamp(Vec3::splat(0.3), Vec3::splat(40.0));
+    if notches != 0.0 && !wants.pointer {
+        // Per-frame factor clamped as a rail against multi-event bursts.
+        let factor = (-notches * ZOOM_PER_NOTCH).exp().clamp(0.86, 1.16);
+        t.scale = (t.scale * Vec3::new(factor, factor, 1.0))
+            .clamp(Vec3::splat(ZOOM_MIN), Vec3::splat(ZOOM_MAX));
     }
 
-    if buttons.pressed(MouseButton::Right) {
-        let mut delta = Vec2::ZERO;
-        for e in motion.read() {
-            delta += e.delta;
+    // Reset drag distance at the start of a press.
+    if buttons.just_pressed(MouseButton::Left) {
+        drag.moved_px = 0.0;
+    }
+    let panning = (buttons.pressed(MouseButton::Left) || buttons.pressed(MouseButton::Right)) && !wants.pointer;
+
+    // Pan by cursor delta (works on web without pointer-lock, unlike MouseMotion).
+    for ev in cursor.read() {
+        if let Some(last) = drag.last_cursor {
+            let delta = ev.position - last;
+            if panning {
+                drag.moved_px += delta.length();
+                t.translation.x -= delta.x * t.scale.x;
+                t.translation.y += delta.y * t.scale.y;
+            }
         }
-        t.translation.x -= delta.x * t.scale.x;
-        t.translation.y += delta.y * t.scale.y;
-    } else {
-        motion.clear();
+        drag.last_cursor = Some(ev.position);
+    }
+
+    // Keyboard pan (WASD / arrows).
+    if !wants.keyboard {
+        let mut dir = Vec2::ZERO;
+        if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
+            dir.y += 1.0;
+        }
+        if keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown]) {
+            dir.y -= 1.0;
+        }
+        if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
+            dir.x -= 1.0;
+        }
+        if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
+            dir.x += 1.0;
+        }
+        if dir != Vec2::ZERO {
+            let step = dir.normalize() * 700.0 * t.scale.x * time.delta_secs();
+            t.translation.x += step.x;
+            t.translation.y += step.y;
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn handle_click(
     buttons: Res<ButtonInput<MouseButton>>,
-    wants: Res<EguiWantsPointer>,
+    wants: Res<EguiWants>,
+    drag: Res<DragState>,
     params: Res<Params>,
     windows: Query<&Window>,
     cam_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     sim: Option<Res<Sim>>,
     mut route: ResMut<RouteState>,
+    mut walkshed_state: ResMut<WalkshedState>,
+    mut walk_live: ResMut<WalkLive>,
     route_vis: Query<Entity, With<RouteVis>>,
+    walkshed_vis: Query<Entity, With<WalkshedVis>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
-    if wants.0 || !buttons.just_pressed(MouseButton::Left) {
+    // Place a point on click-release — but not if the cursor was dragged (pan).
+    if wants.pointer || !buttons.just_released(MouseButton::Left) || drag.moved_px > 6.0 {
         return;
     }
     let Some(sim) = sim else { return };
     let Ok(window) = windows.single() else { return };
     let Some(cursor) = window.cursor_position() else { return };
     let Ok((cam, cam_t)) = cam_q.single() else { return };
-    let Ok(world) = cam.viewport_to_world_2d(cam_t, cursor) else { return };
-    let enu = Enu::new(world.x as f64, world.y as f64);
+    let Ok(world_pt) = cam.viewport_to_world_2d(cam_t, cursor) else { return };
+    let enu = Enu::new(world_pt.x as f64, world_pt.y as f64);
 
+    match params.mode {
+        Mode::Walkshed => {
+            for e in &walkshed_vis {
+                commands.entity(e).despawn();
+            }
+            let Some(node) = sim.graph.snap_nearest(enu) else { return };
+            let ws = sim.graph.walkshed(node, WALKSHED_SECONDS, WALK_SPEED);
+            let recall = 1.0 / sim.layer.recall.unwrap_or(1.0);
+            let summary = sim_core::walkshed_exposure(&sim.graph, &ws, &sim.sensors, &[], recall);
+
+            // Reachable streets light up warm gold.
+            let mut pos = Vec::new();
+            for &ei in &ws.edges {
+                for w in sim.graph.asset().edges[ei as usize].polyline.windows(2) {
+                    pos.push([w[0][0] as f32, w[0][1] as f32, 0.12]);
+                    pos.push([w[1][0] as f32, w[1][1] as f32, 0.12]);
+                }
+            }
+            if !pos.is_empty() {
+                let mesh = meshes.add(world::line_list_mesh(pos));
+                let mat = materials.add(Color::srgb_u8(0xc9, 0x89, 0x2f));
+                commands.spawn((Mesh2d(mesh), MeshMaterial2d(mat), Transform::from_xyz(0.0, 0.0, 0.12), WalkshedVis));
+            }
+            // In-shed cameras: emphasized cold rings.
+            let ring = meshes.add(Circle::new(20.0));
+            let ring_mat = materials.add(Color::srgba(0.16, 0.30, 0.50, 0.85));
+            for p in &summary.camera_points {
+                commands.spawn((
+                    Mesh2d(ring.clone()),
+                    MeshMaterial2d(ring_mat.clone()),
+                    Transform::from_translation(world::to_world(*p, 1.6)),
+                    WalkshedVis,
+                ));
+            }
+            // Center marker (where you're standing).
+            let center = meshes.add(Circle::new(22.0));
+            let center_mat = materials.add(Color::srgb_u8(0x4e, 0x66, 0x38));
+            commands.spawn((
+                Mesh2d(center),
+                MeshMaterial2d(center_mat),
+                Transform::from_translation(world::to_world(enu, 3.0)),
+                WalkshedVis,
+            ));
+            walkshed_state.summary = Some(summary);
+            return;
+        }
+        Mode::Route => {}
+    }
+
+    // --- Route mode (A then B) ---
     if route.a.is_none() || route.b.is_some() {
         for e in &route_vis {
             commands.entity(e).despawn();
@@ -463,12 +652,14 @@ fn handle_click(
             status: "Click again to set the destination (B).".into(),
             ..default()
         };
-        spawn_marker(&mut commands, &mut meshes, &mut materials, enu, Color::srgb(0.25, 0.95, 0.45));
+        *walk_live = WalkLive::default();
+        spawn_marker(&mut commands, &mut meshes, &mut materials, enu, Color::srgb_u8(0x4e, 0x66, 0x38)); // A: lichen
         return;
     }
 
     route.b = Some(enu);
-    spawn_marker(&mut commands, &mut meshes, &mut materials, enu, Color::srgb(0.95, 0.3, 0.85));
+    *walk_live = WalkLive::default();
+    spawn_marker(&mut commands, &mut meshes, &mut materials, enu, Color::srgb_u8(0x6e, 0x2f, 0x12)); // B: deep terracotta
 
     let a = route.a.unwrap();
     let mobile = build_mobile(&params, &sim);
@@ -481,14 +672,15 @@ fn handle_click(
         enu,
         sim_params(&sim),
         params.departure_hour as f64,
+        Some(&sim.dashcam_field),
     ) {
         Ok((r, summary)) => {
             let line = meshes.add(world::line_strip_mesh(&r.points, 2.0));
-            let line_mat = materials.add(Color::srgb(0.25, 0.8, 1.0));
+            let line_mat = materials.add(Color::srgb_u8(0xa8, 0x54, 0x1f)); // route: terracotta ink
             commands.spawn((Mesh2d(line), MeshMaterial2d(line_mat), Transform::default(), RouteVis));
 
             let walker = meshes.add(Circle::new(16.0));
-            let walker_mat = materials.add(Color::srgb(1.0, 0.95, 0.25));
+            let walker_mat = materials.add(Color::srgb_u8(0x7a, 0x3b, 0x14)); // walker: burnt sienna
             commands.spawn((
                 Mesh2d(walker),
                 MeshMaterial2d(walker_mat),
@@ -505,6 +697,88 @@ fn handle_click(
     }
 }
 
+/// Animated walk: pulse each camera as the looping walker enters its view, and
+/// keep a live "captured this pass" tally (resets each loop).
+fn walk_capture_events(
+    params: Res<Params>,
+    route: Res<RouteState>,
+    sim: Option<Res<Sim>>,
+    mut walk_live: ResMut<WalkLive>,
+    walker_q: Query<&Walker>,
+    mut cams: Query<&mut CameraDot>,
+) {
+    if params.mode != Mode::Route {
+        return;
+    }
+    let Some(sim) = sim else { return };
+    let Some(r) = &route.route else { return };
+    let Ok(walker) = walker_q.single() else { return };
+
+    // Detect loop wrap (progress reset to ~0) and start the pass fresh.
+    if walker.progress_m + 1.0 < walk_live.last_progress {
+        walk_live.seen.clear();
+        walk_live.count = 0;
+    }
+    walk_live.last_progress = walker.progress_m;
+
+    let pos = r.position_at(walker.progress_m);
+    for mut dot in &mut cams {
+        let wedge = &sim.sensors[dot.id as usize].wedge;
+        if sim_core::captures(wedge, pos, &[]) && walk_live.seen.insert(dot.id) {
+            walk_live.count += 1;
+            dot.flash = 1.0;
+        }
+    }
+}
+
+/// Decay camera flash pulses (animated-walk capture feedback).
+fn camera_flash_decay(time: Res<Time>, mut q: Query<(&mut CameraDot, &mut Transform)>) {
+    let dt = time.delta_secs();
+    for (mut dot, mut t) in &mut q {
+        if dot.flash > 0.0 {
+            dot.flash = (dot.flash - dt * 2.5).max(0.0);
+        }
+        t.scale = Vec3::splat(1.0 + dot.flash * 1.8);
+    }
+}
+
+/// Clear route/walkshed visuals + state when the interaction mode changes.
+#[allow(clippy::too_many_arguments)]
+fn sync_mode(
+    params: Res<Params>,
+    mut last: Local<Option<Mode>>,
+    route_vis: Query<Entity, With<RouteVis>>,
+    walkshed_vis: Query<Entity, With<WalkshedVis>>,
+    mut route: ResMut<RouteState>,
+    mut walkshed_state: ResMut<WalkshedState>,
+    mut walk_live: ResMut<WalkLive>,
+    mut commands: Commands,
+) {
+    if *last == Some(params.mode) {
+        return;
+    }
+    let first = last.is_none();
+    *last = Some(params.mode);
+    if first {
+        return; // don't wipe on startup
+    }
+    for e in &route_vis {
+        commands.entity(e).despawn();
+    }
+    for e in &walkshed_vis {
+        commands.entity(e).despawn();
+    }
+    *route = RouteState {
+        status: match params.mode {
+            Mode::Route => "Click to set start (A), then destination (B).".into(),
+            Mode::Walkshed => "Click a point to map its 10-minute walkshed.".into(),
+        },
+        ..default()
+    };
+    walkshed_state.summary = None;
+    *walk_live = WalkLive::default();
+}
+
 /// Re-evaluate the existing route when scenario sliders / hour change.
 fn recompute_on_change(params: Res<Params>, sim: Option<Res<Sim>>, mut route: ResMut<RouteState>) {
     if !params.is_changed() {
@@ -513,7 +787,10 @@ fn recompute_on_change(params: Res<Params>, sim: Option<Res<Sim>>, mut route: Re
     let Some(sim) = sim else { return };
     let Some(r) = route.route.clone() else { return };
     let mobile = build_mobile(&params, &sim);
-    let summary = sim_core::summarize(&r, &sim.sensors, &[], &mobile, sim_params(&sim), params.departure_hour as f64);
+    let summary = sim_core::summarize(
+        &r, &sim.sensors, &[], &mobile, sim_params(&sim), params.departure_hour as f64,
+        Some(&sim.dashcam_field),
+    );
     route.summary = Some(summary);
 }
 
@@ -571,14 +848,15 @@ fn sync_visibility(
     set_vis(&mut ace, params.show_ace && !hm);
 }
 
-/// Heat gradient from low (dim) to high (red).
+/// Heat gradient from low exposure (warm parchment-ochre) to high (cold slate) —
+/// exposure literally drains warmth from the page.
 const HEAT_COLORS: [Color; 6] = [
-    Color::srgb(0.14, 0.15, 0.19),
-    Color::srgb(0.18, 0.34, 0.55),
-    Color::srgb(0.16, 0.62, 0.56),
-    Color::srgb(0.78, 0.74, 0.24),
-    Color::srgb(0.92, 0.55, 0.20),
-    Color::srgb(0.96, 0.26, 0.20),
+    Color::srgb_u8(0xdc, 0xcc, 0xa4),
+    Color::srgb_u8(0xcb, 0xa9, 0x68),
+    Color::srgb_u8(0xb8, 0x8a, 0x3e),
+    Color::srgb_u8(0x9c, 0x7c, 0x6e),
+    Color::srgb_u8(0x5e, 0x6f, 0x8c),
+    Color::srgb_u8(0x2c, 0x47, 0x63),
 ];
 
 /// Rebuild the colored heatmap meshes when the mode/class changes.
@@ -642,23 +920,36 @@ fn rebuild_heatmap(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_reset(
     mut reset: ResMut<ResetRequested>,
+    params: Res<Params>,
     mut route: ResMut<RouteState>,
-    q: Query<Entity, With<RouteVis>>,
+    mut walkshed_state: ResMut<WalkshedState>,
+    mut walk_live: ResMut<WalkLive>,
+    route_vis: Query<Entity, With<RouteVis>>,
+    walkshed_vis: Query<Entity, With<WalkshedVis>>,
     mut commands: Commands,
 ) {
     if !reset.0 {
         return;
     }
     reset.0 = false;
-    for e in &q {
+    for e in &route_vis {
+        commands.entity(e).despawn();
+    }
+    for e in &walkshed_vis {
         commands.entity(e).despawn();
     }
     *route = RouteState {
-        status: "Click the map to set a start point (A).".into(),
+        status: match params.mode {
+            Mode::Route => "Click to set start (A), then destination (B).".into(),
+            Mode::Walkshed => "Click a point to map its 10-minute walkshed.".into(),
+        },
         ..default()
     };
+    walkshed_state.summary = None;
+    *walk_live = WalkLive::default();
 }
 
 /// Rebuild the block-group diversity choropleth when toggled on/off.
@@ -691,14 +982,14 @@ fn rebuild_equity(
         let Some(mesh) = world::filled_polygon_mesh(&bg.exterior, -0.3) else {
             continue;
         };
-        // Diversity ramp: dim slate (low) -> bright magenta (high), translucent.
+        // Diversity ramp: washed clay (homogeneous) -> warm lichen (diverse),
+        // translucent. The warm/diverse ground is precisely what the cold
+        // surveillance light bleaches and clusters on (the Dahir thesis).
         let t = (bg.entropy / MAX_ENTROPY).clamp(0.0, 1.0) as f32;
-        let color = Color::srgba(
-            0.12 + 0.70 * t,
-            0.13 + 0.10 * t,
-            0.20 + 0.65 * t,
-            0.55,
-        );
+        let lo = [0xcd, 0xb9, 0x8f]; // washed clay
+        let hi = [0x4e, 0x66, 0x38]; // lichen
+        let ch = |i: usize| (lo[i] as f32 + (hi[i] as f32 - lo[i] as f32) * t) / 255.0;
+        let color = Color::srgba(ch(0), ch(1), ch(2), 0.55);
         commands.spawn((
             Mesh2d(meshes.add(mesh)),
             MeshMaterial2d(materials.add(color)),
@@ -730,6 +1021,10 @@ fn smoke_exit(
     if *frames == 5 {
         params.heatmap_on = false;
         params.equity_on = true;
+    }
+    if *frames == 7 {
+        params.equity_on = false;
+        params.mode = Mode::Walkshed; // exercise mode switch + walkshed panel
     }
     if *frames == 12 {
         let _ = std::fs::write("/tmp/ourspace_frames.txt", format!("frames_ok={}\n", *frames));

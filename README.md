@@ -42,10 +42,13 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   camera dots + FOV wedges + ACE corridors over the street network, live
   "devices that saw you" panel. Runtime-verified (Metal/M2).
 - ✅ **Phase 2**: time-of-day model + three mobile/ambient classes —
-  **ACE bus cameras** (real MTA GTFS corridors, 20 routes), **dashcams** (Tier-C
-  modeled field), and **smart glasses** (Tier-D scenario). Departure-hour
-  scrubber + penetration/adoption sliders re-evaluate the route live; per-source
-  breakdown tagged by confidence tier with Poisson P(seen).
+  **ACE bus cameras** (real MTA GTFS corridors, 20 routes), **rideshare cameras**
+  (spatial field from real NYC TLC Uber/Lyft trip density per taxi zone × tunable
+  fitting rate), and **smart glasses** (Tier-D scenario). Departure-hour scrubber +
+  sliders re-evaluate the route live; per-source breakdown tagged by confidence tier.
+- ✅ **Modes**: animated walk (cameras pulse + live capture count as the walker
+  passes them) and a **10-minute walkshed** (cameras covering everywhere you could
+  reach on foot from one point).
 - ✅ **Phase 3**: native headless `batch` computes a **citywide exposure heatmap**
   (per-class expected devices/min for all 220k street edges, rstar-accelerated,
   ~0.1s) rendered in-app as a class-selectable heat overlay; plus an **equity
@@ -69,8 +72,13 @@ cargo test -p sim-core --no-default-features
 # Bake assets (fetch raw snapshots into data/snapshots/ first; see below)
 cargo run -p data-pipeline -- bake-graph   --overpass-json data/snapshots/osm/manhattan_walk.json assets/processed/graph_manhattan.postcard
 cargo run -p data-pipeline -- bake-cameras data/snapshots/dahir/map_data.csv                       assets/processed/cameras_fixed.postcard
+# ALPR plate readers (DeFlock via OSM/Overpass: man_made=surveillance, surveillance:type=ALPR)
+cargo run -p data-pipeline -- bake-alpr    data/snapshots/deflock/alpr.json assets/processed/alpr.osalpr
 cargo run -p data-pipeline -- bake-ace     data/snapshots/gtfs/gtfs_m data/snapshots/gtfs/ace_routes.json assets/processed/ace_corridors.postcard
 cargo run -p data-pipeline -- bake-equity  data/snapshots/census/blockgroups.geojson data/snapshots/census/acs.json data/snapshots/dahir/map_data.csv assets/processed/equity.postcard
+# Rideshare-camera density (NYC TLC Uber/Lyft trips per taxi zone). Aggregate the
+# remote Parquet with DuckDB, then bake against the taxi-zone polygons:
+cargo run -p data-pipeline -- bake-dashcam-field data/snapshots/tlc/taxi_zones.geojson data/snapshots/tlc/zone_trips.csv assets/processed/dashcam_field.osfield
 
 # Citywide exposure heatmap (per-edge intensities; arg = reference hour 0..23)
 cargo run -p batch --release -- heatmap assets/processed/heatmap.postcard 17
@@ -123,11 +131,15 @@ curl -L --create-dirs -o data/snapshots/dahir/map_data.csv \
 |---|---|---|
 | Walk graph | OpenStreetMap via Overpass API | ODbL 1.0 |
 | Fixed CCTV | Dahir et al. 2025, Stanford Digital Repository (`map_data.csv`) | CC BY 4.0 |
+| ALPR readers | DeFlock crowdsourced plate readers via OpenStreetMap (`surveillance:type=ALPR`) | ODbL 1.0 |
 | ACE corridors | MTA GTFS (route geometry) + data.ny.gov `ki2b-sg5y` (ACE route list) | MTA / OPEN-NY ToU |
 | Block groups | Census TIGERweb (geometry) + Census Reporter API (ACS 5-year B03002, keyless) | Census public domain |
+| Rideshare cams | NYC TLC High-Volume FHV trip records (Uber/Lyft), aggregated by taxi zone via DuckDB | NYC OpenData / TLC terms |
 
-Dashcam and smart-glasses layers are **scenario models** (Tier C/D), not datasets —
-their intensities are user-tunable assumptions, surfaced as such in the UI.
+**Rideshare cameras** are framed as the in-vehicle cameras NYC requires for-hire
+vehicles to carry; their **spatial density is real** (TLC trip distribution per
+taxi zone, normalized to the median zone), while the camera-per-vehicle rate is a
+tunable assumption. **Smart glasses** remain a fully speculative scenario layer.
 
 Camera points are Google Street View **sample-points where a camera was detected**
 (detector recall ~0.63), not surveyed device locations — surfaced in-app as a

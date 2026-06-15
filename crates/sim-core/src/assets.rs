@@ -3,6 +3,7 @@
 //! postcard for a compact, WASM-friendly binary.
 
 use crate::exposure::SourceKind;
+use crate::math::Vec2;
 use crate::projection::GeoOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -175,9 +176,92 @@ impl EquityLayer {
     }
 }
 
+/// One taxi-zone polygon part carrying its zone's normalized rideshare density.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashcamZone {
+    /// Exterior ring in ENU meters.
+    pub exterior: Vec<[f64; 2]>,
+    /// `[min_x, min_y, max_x, max_y]` ENU bounds for fast point prefilter.
+    pub bbox: [f64; 4],
+    /// Rideshare density relative to the median Manhattan zone (≈1.0 typical).
+    pub intensity: f64,
+}
+
+/// Spatial dashcam field: rideshare (for-hire vehicle) density by taxi zone,
+/// from NYC TLC High-Volume FHV trip records. Dashcams ride in these vehicles,
+/// so exposure follows where Uber/Lyft actually drive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashcamFieldLayer {
+    pub origin: GeoOrigin,
+    pub zones: Vec<DashcamZone>,
+    pub provenance: Provenance,
+}
+
+/// Ray-casting point-in-polygon on an ENU ring.
+fn point_in_ring(p: Vec2, ring: &[[f64; 2]]) -> bool {
+    let n = ring.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (ring[i][0], ring[i][1]);
+        let (xj, yj) = (ring[j][0], ring[j][1]);
+        if ((yi > p.y) != (yj > p.y)) && (p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+impl DashcamFieldLayer {
+    /// Relative rideshare density at an ENU point (1.0 ≈ a typical zone). Falls
+    /// back to 1.0 outside all zones so the dashcam class never silently vanishes.
+    pub fn intensity_at(&self, p: Vec2) -> f64 {
+        for z in &self.zones {
+            if p.x >= z.bbox[0] && p.x <= z.bbox[2] && p.y >= z.bbox[1] && p.y <= z.bbox[3]
+                && point_in_ring(p, &z.exterior)
+            {
+                return z.intensity;
+            }
+        }
+        1.0
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashcam_field_intensity_lookup() {
+        let layer = DashcamFieldLayer {
+            origin: GeoOrigin::MANHATTAN,
+            zones: vec![DashcamZone {
+                exterior: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                bbox: [0.0, 0.0, 10.0, 10.0],
+                intensity: 3.5,
+            }],
+            provenance: Provenance {
+                source: String::new(),
+                url: String::new(),
+                license: String::new(),
+                as_of: String::new(),
+                notes: String::new(),
+            },
+        };
+        assert_eq!(layer.intensity_at(Vec2::new(5.0, 5.0)), 3.5); // inside
+        assert_eq!(layer.intensity_at(Vec2::new(50.0, 50.0)), 1.0); // outside -> fallback
+    }
 
     #[test]
     fn graph_asset_round_trips_through_postcard() {

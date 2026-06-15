@@ -4,7 +4,7 @@
 //! Run from the workspace root (so the asset paths resolve):
 //!   cargo run -p sim-core --example route_demo -- 40.758 -73.9855 40.7359 -73.9911
 
-use sim_core::assets::{AceCorridorLayer, FixedSensorLayer, GraphAsset};
+use sim_core::assets::{AceCorridorLayer, DashcamFieldLayer, FixedSensorLayer, GraphAsset};
 use sim_core::scenario::{run_route, sensors_from_layer, FixedCameraDefaults};
 use sim_core::simulation::SimParams;
 use sim_core::{AceConfig, EnuProjection, MobileScenario, StreetGraph, Vec2};
@@ -44,9 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let dashcam_field = std::fs::read(format!("{base}/dashcam_field.osfield"))
+        .ok()
+        .and_then(|b| DashcamFieldLayer::from_bytes(&b).ok());
+
     let from = proj.to_enu(from_lat, from_lon);
     let to = proj.to_enu(to_lat, to_lon);
-    let (_route, sum) = run_route(&graph, &sensors, &[], &mobile, from, to, params, departure_hour)?;
+    let (_route, sum) = run_route(
+        &graph, &sensors, &[], &mobile, from, to, params, departure_hour, dashcam_field.as_ref(),
+    )?;
 
     println!("── our-space exposure demo ──────────────────────────────");
     println!(

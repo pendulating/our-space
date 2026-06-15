@@ -2,10 +2,12 @@
 //! a route end-to-end into an exposure summary. Used by the app, the batch host,
 //! and the headless `route_demo` example.
 
-use crate::assets::FixedSensorLayer;
+use std::collections::HashSet;
+
+use crate::assets::{DashcamFieldLayer, FixedSensorLayer};
 use crate::exposure::{ConfidenceTier, ExposureTally, SourceKind};
-use crate::geometry::{FrustumWedge, OccluderEdge};
-use crate::graph::{Route, RouteError, StreetGraph};
+use crate::geometry::{captures, FrustumWedge, OccluderEdge};
+use crate::graph::{Route, RouteError, StreetGraph, Walkshed};
 use crate::math::Vec2;
 use crate::mobile::MobileScenario;
 use crate::simulation::{simulate_full, SensorInstance, SimParams};
@@ -50,6 +52,58 @@ pub fn sensors_from_layer(layer: &FixedSensorLayer, d: FixedCameraDefaults) -> V
         .collect()
 }
 
+/// Result of a one-point walkshed exposure query.
+#[derive(Debug, Clone)]
+pub struct WalkshedSummary {
+    pub max_minutes: f64,
+    pub reachable_edges: usize,
+    /// Distinct fixed cameras whose coverage touches the walkshed (as detected).
+    pub cameras_raw: u32,
+    /// Recall-corrected estimate (the headline).
+    pub cameras_corrected: f64,
+    /// ENU positions of those cameras (for highlighting on the map).
+    pub camera_points: Vec<Vec2>,
+}
+
+/// Count the distinct fixed cameras that could capture you anywhere within a
+/// walkshed (their FOV covers any reachable street point).
+pub fn walkshed_exposure(
+    graph: &StreetGraph,
+    ws: &Walkshed,
+    sensors: &[SensorInstance],
+    occluders: &[OccluderEdge],
+    recall_factor: f64,
+) -> WalkshedSummary {
+    let edges = &graph.asset().edges;
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut camera_points: Vec<Vec2> = Vec::new();
+
+    for &ei in &ws.edges {
+        let poly = &edges[ei as usize].polyline;
+        // Sample first / middle / last vertices of each (short) edge.
+        let idxs = [0, poly.len() / 2, poly.len().saturating_sub(1)];
+        for &k in &idxs {
+            let p = poly[k];
+            let pt = Vec2::new(p[0], p[1]);
+            for s in sensors {
+                if !seen.contains(&s.id) && captures(&s.wedge, pt, occluders) {
+                    seen.insert(s.id);
+                    camera_points.push(s.wedge.apex);
+                }
+            }
+        }
+    }
+
+    let raw = seen.len() as u32;
+    WalkshedSummary {
+        max_minutes: ws.max_seconds / 60.0,
+        reachable_edges: ws.edges.len(),
+        cameras_raw: raw,
+        cameras_corrected: raw as f64 * recall_factor,
+        camera_points,
+    }
+}
+
 /// Per-class exposure for the breakdown panel.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceBreakdown {
@@ -77,6 +131,7 @@ pub struct RouteSummary {
 
 /// Route between two ENU points, simulate full exposure (fixed + mobile), and
 /// summarize. `departure_hour` (0–24) scales the time-dependent mobile classes.
+#[allow(clippy::too_many_arguments)]
 pub fn run_route(
     graph: &StreetGraph,
     sensors: &[SensorInstance],
@@ -86,14 +141,16 @@ pub fn run_route(
     to: Vec2,
     params: SimParams,
     departure_hour: f64,
+    dashcam_field: Option<&DashcamFieldLayer>,
 ) -> Result<(Route, RouteSummary), RouteError> {
     let route = graph.route_points(from, to)?;
-    let summary = summarize(&route, sensors, occluders, mobile, params, departure_hour);
+    let summary = summarize(&route, sensors, occluders, mobile, params, departure_hour, dashcam_field);
     Ok((route, summary))
 }
 
 /// Simulate exposure for an already-computed route and summarize. Lets the app
 /// re-evaluate when scenario sliders / departure hour change without re-routing.
+#[allow(clippy::too_many_arguments)]
 pub fn summarize(
     route: &Route,
     sensors: &[SensorInstance],
@@ -101,8 +158,9 @@ pub fn summarize(
     mobile: &MobileScenario,
     params: SimParams,
     departure_hour: f64,
+    dashcam_field: Option<&DashcamFieldLayer>,
 ) -> RouteSummary {
-    let tally = simulate_full(route, sensors, occluders, mobile, params, departure_hour);
+    let tally = simulate_full(route, sensors, occluders, mobile, params, departure_hour, dashcam_field);
 
     let breakdown: Vec<SourceBreakdown> = SourceKind::ALL
         .iter()

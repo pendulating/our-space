@@ -6,6 +6,7 @@
 //! [`Route`]; here we sample position(t) at constant speed and, at each tick,
 //! test the walker against every sensor's capture geometry.
 
+use crate::assets::DashcamFieldLayer;
 use crate::exposure::{ExposureTally, SourceKind};
 use crate::geometry::{captures, FrustumWedge, OccluderEdge};
 use crate::graph::Route;
@@ -53,7 +54,7 @@ pub fn simulate_fixed(
     occluders: &[OccluderEdge],
     params: SimParams,
 ) -> ExposureTally {
-    simulate_full(route, sensors, occluders, &MobileScenario::default(), params, 12.0)
+    simulate_full(route, sensors, occluders, &MobileScenario::default(), params, 12.0, None)
 }
 
 /// Full exposure simulation: fixed cameras + the enabled mobile/ambient classes,
@@ -63,6 +64,7 @@ pub fn simulate_fixed(
 /// each tick, accumulate fixed captures (in-FOV + line-of-sight) and mobile
 /// encounter intensities (ACE corridor proximity, dashcam/glasses fields), with
 /// the hour-of-day scaling bus headways, traffic, and foot traffic.
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_full(
     route: &Route,
     fixed: &[SensorInstance],
@@ -70,6 +72,7 @@ pub fn simulate_full(
     mobile: &MobileScenario,
     params: SimParams,
     departure_hour: f64,
+    dashcam_field: Option<&DashcamFieldLayer>,
 ) -> ExposureTally {
     let mut tally = ExposureTally::new();
     tally.recall_factor = params.recall_factor;
@@ -110,9 +113,11 @@ pub fn simulate_full(
             }
         }
 
-        // --- dashcams: field over any street, scaled by diurnal traffic ---
+        // --- dashcams (rideshare cameras): rate follows local rideshare density
+        //     (real TLC trip field) × diurnal traffic ---
         if let Some(d) = &mobile.dashcam {
-            let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour);
+            let zone = dashcam_field.map_or(1.0, |f| f.intensity_at(*pos));
+            let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour) * zone;
             let encounters = veh_per_s * d.penetration * d.capture_prob * tick_dt;
             tally.record_mobile(SourceKind::Dashcam, encounters, encounters * d.frames_per_pass);
         }
@@ -158,6 +163,7 @@ impl ExposureRates {
 /// ACE corridor's capture range. Fixed cameras covering the point contribute one
 /// device each (recall-corrected); mobile classes contribute their per-minute
 /// encounter rate at the given hour.
+#[allow(clippy::too_many_arguments)]
 pub fn exposure_rates_per_minute(
     point: Vec2,
     hour: f64,
@@ -166,6 +172,7 @@ pub fn exposure_rates_per_minute(
     near_ace: bool,
     mobile: &MobileScenario,
     recall_factor: f64,
+    dashcam_field: Option<&DashcamFieldLayer>,
 ) -> ExposureRates {
     let mut r = ExposureRates::default();
 
@@ -182,7 +189,8 @@ pub fn exposure_rates_per_minute(
         }
     }
     if let Some(d) = &mobile.dashcam {
-        let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour);
+        let zone = dashcam_field.map_or(1.0, |f| f.intensity_at(point));
+        let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour) * zone;
         r.dashcam = veh_per_s * d.penetration * d.capture_prob * 60.0;
     }
     if let Some(g) = &mobile.glasses {
@@ -266,7 +274,7 @@ mod tests {
         let ace = AceConfig::new(vec![[Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0)]]);
         let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None };
         let dev = |hour| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour)
+            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None)
                 .source(SourceKind::AceBus)
                 .devices
         };
@@ -282,7 +290,7 @@ mod tests {
         // Corridor 100 m away — beyond the 20 m capture range.
         let ace = AceConfig::new(vec![[Vec2::new(0.0, 100.0), Vec2::new(20.0, 100.0)]]);
         let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None };
-        let t = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.0);
+        let t = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.0, None);
         assert_eq!(t.source(SourceKind::AceBus).devices, 0.0);
     }
 
@@ -294,10 +302,10 @@ mod tests {
             dashcam: Some(DashcamConfig::default()),
             glasses: None,
         };
-        let peak = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.5)
+        let peak = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.5, None)
             .source(SourceKind::Dashcam)
             .devices;
-        let night = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 3.0)
+        let night = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 3.0, None)
             .source(SourceKind::Dashcam)
             .devices;
         assert!(night > 0.0);
@@ -309,7 +317,7 @@ mod tests {
         // Camera at (0,5) looking south covers the origin (5 m away, in range).
         let cam = cam_at(0.0, 5.0, 180.0);
         let fixed_only =
-            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &[], false, &MobileScenario::default(), 1.0);
+            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &[], false, &MobileScenario::default(), 1.0, None);
         assert!((fixed_only.fixed - 1.0).abs() < 1e-9, "one covering camera, got {}", fixed_only.fixed);
         assert_eq!(fixed_only.ace, 0.0);
 
@@ -319,7 +327,7 @@ mod tests {
             glasses: None,
         };
         let with_mobile =
-            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &[], true, &mobile, 1.0);
+            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &[], true, &mobile, 1.0, None);
         assert!(with_mobile.ace > 0.0 && with_mobile.dashcam > 0.0);
         assert!(with_mobile.total() > fixed_only.total());
     }

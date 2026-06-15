@@ -13,7 +13,9 @@ use bevy::asset::{AssetLoader, LoadContext};
 use bevy::prelude::*;
 use serde::de::DeserializeOwned;
 
-use sim_core::assets::{AceCorridorLayer, EquityLayer, FixedSensorLayer, GraphAsset, HeatmapLayer};
+use sim_core::assets::{
+    AceCorridorLayer, DashcamFieldLayer, EquityLayer, FixedSensorLayer, GraphAsset, HeatmapLayer,
+};
 
 macro_rules! postcard_asset {
     ($name:ident, $inner:ty) => {
@@ -27,6 +29,8 @@ postcard_asset!(CamerasRes, FixedSensorLayer);
 postcard_asset!(AceRes, AceCorridorLayer);
 postcard_asset!(HeatmapRes, HeatmapLayer);
 postcard_asset!(EquityRes, EquityLayer);
+postcard_asset!(DashcamFieldRes, DashcamFieldLayer);
+postcard_asset!(AlprRes, FixedSensorLayer);
 
 /// Generic loader for any postcard-encoded `Asset` newtype. Each instance owns a
 /// distinct file extension so the right loader resolves per asset type (a single
@@ -71,11 +75,15 @@ pub fn register(app: &mut App) {
         .init_asset::<AceRes>()
         .init_asset::<HeatmapRes>()
         .init_asset::<EquityRes>()
+        .init_asset::<DashcamFieldRes>()
+        .init_asset::<AlprRes>()
         .register_asset_loader(PostcardLoader::<GraphAssetRes>::new("osgraph"))
         .register_asset_loader(PostcardLoader::<CamerasRes>::new("oscam"))
         .register_asset_loader(PostcardLoader::<AceRes>::new("osace"))
         .register_asset_loader(PostcardLoader::<HeatmapRes>::new("osheat"))
-        .register_asset_loader(PostcardLoader::<EquityRes>::new("osequity"));
+        .register_asset_loader(PostcardLoader::<EquityRes>::new("osequity"))
+        .register_asset_loader(PostcardLoader::<DashcamFieldRes>::new("osfield"))
+        .register_asset_loader(PostcardLoader::<AlprRes>::new("osalpr"));
 }
 
 /// Handles requested at startup; the world is built once they resolve.
@@ -86,5 +94,7 @@ pub struct LoadingHandles {
     pub ace: Handle<AceRes>,
     pub heatmap: Handle<HeatmapRes>,
     pub equity: Handle<EquityRes>,
+    pub dashcam: Handle<DashcamFieldRes>,
+    pub alpr: Handle<AlprRes>,
     pub built: bool,
 }

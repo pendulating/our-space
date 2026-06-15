@@ -41,6 +41,8 @@ pub enum SourceKind {
     AceBus,
     Dashcam,
     SmartGlasses,
+    /// Automated license-plate readers (DeFlock-mapped: Flock + agency systems).
+    Alpr,
 }
 
 impl SourceKind {
@@ -48,6 +50,7 @@ impl SourceKind {
         match self {
             SourceKind::DotLiveView => ConfidenceTier::A,
             SourceKind::AceBus => ConfidenceTier::A,
+            SourceKind::Alpr => ConfidenceTier::A, // mapped points (crowdsourced, incomplete)
             SourceKind::FixedCctv => ConfidenceTier::B,
             SourceKind::Dashcam => ConfidenceTier::C,
             SourceKind::SmartGlasses => ConfidenceTier::D,
@@ -59,23 +62,34 @@ impl SourceKind {
             SourceKind::FixedCctv => "Fixed CCTV",
             SourceKind::DotLiveView => "DOT live-view",
             SourceKind::AceBus => "ACE buses",
-            SourceKind::Dashcam => "Dashcams",
+            SourceKind::Dashcam => "Rideshare cams",
             SourceKind::SmartGlasses => "Smart glasses",
+            SourceKind::Alpr => "ALPR readers",
         }
     }
 
-    /// Fixed (point-with-frustum) classes count distinct device ids and get the
-    /// recall correction; mobile/ambient classes accumulate Poisson encounters.
+    /// Fixed (point-with-frustum) classes count distinct device ids; mobile/
+    /// ambient classes accumulate Poisson encounters.
     pub fn is_fixed(self) -> bool {
-        matches!(self, SourceKind::FixedCctv | SourceKind::DotLiveView)
+        matches!(
+            self,
+            SourceKind::FixedCctv | SourceKind::DotLiveView | SourceKind::Alpr
+        )
     }
 
-    pub const ALL: [SourceKind; 5] = [
+    /// Only the street-view-detected CCTV layer carries the recall correction;
+    /// mapped points (DOT cams, ALPRs) are taken as located.
+    pub fn recall_corrected(self) -> bool {
+        matches!(self, SourceKind::FixedCctv)
+    }
+
+    pub const ALL: [SourceKind; 6] = [
         SourceKind::FixedCctv,
         SourceKind::DotLiveView,
         SourceKind::AceBus,
         SourceKind::Dashcam,
         SourceKind::SmartGlasses,
+        SourceKind::Alpr,
     ];
 }
 
@@ -99,7 +113,7 @@ pub fn p_at_least_one(expected: f64) -> f64 {
 /// The full exposure result, split by source plus the toggle metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExposureTally {
-    per_source: [SourceTally; 5],
+    per_source: [SourceTally; 6],
     /// (source index, device id) pairs already counted, so a fixed camera seen
     /// across many ticks counts once. Transient; not serialized.
     #[serde(skip)]
@@ -115,7 +129,7 @@ pub struct ExposureTally {
 impl Default for ExposureTally {
     fn default() -> Self {
         ExposureTally {
-            per_source: [SourceTally::default(); 5],
+            per_source: [SourceTally::default(); 6],
             fixed_seen: HashSet::new(),
             route_length_m: 0.0,
             covered_length_m: 0.0,
@@ -136,6 +150,7 @@ impl ExposureTally {
             SourceKind::AceBus => 2,
             SourceKind::Dashcam => 3,
             SourceKind::SmartGlasses => 4,
+            SourceKind::Alpr => 5,
         }
     }
 
@@ -174,7 +189,7 @@ impl ExposureTally {
     /// classes only.
     pub fn adjusted_devices(&self, kind: SourceKind) -> f64 {
         let d = self.source(kind).devices;
-        if kind.is_fixed() {
+        if kind.recall_corrected() {
             d * self.recall_factor
         } else {
             d

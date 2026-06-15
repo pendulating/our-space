@@ -10,7 +10,8 @@ use rstar::primitives::GeomWithData;
 use rstar::RTree;
 
 use sim_core::assets::{
-    AceCorridorLayer, EdgeData, FixedSensorLayer, GraphAsset, HeatmapLayer, Provenance,
+    AceCorridorLayer, DashcamFieldLayer, EdgeData, FixedSensorLayer, GraphAsset, HeatmapLayer,
+    Provenance,
 };
 use sim_core::{
     exposure_rates_per_minute, sensors_from_layer, AceConfig, FixedCameraDefaults, MobileScenario,
@@ -22,6 +23,8 @@ use sim_core::{
 const GRAPH_PATH: &str = "crates/app-interactive/assets/processed/graph_manhattan.osgraph";
 const CAMERAS_PATH: &str = "crates/app-interactive/assets/processed/cameras_fixed.oscam";
 const ACE_PATH: &str = "crates/app-interactive/assets/processed/ace_corridors.osace";
+const DASHCAM_PATH: &str = "crates/app-interactive/assets/processed/dashcam_field.osfield";
+const ALPR_PATH: &str = "crates/app-interactive/assets/processed/alpr.osalpr";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -52,7 +55,16 @@ fn edge_midpoint(e: &EdgeData) -> Enu {
 fn heatmap(out: &str, hour: f64) -> Result<()> {
     let graph = GraphAsset::from_bytes(&read(GRAPH_PATH)?).context("decoding graph")?;
     let cam_layer = FixedSensorLayer::from_bytes(&read(CAMERAS_PATH)?).context("decoding cameras")?;
-    let sensors = sensors_from_layer(&cam_layer, FixedCameraDefaults::default());
+    let mut sensors = sensors_from_layer(&cam_layer, FixedCameraDefaults::default());
+    // Add DeFlock ALPRs to the fixed-camera set.
+    if let Ok(b) = std::fs::read(ALPR_PATH) {
+        if let Ok(al) = FixedSensorLayer::from_bytes(&b) {
+            sensors.extend(sensors_from_layer(&al, FixedCameraDefaults::default()));
+        }
+    }
+    for (i, s) in sensors.iter_mut().enumerate() {
+        s.id = i as u64;
+    }
     let recall = 1.0 / cam_layer.recall.unwrap_or(1.0);
 
     // Spatial index of camera positions (generous query radius; the FOV test
@@ -98,6 +110,11 @@ fn heatmap(out: &str, hour: f64) -> Result<()> {
         }
     }
 
+    // Spatial rideshare-camera field (real TLC trip density).
+    let dashcam_field: Option<DashcamFieldLayer> = std::fs::read(DASHCAM_PATH)
+        .ok()
+        .and_then(|b| DashcamFieldLayer::from_bytes(&b).ok());
+
     let n = graph.edges.len();
     let (mut fixed, mut ace_v, mut dashcam, mut glasses) = (
         Vec::with_capacity(n),
@@ -115,7 +132,9 @@ fn heatmap(out: &str, hour: f64) -> Result<()> {
         let near_ace = ace_tree
             .as_ref()
             .is_some_and(|t| t.locate_within_distance([mid.x, mid.y], ace_cap_r2).next().is_some());
-        let r = exposure_rates_per_minute(mid, hour, &nearby, &[], near_ace, &mobile, recall);
+        let r = exposure_rates_per_minute(
+            mid, hour, &nearby, &[], near_ace, &mobile, recall, dashcam_field.as_ref(),
+        );
         max_total = max_total.max(r.total());
         fixed.push(r.fixed);
         ace_v.push(r.ace);

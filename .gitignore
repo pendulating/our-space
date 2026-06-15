@@ -9,14 +9,9 @@ Cargo.lock.orig
 # Large baked assets (regenerable via data-pipeline / batch)
 /crates/app-interactive/assets/processed/
 
-# Raw data snapshots are large; keep the provenance manifest, ignore the payloads
-/data/snapshots/**/*.csv
-/data/snapshots/**/*.zip
-/data/snapshots/**/*.geojson
-/data/snapshots/**/*.graphml
-/data/snapshots/**/*.json
-/data/snapshots/**/*.txt
-!/data/snapshots/**/manifest.json
+# Raw data snapshots are large and regenerable (fetched via the documented
+# curl/DuckDB/Overpass steps); never commit them.
+/data/snapshots/
 
 # Python virtualenv for the OSMnx export step
 /.venv

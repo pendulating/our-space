@@ -4,8 +4,9 @@
 use crate::assets::GraphAsset;
 use crate::math::Vec2;
 use crate::projection::GeoOrigin;
-use petgraph::algo::astar;
+use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{NodeIndex, UnGraph};
+use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RouteError {
@@ -105,6 +106,35 @@ impl StreetGraph {
         let a = self.snap_nearest(from).ok_or(RouteError::Empty)?;
         let b = self.snap_nearest(to).ok_or(RouteError::Empty)?;
         self.route(a, b)
+    }
+
+    /// All street reachable on foot within `max_seconds` of `start` (a walkshed
+    /// / isochrone), via Dijkstra with time-weighted edges.
+    pub fn walkshed(&self, start: u32, max_seconds: f64, speed_mps: f64) -> Walkshed {
+        let costs = dijkstra(
+            &self.g,
+            NodeIndex::new(start as usize),
+            None,
+            |e| self.asset.edges[*e.weight()].length_m / speed_mps,
+        );
+        let node_time: HashMap<u32, f64> = costs
+            .into_iter()
+            .filter(|(_, c)| *c <= max_seconds)
+            .map(|(n, c)| (n.index() as u32, c))
+            .collect();
+        // An edge is in the walkshed when both endpoints are reachable in time.
+        let edges: Vec<u32> = (0..self.asset.edges.len() as u32)
+            .filter(|&i| {
+                let e = &self.asset.edges[i as usize];
+                node_time.contains_key(&e.from) && node_time.contains_key(&e.to)
+            })
+            .collect();
+        Walkshed {
+            start,
+            max_seconds,
+            node_time,
+            edges,
+        }
     }
 
     /// Stitch the node path into a continuous ENU polyline, orienting each
@@ -235,6 +265,18 @@ impl Route {
     }
 }
 
+/// A walkshed (isochrone): the street network reachable within a time budget on
+/// foot from a start node.
+#[derive(Debug, Clone)]
+pub struct Walkshed {
+    pub start: u32,
+    pub max_seconds: f64,
+    /// Reachable node id -> arrival time (seconds).
+    pub node_time: HashMap<u32, f64>,
+    /// Indices into the graph's edges for edges fully inside the walkshed.
+    pub edges: Vec<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +343,25 @@ mod tests {
         let (t_end, p_end) = *samples.last().unwrap();
         assert!((t_end - 10.0).abs() < 1e-6);
         assert!(p_end.distance(Vec2::new(10.0, 0.0)) < 1e-6);
+    }
+
+    #[test]
+    fn walkshed_respects_time_budget() {
+        // Square, 10 m edges, walk 1 m/s -> each edge = 10 s.
+        let g = StreetGraph::from_asset(square_graph());
+        // 15 s budget from node 0: reach 0, and neighbors 1 & 3 (10 s); node 2 is 20 s away.
+        let ws = g.walkshed(0, 15.0, 1.0);
+        assert!(ws.node_time.contains_key(&0));
+        assert!(ws.node_time.contains_key(&1));
+        assert!(ws.node_time.contains_key(&3));
+        assert!(!ws.node_time.contains_key(&2));
+        // Reachable edges: 0-1 and 3-0 (both endpoints reachable); not 1-2 or 2-3.
+        assert_eq!(ws.edges.len(), 2);
+
+        // A generous budget reaches everything.
+        let all = g.walkshed(0, 1000.0, 1.0);
+        assert_eq!(all.node_time.len(), 4);
+        assert_eq!(all.edges.len(), 4);
     }
 
     #[test]
