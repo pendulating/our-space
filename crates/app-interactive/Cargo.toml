@@ -1,0 +1,20 @@
+[package]
+name = "app-interactive"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Interactive single-route our-space app (native window for dev; WebGPU WASM for the public build)."
+
+[dependencies]
+sim-core = { workspace = true, features = ["ecs"] }
+# Declared directly (not via workspace) so we get Bevy's default desktop feature
+# set; the wasm build will swap to a curated feature set in Phase 4.
+bevy = "0.18"
+bevy_egui = { workspace = true }
+bevy_prototype_lyon = { workspace = true }
+bevy_ecs_tilemap = { workspace = true }
+leafwing-input-manager = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# wasm interop bridge wired up in Phase 4.

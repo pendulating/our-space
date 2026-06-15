@@ -1,0 +1,14 @@
+[package]
+name = "batch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native headless batch: citywide exposure heatmaps + O-D route sampling (Phase 3)."
+
+[dependencies]
+sim-core = { workspace = true, features = ["ecs"] }
+# Headless: no winit/render. `std` provides the glam math backend; the parallel
+# executor + timing plugins are added in Phase 3 when the batch loop lands.
+bevy = { version = "0.18", default-features = false, features = ["std"] }
+anyhow = { workspace = true }

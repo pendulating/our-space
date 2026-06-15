@@ -1,0 +1,23 @@
+[package]
+name = "sim-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Render-agnostic simulation core for our-space: projection, sensor geometry, exposure model, and (optional) Bevy ECS layer."
+
+[features]
+# Pure analytical core (projection + geometry + exposure + asset structs) builds
+# and tests with zero Bevy. The `ecs` feature adds the Bevy component/resource
+# layer; it is opt-in so the core stays fast to compile/test and WASM-lean.
+default = []
+ecs = ["dep:bevy_ecs"]
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+petgraph = { workspace = true }
+
+# ECS layer (optional). Only bevy_ecs is needed; positions use our own ENU Vec2.
+bevy_ecs = { workspace = true, optional = true }

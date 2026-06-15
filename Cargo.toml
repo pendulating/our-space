@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sim-core",
+    "crates/data-pipeline",
+    "crates/app-interactive",
+    "crates/batch",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mattfranchi/our-space"
+
+# Centralized, version-pinned dependencies. Versions for the Bevy stack are the
+# ones verified during planning (see .claude/plans). The leafwing pin is load-bearing:
+# leafwing-input-manager 0.18 targets Bevy 0.17 and would split the Bevy graph.
+[workspace.dependencies]
+# --- Bevy ---
+# The `bevy` umbrella is declared directly in each binary crate (app-interactive
+# uses default/desktop features; batch goes headless) so each can pick its own
+# feature set — workspace inheritance can't override `default-features` per crate.
+# sim-core's optional `ecs` layer only needs bevy_ecs (with a std math backend).
+bevy_ecs = { version = "0.18", default-features = false, features = ["std"] }
+
+# --- Bevy companions (all must agree on Bevy 0.18) ---
+bevy_egui = "0.39"
+bevy_ecs_tilemap = "0.18"
+bevy_prototype_lyon = "0.16"
+leafwing-input-manager = "0.20"
+
+# --- routing / graph / geometry ---
+petgraph = "0.6"
+fast_paths = "1.0"
+geo = "0.29"
+geo-types = "0.7"
+geojson = "0.24"
+rstar = "0.12"
+
+# --- transit / data ---
+gtfs-structures = { version = "0.48", default-features = false }
+csv = "1"
+
+# --- serialization / utility ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+anyhow = "1"
+thiserror = "2"
+
+# our crates
+sim-core = { path = "crates/sim-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Aggressive size optimization for the wasm bundle (Phase 4). Build with:
+#   cargo build --profile wasm-release --target wasm32-unknown-unknown
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

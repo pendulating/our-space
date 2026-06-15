@@ -1,0 +1,14 @@
+[package]
+name = "data-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Offline native CLI: ingest NYC open datasets into baked static sim assets."
+
+[dependencies]
+sim-core = { workspace = true }
+anyhow = { workspace = true }
+csv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

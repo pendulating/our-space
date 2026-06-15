@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# macOS
+.DS_Store
+
+# Large baked assets (keep small samples in-repo; bake big ones locally)
+/assets/processed/*.bin
+/assets/processed/*.postcard
+
+# Raw data snapshots are large; keep the provenance manifest, ignore the payloads
+/data/snapshots/**/*.csv
+/data/snapshots/**/*.zip
+/data/snapshots/**/*.geojson
+/data/snapshots/**/*.graphml
+/data/snapshots/**/*.json
+!/data/snapshots/**/manifest.json
+
+# Python virtualenv for the OSMnx export step
+/.venv
+__pycache__/
+
+# Web build output
+/web/dist
+/web/node_modules
