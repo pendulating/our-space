@@ -87,6 +87,28 @@ impl FixedSensorLayer {
     }
 }
 
+/// Baked ACE bus-camera corridors: the line segments enforced buses traverse,
+/// in ENU meters. A walker within the configured curb reach of any segment can
+/// be captured by a passing bus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AceCorridorLayer {
+    pub origin: GeoOrigin,
+    /// `[[x0,y0],[x1,y1]]` ENU segments.
+    pub segments: Vec<[[f64; 2]; 2]>,
+    /// ACE route short-names included (for provenance/UI).
+    pub routes: Vec<String>,
+    pub provenance: Provenance,
+}
+
+impl AceCorridorLayer {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

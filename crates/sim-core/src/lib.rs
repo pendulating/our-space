@@ -18,6 +18,7 @@ pub mod exposure;
 pub mod geometry;
 pub mod graph;
 pub mod math;
+pub mod mobile;
 pub mod projection;
 pub mod scenario;
 pub mod simulation;
@@ -30,6 +31,9 @@ pub use exposure::{ConfidenceTier, ExposureTally, SourceKind, DAHIR_RECALL};
 pub use geometry::{captures, FrustumWedge, OccluderEdge};
 pub use graph::{Route, RouteError, StreetGraph, DEFAULT_WALK_SPEED_MPS};
 pub use math::Vec2;
+pub use mobile::{AceConfig, DashcamConfig, GlassesConfig, MobileScenario};
 pub use projection::{EnuProjection, GeoOrigin};
-pub use scenario::{run_route, sensors_from_layer, FixedCameraDefaults, RouteSummary};
-pub use simulation::{simulate_fixed, SensorInstance, SimParams};
+pub use scenario::{
+    run_route, sensors_from_layer, summarize, FixedCameraDefaults, RouteSummary, SourceBreakdown,
+};
+pub use simulation::{simulate_fixed, simulate_full, SensorInstance, SimParams};

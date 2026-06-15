@@ -76,6 +76,18 @@ impl Vec2 {
     }
 }
 
+/// Shortest distance from point `p` to the line segment `a`–`b`.
+#[inline]
+pub fn point_segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let ab = b.sub(a);
+    let len_sq = ab.length_sq();
+    if len_sq <= f64::EPSILON {
+        return p.distance(a);
+    }
+    let t = (p.sub(a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance(a.add(ab.scale(t)))
+}
+
 /// Smallest absolute difference between two angles (radians), in [0, π].
 #[inline]
 pub fn angle_diff(a: f64, b: f64) -> f64 {
@@ -114,5 +126,17 @@ mod tests {
     fn angle_diff_wraps() {
         assert!((angle_diff(0.1, 2.0 * PI - 0.1) - 0.2).abs() < 1e-9);
         assert!((angle_diff(0.0, PI) - PI).abs() < 1e-9);
+    }
+
+    #[test]
+    fn point_segment_distance_cases() {
+        let a = Vec2::new(0.0, 0.0);
+        let b = Vec2::new(10.0, 0.0);
+        // perpendicular from above the middle
+        assert!((point_segment_distance(Vec2::new(5.0, 3.0), a, b) - 3.0).abs() < 1e-9);
+        // beyond an endpoint clamps to it
+        assert!((point_segment_distance(Vec2::new(-4.0, 0.0), a, b) - 4.0).abs() < 1e-9);
+        // degenerate segment = point distance
+        assert!((point_segment_distance(Vec2::new(0.0, 2.0), a, a) - 2.0).abs() < 1e-9);
     }
 }

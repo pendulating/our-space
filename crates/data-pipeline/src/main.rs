@@ -6,6 +6,7 @@
 //!   data-pipeline bake-graph --geojson <walk.geojson> <out.postcard>   (TODO)
 //!   data-pipeline bake-cameras <map_data.csv> <out.postcard>
 
+mod ace;
 mod cameras_dahir;
 mod graph_osm;
 mod graph_synth;
@@ -34,6 +35,14 @@ fn run() -> anyhow::Result<()> {
             let out = args.get(3).context(USAGE)?;
             ensure_parent(out)?;
             cameras_dahir::bake(csv, out)?;
+            Ok(())
+        }
+        Some("bake-ace") => {
+            let gtfs_dir = args.get(2).context(USAGE)?;
+            let ace_json = args.get(3).context(USAGE)?;
+            let out = args.get(4).context(USAGE)?;
+            ensure_parent(out)?;
+            ace::bake(gtfs_dir, ace_json, out)?;
             Ok(())
         }
         _ => bail!(USAGE),
@@ -84,4 +93,5 @@ fn ensure_parent(path: &str) -> anyhow::Result<()> {
 const USAGE: &str = "usage:\n  \
     data-pipeline bake-graph --synthetic <rows> <cols> <spacing_m> <out.postcard>\n  \
     data-pipeline bake-graph --overpass-json <walk.json> <out.postcard>\n  \
-    data-pipeline bake-cameras <map_data.csv> <out.postcard>";
+    data-pipeline bake-cameras <map_data.csv> <out.postcard>\n  \
+    data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard>";

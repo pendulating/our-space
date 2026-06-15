@@ -1,14 +1,15 @@
 //! The exposure model.
 //!
-//! Headline (per the product decision) is **"cameras that saw you"** — the count
-//! of distinct devices whose coverage the route entered. Underneath we also
-//! accumulate the rigorous expected-capture-events `E[C] = E_fixed + E_mobile`
-//! and the fraction of the route under surveillance, all from one per-tick pass.
+//! Headline (per the product decision) is **"cameras that saw you"** — the
+//! expected number of distinct devices whose coverage the route entered, summed
+//! across all sensing classes. Each class also tracks expected image **frames**
+//! (rich for continuous fixed cameras) and a Poisson **P(≥1 capture)**.
 //!
-//! - Fixed cameras contribute `frame_rate * dwell_time_in_view`.
-//! - Mobile sources (ACE buses, dashcams, smart glasses) are rare independent
-//!   encounters: an intensity `lambda` integrated over route-time gives the
-//!   Poisson mean, so `P(>=1 capture) = 1 - exp(-E_mobile)`.
+//! - Fixed cameras: distinct device ids seen (recall-corrected) + `frame_rate ×
+//!   dwell` frames.
+//! - Mobile/ambient sources (ACE buses, dashcams, smart glasses): rare
+//!   independent encounters, so the per-class device count is the Poisson mean
+//!   of encounters accumulated along the route, and `P(≥1) = 1 − e^(−mean)`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -26,7 +27,7 @@ pub enum ConfidenceTier {
     A,
     /// Estimated from inventories (fixed CCTV; recall ~0.63).
     B,
-    /// Modeled field from real structure x assumed penetration (dashcams).
+    /// Modeled field from real structure × assumed penetration (dashcams).
     C,
     /// Speculative / emerging (smart glasses).
     D,
@@ -63,6 +64,12 @@ impl SourceKind {
         }
     }
 
+    /// Fixed (point-with-frustum) classes count distinct device ids and get the
+    /// recall correction; mobile/ambient classes accumulate Poisson encounters.
+    pub fn is_fixed(self) -> bool {
+        matches!(self, SourceKind::FixedCctv | SourceKind::DotLiveView)
+    }
+
     pub const ALL: [SourceKind; 5] = [
         SourceKind::FixedCctv,
         SourceKind::DotLiveView,
@@ -75,11 +82,12 @@ impl SourceKind {
 /// Per-source accumulated exposure.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SourceTally {
-    /// Distinct devices whose coverage the route entered (the headline driver).
-    pub distinct_devices: u32,
-    /// Expected number of capture events (frames). Fixed: frame_rate*dwell.
-    /// Mobile: Poisson mean of encounters.
-    pub expected_captures: f64,
+    /// Expected number of distinct devices that captured you (the headline
+    /// driver). Fixed: integer count of distinct ids. Mobile: Poisson mean.
+    pub devices: f64,
+    /// Expected number of image frames you appear in. Fixed: `frame_rate ×
+    /// dwell`. Mobile: `encounters × frames-per-encounter`.
+    pub frames: f64,
 }
 
 /// Poisson probability of at least one capture given an expected count.
@@ -92,15 +100,15 @@ pub fn p_at_least_one(expected: f64) -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExposureTally {
     per_source: [SourceTally; 5],
-    /// Ids of distinct fixed devices already counted (so a camera seen across
-    /// many ticks counts once). Kept transient; not serialized.
+    /// (source index, device id) pairs already counted, so a fixed camera seen
+    /// across many ticks counts once. Transient; not serialized.
     #[serde(skip)]
-    fixed_seen: HashSet<u64>,
+    fixed_seen: HashSet<(u8, u64)>,
     /// Total route length walked, meters.
     pub route_length_m: f64,
-    /// Length of the route under >=1 active fixed coverage, meters.
+    /// Length of the route under ≥1 active fixed coverage, meters.
     pub covered_length_m: f64,
-    /// Recall correction factor applied to fixed counts (1.0 = none).
+    /// Recall correction factor applied to fixed device counts (1.0 = none).
     pub recall_factor: f64,
 }
 
@@ -135,23 +143,22 @@ impl ExposureTally {
         self.per_source[Self::idx(kind)]
     }
 
-    /// Record one simulation tick during which fixed device `id` (of `kind`)
-    /// captured the walker. `frame_rate * dt` capture-events accrue; the device
-    /// is counted toward distinct-devices exactly once.
+    /// Record one tick during which fixed device `id` (of `kind`) captured the
+    /// walker: `frame_rate × dt` frames accrue; the device counts once.
     pub fn record_fixed_capture(&mut self, kind: SourceKind, id: u64, frame_rate: f64, dt: f64) {
         let i = Self::idx(kind);
-        self.per_source[i].expected_captures += frame_rate * dt;
-        if self.fixed_seen.insert(id) {
-            self.per_source[i].distinct_devices += 1;
+        self.per_source[i].frames += frame_rate * dt;
+        if self.fixed_seen.insert((i as u8, id)) {
+            self.per_source[i].devices += 1.0;
         }
     }
 
-    /// Add mobile expected-captures (Poisson mean) accrued over a tick for a
-    /// class. `expected_devices` optionally credits distinct-device count
-    /// (e.g. expected distinct buses passing).
-    pub fn record_mobile(&mut self, kind: SourceKind, expected_captures: f64) {
+    /// Accumulate mobile/ambient exposure for a class over a tick: expected
+    /// distinct devices (Poisson mean increment) and expected frames.
+    pub fn record_mobile(&mut self, kind: SourceKind, expected_devices: f64, expected_frames: f64) {
         let i = Self::idx(kind);
-        self.per_source[i].expected_captures += expected_captures;
+        self.per_source[i].devices += expected_devices;
+        self.per_source[i].frames += expected_frames;
     }
 
     /// Mark that the walker advanced `step_m` meters this tick, `covered` of
@@ -163,38 +170,35 @@ impl ExposureTally {
         }
     }
 
-    /// HEADLINE: total distinct devices that could have captured the walker,
-    /// fixed devices recall-corrected (rounded). For mobile classes we credit
-    /// expected distinct encounters as `ceil(P(>=1))`-style presence: a class
-    /// counts if its expected captures imply a meaningful chance of capture.
-    pub fn headline_device_count(&self) -> u32 {
-        let mut total = 0u32;
-        for kind in SourceKind::ALL {
-            let t = self.source(kind);
-            match kind {
-                SourceKind::FixedCctv | SourceKind::DotLiveView => {
-                    let corrected = (t.distinct_devices as f64 * self.recall_factor).round();
-                    total += corrected as u32;
-                }
-                _ => {
-                    // Mobile: expected distinct encounters ~ expected_captures is
-                    // a per-frame quantity, so use the Poisson mean of *encounters*
-                    // tracked in expected_captures only when callers store encounter
-                    // counts there. We expose this separately; headline stays
-                    // fixed-dominated for honesty. Round expected encounters.
-                    total += t.expected_captures.round() as u32;
-                }
-            }
+    /// Expected devices for a class, with the recall correction applied to fixed
+    /// classes only.
+    pub fn adjusted_devices(&self, kind: SourceKind) -> f64 {
+        let d = self.source(kind).devices;
+        if kind.is_fixed() {
+            d * self.recall_factor
+        } else {
+            d
         }
-        total
     }
 
-    /// Total expected capture-events across all sources (the rigorous metric).
-    pub fn total_expected_captures(&self) -> f64 {
-        self.per_source.iter().map(|s| s.expected_captures).sum()
+    /// HEADLINE: total expected distinct devices that could have captured you,
+    /// across all classes (fixed recall-corrected), rounded.
+    pub fn headline_device_count(&self) -> u32 {
+        let total: f64 = SourceKind::ALL.iter().map(|&k| self.adjusted_devices(k)).sum();
+        total.round().max(0.0) as u32
     }
 
-    /// Fraction of the route under surveillance, in [0, 1].
+    /// Poisson P(≥1 capture) from a class (using its adjusted device mean).
+    pub fn p_capture(&self, kind: SourceKind) -> f64 {
+        p_at_least_one(self.adjusted_devices(kind))
+    }
+
+    /// Total expected capture-events (image frames) across all sources.
+    pub fn total_expected_frames(&self) -> f64 {
+        self.per_source.iter().map(|s| s.frames).sum()
+    }
+
+    /// Fraction of the route under (fixed) surveillance, in [0, 1].
     pub fn fraction_surveilled(&self) -> f64 {
         if self.route_length_m <= 0.0 {
             0.0
@@ -216,28 +220,48 @@ mod tests {
     }
 
     #[test]
-    fn distinct_devices_counted_once_capture_events_accumulate() {
+    fn distinct_devices_counted_once_frames_accumulate() {
         let mut t = ExposureTally::new();
-        // Camera id=1 captures across 3 one-second ticks at 15 fps.
         for _ in 0..3 {
             t.record_fixed_capture(SourceKind::FixedCctv, 1, 15.0, 1.0);
         }
-        // A second camera for one tick.
         t.record_fixed_capture(SourceKind::FixedCctv, 2, 15.0, 1.0);
         let s = t.source(SourceKind::FixedCctv);
-        assert_eq!(s.distinct_devices, 2);
-        assert!((s.expected_captures - 60.0).abs() < 1e-9); // 4 capture-ticks * 15
+        assert_eq!(s.devices, 2.0);
+        assert!((s.frames - 60.0).abs() < 1e-9); // 4 capture-ticks × 15 fps
     }
 
     #[test]
-    fn recall_correction_inflates_headline() {
+    fn same_id_different_kind_counts_separately() {
+        let mut t = ExposureTally::new();
+        t.record_fixed_capture(SourceKind::FixedCctv, 7, 1.0, 1.0);
+        t.record_fixed_capture(SourceKind::DotLiveView, 7, 1.0, 1.0);
+        assert_eq!(t.source(SourceKind::FixedCctv).devices, 1.0);
+        assert_eq!(t.source(SourceKind::DotLiveView).devices, 1.0);
+    }
+
+    #[test]
+    fn mobile_accumulates_poisson_mean() {
+        let mut t = ExposureTally::new();
+        t.record_mobile(SourceKind::AceBus, 0.3, 0.3);
+        t.record_mobile(SourceKind::AceBus, 0.2, 0.2);
+        assert!((t.source(SourceKind::AceBus).devices - 0.5).abs() < 1e-9);
+        // P(>=1) for mean 0.5
+        assert!((t.p_capture(SourceKind::AceBus) - (1.0 - (-0.5f64).exp())).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recall_correction_inflates_fixed_only() {
         let mut t = ExposureTally::new();
         t.recall_factor = 1.0 / DAHIR_RECALL; // ~1.587
         for id in 0..10u64 {
             t.record_fixed_capture(SourceKind::FixedCctv, id, 1.0, 1.0);
         }
-        // 10 detected -> ~16 unbiased.
-        assert_eq!(t.headline_device_count(), 16);
+        t.record_mobile(SourceKind::Dashcam, 4.0, 4.0); // mobile NOT recall-corrected
+        // fixed: 10 -> ~16 ; dashcam: 4 -> 4 ; headline ~20
+        assert!((t.adjusted_devices(SourceKind::FixedCctv) - 10.0 / DAHIR_RECALL).abs() < 1e-9);
+        assert_eq!(t.adjusted_devices(SourceKind::Dashcam), 4.0);
+        assert_eq!(t.headline_device_count(), 20);
     }
 
     #[test]
@@ -253,5 +277,7 @@ mod tests {
         assert_eq!(SourceKind::FixedCctv.tier(), ConfidenceTier::B);
         assert_eq!(SourceKind::SmartGlasses.tier(), ConfidenceTier::D);
         assert_eq!(SourceKind::AceBus.tier(), ConfidenceTier::A);
+        assert!(SourceKind::FixedCctv.is_fixed());
+        assert!(!SourceKind::AceBus.is_fixed());
     }
 }

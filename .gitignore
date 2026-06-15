@@ -16,6 +16,7 @@ Cargo.lock.orig
 /data/snapshots/**/*.geojson
 /data/snapshots/**/*.graphml
 /data/snapshots/**/*.json
+/data/snapshots/**/*.txt
 !/data/snapshots/**/manifest.json
 
 # Python virtualenv for the OSMnx export step
