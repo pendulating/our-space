@@ -10,6 +10,7 @@ description = "Interactive single-route our-space app (native window for dev; We
 sim-core = { workspace = true }
 bevy_egui = { workspace = true }
 bevy_prototype_lyon = { workspace = true }
+rstar = { workspace = true }
 earcutr = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }

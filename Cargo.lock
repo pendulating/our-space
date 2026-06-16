@@ -189,6 +189,7 @@ dependencies = [
  "console_error_panic_hook",
  "earcutr",
  "postcard",
+ "rstar 0.12.2",
  "serde",
  "sim-core",
  "wasm-bindgen",

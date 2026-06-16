@@ -18,6 +18,8 @@ use bevy::window::CursorMoved;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
 use bevy::math::primitives::{Rectangle, RegularPolygon};
+use rstar::primitives::GeomWithData;
+use rstar::RTree;
 use agents::AgentPool;
 use loading::{
     AceRes, AlprRes, CamerasRes, DashcamFieldRes, DotRes, EquityRes, GraphAssetRes, HeatmapRes,
@@ -107,6 +109,13 @@ pub struct Sim {
     pub dashcam_field: DashcamFieldLayer,
     /// Baked weighted pool of vehicle (rideshare) routes for the dashcam agents.
     pub vehicle_routes: Vec<sim_core::assets::VehicleRoute>,
+    /// R-tree over fixed-camera apex positions (data = sensor id) so the live
+    /// walk tally tests only nearby cameras, not all ~5k every frame.
+    pub cam_index: RTree<GeomWithData<[f64; 2], u64>>,
+    /// Squared query radius (m²) = (max camera range + margin)² for the cull.
+    pub cam_query_r2: f64,
+    /// Camera-dot entity per sensor id (id-ordered), for O(1) flash on capture.
+    pub cam_entities: Vec<Entity>,
 }
 
 #[derive(Resource, Default)]
@@ -446,6 +455,7 @@ fn build_world(
     let alpr_mat = materials.add(Color::srgb_u8(0x41, 0x60, 0x7e)); // steel plate-reader
     let dot_mat = materials.add(Color::srgb_u8(0x4d, 0x7a, 0x8c)); // cold cyan-slate (DOT)
     let wedge_mat = materials.add(Color::srgba(0.11, 0.21, 0.40, 0.34)); // cold projected cone
+    let mut cam_entities: Vec<Entity> = Vec::with_capacity(sensors.len());
     for s in &sensors {
         let apex = s.wedge.apex;
         let (mesh, mat) = match s.kind {
@@ -453,13 +463,16 @@ fn build_world(
             sim_core::SourceKind::DotLiveView => (dot_tri.clone(), dot_mat.clone()),
             _ => (cctv_circle.clone(), cctv_mat.clone()),
         };
-        commands.spawn((
-            Mesh2d(mesh),
-            MeshMaterial2d(mat),
-            Transform::from_translation(world::to_world(apex, 1.0)),
-            BaseMap,
-            CameraDot { id: s.id, flash: 0.0 },
-        ));
+        let entity = commands
+            .spawn((
+                Mesh2d(mesh),
+                MeshMaterial2d(mat),
+                Transform::from_translation(world::to_world(apex, 1.0)),
+                BaseMap,
+                CameraDot { id: s.id, flash: 0.0 },
+            ))
+            .id();
+        cam_entities.push(entity); // sensors are id-ordered, so cam_entities[id] = entity
         // Only draw a cone for directional sensors. Omnidirectional cameras
         // (DOT PTZ, heading-less ALPRs) would render as large translucent discs
         // that bury the map and overstate constant 360° capture.
@@ -493,6 +506,17 @@ fn build_world(
     route.status = "Click the map to set a start point (A).".into();
     info!("equity: diversity ~ detected cameras  r = {:?}", equity_corr);
 
+    // R-tree over camera apexes so the per-frame live walk tally tests only
+    // cameras near the walker (not all ~5k). Query radius = max range + margin.
+    let cam_index: RTree<GeomWithData<[f64; 2], u64>> = RTree::bulk_load(
+        sensors
+            .iter()
+            .map(|s| GeomWithData::new([s.wedge.apex.x, s.wedge.apex.y], s.id))
+            .collect(),
+    );
+    let cam_max_range = sensors.iter().map(|s| s.wedge.range_m).fold(0.0_f64, f64::max);
+    let cam_query_r2 = (cam_max_range + 2.0).powi(2);
+
     // Ambient mobile agents: decode the baked vehicle-route pool and spawn the
     // fixed entity pool (vehicles + pedestrians). Routes also live on `Sim` for
     // runtime weighted resampling on recycle.
@@ -524,6 +548,9 @@ fn build_world(
         equity_corr,
         dashcam_field,
         vehicle_routes,
+        cam_index,
+        cam_query_r2,
+        cam_entities,
     });
     handles.built = true;
 }
@@ -790,11 +817,20 @@ fn walk_capture_events(
     walk_live.last_progress = walker.progress_m;
 
     let pos = r.position_at(walker.progress_m);
-    for mut dot in &mut cams {
-        let wedge = &sim.sensors[dot.id as usize].wedge;
-        if sim_core::captures(wedge, pos, &[]) && walk_live.seen.insert(dot.id) {
+    // Spatial cull: test only cameras within max range of the walker, not all ~5k.
+    for cand in sim.cam_index.locate_within_distance([pos.x, pos.y], sim.cam_query_r2) {
+        let id = cand.data;
+        if walk_live.seen.contains(&id) {
+            continue;
+        }
+        let wedge = &sim.sensors[id as usize].wedge;
+        if sim_core::captures(wedge, pos, &[]) && walk_live.seen.insert(id) {
             walk_live.count += 1;
-            dot.flash = 1.0;
+            if let Some(&entity) = sim.cam_entities.get(id as usize) {
+                if let Ok(mut dot) = cams.get_mut(entity) {
+                    dot.flash = 1.0;
+                }
+            }
         }
     }
 }
@@ -803,9 +839,14 @@ fn walk_capture_events(
 fn camera_flash_decay(time: Res<Time>, mut q: Query<(&mut CameraDot, &mut Transform)>) {
     let dt = time.delta_secs();
     for (mut dot, mut t) in &mut q {
-        if dot.flash > 0.0 {
-            dot.flash = (dot.flash - dt * 2.5).max(0.0);
+        // Only touch the Transform of cameras that are actually flashing — writing
+        // every dot's scale each frame marks all ~5k Transforms changed and forces
+        // a full GPU re-extraction. Idle dots (flash == 0, scale already 1) are
+        // left alone. The frame flash reaches 0 does the final reset write.
+        if dot.flash <= 0.0 {
+            continue;
         }
+        dot.flash = (dot.flash - dt * 2.5).max(0.0);
         t.scale = Vec3::splat(1.0 + dot.flash * 1.8);
     }
 }
