@@ -108,10 +108,13 @@ pub fn ui_panel(
                         w.max_minutes, w.reachable_edges
                     ));
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} detected (×1/0.63 recall correction)",
-                            w.cameras_raw
-                        ))
+                        egui::RichText::new(
+                            if (w.cameras_corrected - w.cameras_raw as f64).abs() > 0.5 {
+                                format!("{} detected (recall-corrected)", w.cameras_raw)
+                            } else {
+                                format!("{} mapped (crowdsourced census + ML detections)", w.cameras_raw)
+                            },
+                        )
                         .weak(),
                     );
                 } else {
@@ -288,7 +291,12 @@ pub fn ui_panel(
             ui.separator();
             ui.collapsing("About the data & its limits", |ui| {
                 ui.label("Streets: OpenStreetMap via Overpass (ODbL).");
-                ui.label("Fixed CCTV: Dahir et al. 2025, Stanford (CC BY 4.0; recall ~0.63).");
+                ui.label(
+                    "Fixed CCTV: Amnesty Decode Surveillance NYC crowdsourced census \
+                     (CC BY-NC-ND 4.0) + Dahir et al. 2025 detections (CC BY 4.0), \
+                     aggregated & de-duplicated.",
+                );
+                ui.label("DOT traffic cams (triangles): NYC DOT (nyctmc.org) — locations only, images not used.");
                 ui.label("ACE corridors: MTA GTFS + data.ny.gov ACE route list.");
                 ui.label("ALPR readers (squares): DeFlock crowdsourced plate readers via OSM.");
                 ui.label("Rideshare cams: density from NYC TLC Uber/Lyft trips, by taxi zone.");

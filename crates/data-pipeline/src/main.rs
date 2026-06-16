@@ -8,6 +8,7 @@
 
 mod ace;
 mod alpr;
+mod amnesty;
 mod cameras_dahir;
 mod dashcam;
 mod dot;
@@ -39,6 +40,14 @@ fn run() -> anyhow::Result<()> {
             let out = args.get(3).context(USAGE)?;
             ensure_parent(out)?;
             cameras_dahir::bake(csv, out)?;
+            Ok(())
+        }
+        Some("bake-cctv") => {
+            let amnesty = args.get(2).context(USAGE)?;
+            let dahir = args.get(3).context(USAGE)?;
+            let out = args.get(4).context(USAGE)?;
+            ensure_parent(out)?;
+            amnesty::bake(amnesty, dahir, out)?;
             Ok(())
         }
         Some("bake-ace") => {
@@ -129,6 +138,7 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-graph --synthetic <rows> <cols> <spacing_m> <out.postcard>\n  \
     data-pipeline bake-graph --overpass-json <walk.json> <out.postcard>\n  \
     data-pipeline bake-cameras <map_data.csv> <out.postcard>\n  \
+    data-pipeline bake-cctv <amnesty_counts_per_intersections.csv> <dahir_map_data.csv> <out.postcard>\n  \
     data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard>\n  \
     data-pipeline bake-equity <bg.geojson> <acs.json> <map_data.csv> <out.postcard>\n  \
     data-pipeline bake-dashcam-field <taxi_zones.geojson> <zone_trips.csv> <out.postcard>\n  \

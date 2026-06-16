@@ -20,8 +20,9 @@ See also: [`DESIGN.md`](DESIGN.md) (the visual/UX system), [`PLAN.md`](PLAN.md)
 The system has two halves joined by a set of compact **baked assets**:
 
 - An **offline pipeline** ingests NYC open data (OSM, Census, MTA, TLC, DeFlock,
-  the NYC DOT traffic-camera feed, the Dahir et al. CCTV dataset), normalizes it,
-  projects it to local ENU meters, and serializes it to small `postcard` binaries.
+  the NYC DOT traffic-camera feed, the Amnesty *Decode Surveillance NYC* census,
+  the Dahir et al. CCTV dataset), normalizes it, projects it to local ENU meters,
+  and serializes it to small `postcard` binaries.
 - A **render-agnostic simulation core** (`sim-core`) loads those assets and
   computes exposure. It runs in two hosts: the interactive **Bevy app**
   (native dev window; WebGPU/WASM for the public web build) and a native
@@ -114,11 +115,11 @@ A `FrustumWedge` (`geometry.rs`) is `{ apex, heading_rad, half_fov_rad, range_m 
 | `SmartGlasses` | "Smart glasses" | D | no | no |
 | `Alpr` | "ALPR readers" | A | yes | no |
 
-`ConfidenceTier` governs UI honesty: **A** mapped/public infrastructure (DOT cams, ACE, ALPR points), **B** estimated from inventories (fixed CCTV, recall ~0.63), **C** modeled field × assumed penetration (dashcams), **D** speculative/emerging (smart glasses). `is_fixed()` distinguishes point-with-frustum classes (distinct device counting) from mobile/ambient classes (Poisson encounters). **Only `FixedCctv`** carries the recall correction — mapped points (DOT, ALPR) are taken as located.
+`ConfidenceTier` governs UI honesty: **A** mapped/public infrastructure (DOT cams, ACE, ALPR points), **B** estimated from inventories (fixed CCTV), **C** modeled field × assumed penetration (dashcams), **D** speculative/emerging (smart glasses). `is_fixed()` distinguishes point-with-frustum classes (distinct device counting) from mobile/ambient classes (Poisson encounters). The `recall_corrected()` hook applies **only to `FixedCctv`**, and the correction factor comes from the *layer's* `recall` field — so it engages only if the shipped CCTV layer declares one. The current merged layer carries `recall: None` (a direct census; see below), so no inflation is applied; the Dahir-only fallback layer (`bake-cameras`) declares `recall: Some(0.63)` and would re-enable it.
 
 ### The exposure model
 
-The headline metric is **"cameras that saw you"** — expected distinct devices whose coverage the route entered, summed across all classes. `DAHIR_RECALL = 0.63` is the recall of the Dahir et al. street-view camera detector; observed fixed-CCTV density underestimates the truth by this factor, so the count is divided by it (i.e. multiplied by `recall_factor = 1/0.63 ≈ 1.587`). This is surfaced as an uncertainty band, never silently applied.
+The headline metric is **"cameras that saw you"** — expected distinct devices whose coverage the route entered, summed across all classes. `DAHIR_RECALL = 0.63` is the recall of the Dahir et al. street-view camera detector; for a Dahir-only CCTV layer, observed density underestimates the truth by this factor, so the count is divided by it (`recall_factor = 1/0.63 ≈ 1.587`) and surfaced as an uncertainty band, never silently applied. The shipped layer instead **merges** the Amnesty crowdsourced census with Dahir (next section), which is a direct count rather than an ML detection, so it ships `recall: None` — the headline is the census count, un-inflated.
 
 `ExposureTally` holds `per_source: [SourceTally; 6]` (each `{ devices, frames }`), a transient `fixed_seen: HashSet<(u8, u64)>` (so a fixed camera seen across many ticks counts once), `route_length_m`, `covered_length_m`, and `recall_factor` (default 1.0). `p_at_least_one(expected) = 1 − e^(−expected)`.
 
@@ -231,7 +232,8 @@ Each subcommand writes to the `<out>` path it is given. Parent directories are a
 |---|---|---|---|
 | `bake-graph --overpass-json` | `<walk.json> <out>` | `graph_osm::bake` | routable pedestrian `GraphAsset` from OSM walk network |
 | `bake-graph --synthetic` | `<rows> <cols> <spacing_m> <out>` | `graph_synth::synthetic_grid` | synthetic grid graph (testing/dev; no provenance source) |
-| `bake-cameras` | `<map_data.csv> <out>` | `cameras_dahir::bake` | fixed-CCTV `FixedSensorLayer` |
+| `bake-cameras` | `<map_data.csv> <out>` | `cameras_dahir::bake` | Dahir-only fixed-CCTV `FixedSensorLayer` (fallback) |
+| `bake-cctv` | `<amnesty_counts.csv> <dahir_map_data.csv> <out>` | `amnesty::bake` | **unified** fixed-CCTV `FixedSensorLayer` (Amnesty census + Dahir, de-duplicated) |
 | `bake-ace` | `<gtfs_dir> <ace_routes.json> <out>` | `ace::bake` | `AceCorridorLayer` |
 | `bake-equity` | `<bg.geojson> <acs.json> <map_data.csv> <out>` | `equity::bake` | `EquityLayer` |
 | `bake-dashcam-field` | `<taxi_zones.geojson> <zone_trips.csv> <out>` | `dashcam::bake` | `DashcamFieldLayer` |
@@ -245,7 +247,8 @@ The heatmap is **not** a `data-pipeline` subcommand — it is produced by the `b
 | Source | What it is | Provider | License (as baked) |
 |---|---|---|---|
 | OSM walk network | Pedestrian-usable highways, fetched as an Overpass API JSON dump | OpenStreetMap via Overpass API | ODbL 1.0 |
-| `map_data.csv` | Google Street View sample-points where a camera was detected (panorama-level, detector recall ~0.63 — **not** surveyed devices) | Dahir et al. 2025, Stanford Digital Repository (`purl.stanford.edu/jr882ny4955`) | CC BY 4.0 |
+| Amnesty Decode NYC | Crowdsourced camera **counts per intersection** (median over 3 volunteers; `counts_per_intersections.csv`) — the dominant, most complete street-CCTV census | Amnesty International, Decode Surveillance NYC (`github.com/amnesty-crisis-evidence-lab/decode-surveillance-nyc`) | CC BY-NC-ND 4.0 — used non-commercially, attributed (see note below) |
+| `map_data.csv` | Google Street View sample-points where a camera was detected (panorama-level, detector recall ~0.63 — **not** surveyed devices); merged with Amnesty to add mid-block detections | Dahir et al. 2025, Stanford Digital Repository (`purl.stanford.edu/jr882ny4955`) | CC BY 4.0 |
 | DeFlock ALPRs | Crowdsourced license-plate-reader points synced into OSM as `man_made=surveillance` + `surveillance:type=ALPR`, fetched via Overpass | DeFlock via OpenStreetMap (`deflock.me`) | ODbL 1.0 |
 | NYC DOT traffic cams | Public PTZ traffic-monitoring camera **locations** from the TMC feed (`webcams.nyctmc.org/api/cameras/`); the `imageUrl` field is never read or stored | NYC DOT Traffic Management Center (`nyctmc.org`) | No open license — **coordinates only, images not used or redistributed** |
 | MTA GTFS static | Bus route geometry (`routes.txt`, `trips.txt`, `shapes.txt`) | MTA | MTA / OPEN-NY Terms of Use |
@@ -262,7 +265,7 @@ Counts are the real values produced by this build (from each module's summary).
 | File (under `assets/processed/`) | Ext | sim-core type | Source | Counts (this build) |
 |---|---|---|---|---|
 | `graph_manhattan.osgraph` | `.osgraph` | `GraphAsset` | OSM walk via Overpass (largest connected component, ODbL) | 151,339 nodes / 220,609 edges |
-| `cameras_fixed.oscam` | `.oscam` | `FixedSensorLayer` (`FixedCctv`, `recall: Some(0.63)`) | Dahir et al. 2025 `map_data.csv` (CC BY 4.0) | 217 unique Manhattan cameras |
+| `cameras_fixed.oscam` | `.oscam` | `FixedSensorLayer` (`FixedCctv`, `recall: None`) | Amnesty Decode NYC census + Dahir et al. (de-duplicated) | 4,422 cameras (4,266 Amnesty + 156 Dahir-unique) |
 | `alpr.osalpr` | `.osalpr` | `FixedSensorLayer` (`Alpr`, `recall: None`) | DeFlock via OSM (ODbL) | 444 readers |
 | `dot_cameras.osdot` | `.osdot` | `FixedSensorLayer` (`DotLiveView`, `recall: None`) | NYC DOT TMC feed (locations only) | 370 Manhattan cams (online) |
 | `ace_corridors.osace` | `.osace` | `AceCorridorLayer` | MTA GTFS + data.ny.gov `ki2b-sg5y` | 20 routes / 15,361 segments |
@@ -298,6 +301,15 @@ Models that NYC for-hire vehicles must carry cameras, so exposure follows where 
 3. The **median** density over zones with data (robust to airport outliers).
 4. Each zone's **intensity** = `(density / median)`, clamped to `[0.0, 8.0]` (≈1.0 = a typical zone).
 5. `DashcamFieldLayer::intensity_at(p)` does bbox prefilter + ray-cast point-in-polygon; outside all zones it falls back to `1.0`.
+
+### Fixed-CCTV merge & de-duplication (`amnesty.rs`)
+
+`bake-cctv` unifies two independent Google-Street-View censuses of the **same physical camera population**, so they are de-duplicated rather than summed:
+
+1. **Amnesty Decode Surveillance NYC** (`counts_per_intersections.csv`) is the base: each Manhattan intersection reporting `n_cameras_median ≥ 1` becomes `n` **omnidirectional** sensors at the panorama point (the aggregate has no per-camera bearing). Rows with empty `Lat`/`Long` (unresolved panoramas) are skipped. ≈4,266 cameras across ≈2,019 intersections.
+2. **Dahir et al.** detections are added **only where they don't duplicate** an Amnesty corner: a Dahir camera within `DEDUP_RADIUS_M = 50 m` (ENU) of any Amnesty camera-bearing intersection is dropped; the rest (≈156, mostly mid-block — Amnesty sampled intersections only) are kept with their GSV heading. 
+
+The merged layer is `FixedCctv` with `recall: None` — Amnesty's direct counts dominate, so the Dahir ML-recall correction does not apply to the set. **Licensing:** the Amnesty data is CC BY-NC-ND 4.0; this project's non-commercial/research posture satisfies NC, the source is attributed on every surface, and baking is treated as permissible factual-data use under that posture. The equity overlay (`bake-equity`) deliberately **stays Dahir-only**, since it replicates the specific Dahir et al. diversity↔camera correlation.
 
 ### ALPR headings (`alpr.rs`)
 

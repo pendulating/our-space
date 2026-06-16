@@ -43,8 +43,9 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   (headline "cameras that saw you" + expected capture-events + % surveilled), A*
   routing with snap/validate, position-over-time. 25 unit tests.
 - ✅ `data-pipeline`: bakes the **real Manhattan walk graph** (151k nodes / 221k edges,
-  from OpenStreetMap via Overpass) and the **real fixed-camera layers** — CCTV (217
-  Manhattan cameras from Dahir et al., CC BY 4.0, recall-corrected), DeFlock ALPR
+  from OpenStreetMap via Overpass) and the **real fixed-camera layers** — a unified
+  street-CCTV census (**~4,400** cameras: Amnesty *Decode Surveillance NYC* crowdsourced
+  counts **+** Dahir et al. ML detections, aggregated & de-duplicated), DeFlock ALPR
   readers, and **NYC DOT traffic cameras** (~370, locations only).
 - ✅ End-to-end headless demo produces real exposure numbers for real walks.
 - ✅ `app-interactive`: native Bevy map UI — click A/B to route, animated walker,
@@ -80,7 +81,8 @@ cargo test -p sim-core --no-default-features
 
 # Bake assets (fetch raw snapshots into data/snapshots/ first; see below)
 cargo run -p data-pipeline -- bake-graph   --overpass-json data/snapshots/osm/manhattan_walk.json assets/processed/graph_manhattan.postcard
-cargo run -p data-pipeline -- bake-cameras data/snapshots/dahir/map_data.csv                       assets/processed/cameras_fixed.postcard
+# Fixed CCTV: Amnesty Decode Surveillance NYC census + Dahir et al., aggregated & de-duplicated
+cargo run -p data-pipeline -- bake-cctv    data/snapshots/amnesty/counts_per_intersections.csv data/snapshots/dahir/map_data.csv assets/processed/cameras_fixed.oscam
 # ALPR plate readers (DeFlock via OSM/Overpass: man_made=surveillance, surveillance:type=ALPR)
 cargo run -p data-pipeline -- bake-alpr    data/snapshots/deflock/alpr.json assets/processed/alpr.osalpr
 # NYC DOT traffic cameras (nyctmc.org feed; locations only — images are never used)
@@ -146,6 +148,12 @@ the `/our-space/` project subpath, so no base-path config is needed.
 curl -L --create-dirs -o data/snapshots/dahir/map_data.csv \
   "https://stacks.stanford.edu/file/druid:jr882ny4955/map_data.csv"
 
+# Amnesty International "Decode Surveillance NYC" crowdsourced camera census
+# (CC BY-NC-ND 4.0 — non-commercial use, attributed). The aggregated per-
+# intersection counts file is the input to bake-cctv:
+curl -L --create-dirs -o data/snapshots/amnesty/counts_per_intersections.csv \
+  "https://raw.githubusercontent.com/amnesty-crisis-evidence-lab/decode-surveillance-nyc/main/data/counts_per_intersections.csv"
+
 # Manhattan pedestrian network from OpenStreetMap via Overpass (ODbL):
 #   POST the walk-network query (bbox 40.698,-74.022,40.882,-73.906) to
 #   https://overpass-api.de/api/interpreter and save the JSON to
@@ -161,7 +169,7 @@ curl -L --create-dirs -o data/snapshots/dot/cameras.json \
 | Layer | Source | License |
 |---|---|---|
 | Walk graph | OpenStreetMap via Overpass API | ODbL 1.0 |
-| Fixed CCTV | Dahir et al. 2025, Stanford Digital Repository (`map_data.csv`) | CC BY 4.0 |
+| Fixed CCTV | Amnesty Int'l *Decode Surveillance NYC* (crowdsourced census) **+** Dahir et al. 2025 (`map_data.csv`), aggregated & de-duplicated | CC BY-NC-ND 4.0 (Amnesty) + CC BY 4.0 (Dahir) |
 | ALPR readers | DeFlock crowdsourced plate readers via OpenStreetMap (`surveillance:type=ALPR`) | ODbL 1.0 |
 | DOT traffic cams | NYC DOT Traffic Management Center feed (`nyctmc.org`) — **locations only** | No open license; coords only, images never used |
 | ACE corridors | MTA GTFS (route geometry) + data.ny.gov `ki2b-sg5y` (ACE route list) | MTA / OPEN-NY ToU |
@@ -180,6 +188,14 @@ never read, fetched, stored, or redistributed — and model them as a separate
 low-frame-rate *monitoring* class (omnidirectional PTZ; locations are mapped, so
 Tier A, no recall correction).
 
-Camera points are Google Street View **sample-points where a camera was detected**
-(detector recall ~0.63), not surveyed device locations — surfaced in-app as a
-modeled estimate with an uncertainty band.
+**Fixed CCTV** unifies two independent Google Street View censuses of the *same*
+physical camera population, so they are de-duplicated rather than summed: Amnesty's
+crowdsourced per-intersection counts (median over 3 volunteers, placed
+omnidirectional at each intersection) form the base, plus any Dahir et al.
+detection more than 50 m from an Amnesty camera-bearing intersection. These are
+**sample-point estimates, not surveyed device coordinates**; the merged headline
+is a direct census count, not the Dahir recall-corrected estimate.
+
+The Amnesty data is **CC BY-NC-ND 4.0**: used here non-commercially (research),
+attributed, and is the one layer whose source carries a NoDerivatives term — see
+`docs/ARCHITECTURE.md` for the handling rationale.
