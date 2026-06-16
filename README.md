@@ -43,8 +43,9 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   (headline "cameras that saw you" + expected capture-events + % surveilled), A*
   routing with snap/validate, position-over-time. 25 unit tests.
 - ✅ `data-pipeline`: bakes the **real Manhattan walk graph** (151k nodes / 221k edges,
-  from OpenStreetMap via Overpass) and the **real fixed-CCTV layer** (217 Manhattan
-  cameras from Dahir et al., CC BY 4.0, recall-corrected).
+  from OpenStreetMap via Overpass) and the **real fixed-camera layers** — CCTV (217
+  Manhattan cameras from Dahir et al., CC BY 4.0, recall-corrected), DeFlock ALPR
+  readers, and **NYC DOT traffic cameras** (~370, locations only).
 - ✅ End-to-end headless demo produces real exposure numbers for real walks.
 - ✅ `app-interactive`: native Bevy map UI — click A/B to route, animated walker,
   camera dots + FOV wedges + ACE corridors over the street network, live
@@ -82,6 +83,8 @@ cargo run -p data-pipeline -- bake-graph   --overpass-json data/snapshots/osm/ma
 cargo run -p data-pipeline -- bake-cameras data/snapshots/dahir/map_data.csv                       assets/processed/cameras_fixed.postcard
 # ALPR plate readers (DeFlock via OSM/Overpass: man_made=surveillance, surveillance:type=ALPR)
 cargo run -p data-pipeline -- bake-alpr    data/snapshots/deflock/alpr.json assets/processed/alpr.osalpr
+# NYC DOT traffic cameras (nyctmc.org feed; locations only — images are never used)
+cargo run -p data-pipeline -- bake-dot     data/snapshots/dot/cameras.json  assets/processed/dot_cameras.osdot
 cargo run -p data-pipeline -- bake-ace     data/snapshots/gtfs/gtfs_m data/snapshots/gtfs/ace_routes.json assets/processed/ace_corridors.postcard
 cargo run -p data-pipeline -- bake-equity  data/snapshots/census/blockgroups.geojson data/snapshots/census/acs.json data/snapshots/dahir/map_data.csv assets/processed/equity.postcard
 # Rideshare-camera density (NYC TLC Uber/Lyft trips per taxi zone). Aggregate the
@@ -147,6 +150,10 @@ curl -L --create-dirs -o data/snapshots/dahir/map_data.csv \
 #   POST the walk-network query (bbox 40.698,-74.022,40.882,-73.906) to
 #   https://overpass-api.de/api/interpreter and save the JSON to
 #   data/snapshots/osm/manhattan_walk.json
+
+# NYC DOT traffic-camera locations (no open license — we keep only coordinates):
+curl -L --create-dirs -o data/snapshots/dot/cameras.json \
+  "https://webcams.nyctmc.org/api/cameras/"
 ```
 
 ## Data sources & licenses
@@ -156,6 +163,7 @@ curl -L --create-dirs -o data/snapshots/dahir/map_data.csv \
 | Walk graph | OpenStreetMap via Overpass API | ODbL 1.0 |
 | Fixed CCTV | Dahir et al. 2025, Stanford Digital Repository (`map_data.csv`) | CC BY 4.0 |
 | ALPR readers | DeFlock crowdsourced plate readers via OpenStreetMap (`surveillance:type=ALPR`) | ODbL 1.0 |
+| DOT traffic cams | NYC DOT Traffic Management Center feed (`nyctmc.org`) — **locations only** | No open license; coords only, images never used |
 | ACE corridors | MTA GTFS (route geometry) + data.ny.gov `ki2b-sg5y` (ACE route list) | MTA / OPEN-NY ToU |
 | Block groups | Census TIGERweb (geometry) + Census Reporter API (ACS 5-year B03002, keyless) | Census public domain |
 | Rideshare cams | NYC TLC High-Volume FHV trip records (Uber/Lyft), aggregated by taxi zone via DuckDB | NYC OpenData / TLC terms |
@@ -164,6 +172,13 @@ curl -L --create-dirs -o data/snapshots/dahir/map_data.csv \
 vehicles to carry; their **spatial density is real** (TLC trip distribution per
 taxi zone, normalized to the median zone), while the camera-per-vehicle rate is a
 tunable assumption. **Smart glasses** remain a fully speculative scenario layer.
+
+**NYC DOT traffic cameras** (the ~370 Manhattan units behind `nyctmc.org`) have
+**no open license**, and DOT has objected to reuse of the camera *images*. We
+therefore ingest **only the published coordinates** — the `imageUrl` field is
+never read, fetched, stored, or redistributed — and model them as a separate
+low-frame-rate *monitoring* class (omnidirectional PTZ; locations are mapped, so
+Tier A, no recall correction).
 
 Camera points are Google Street View **sample-points where a camera was detected**
 (detector recall ~0.63), not surveyed device locations — surfaced in-app as a

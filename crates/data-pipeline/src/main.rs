@@ -10,6 +10,7 @@ mod ace;
 mod alpr;
 mod cameras_dahir;
 mod dashcam;
+mod dot;
 mod equity;
 mod graph_osm;
 mod graph_synth;
@@ -72,6 +73,13 @@ fn run() -> anyhow::Result<()> {
             alpr::bake(json, out)?;
             Ok(())
         }
+        Some("bake-dot") => {
+            let json = args.get(2).context(USAGE)?;
+            let out = args.get(3).context(USAGE)?;
+            ensure_parent(out)?;
+            dot::bake(json, out)?;
+            Ok(())
+        }
         _ => bail!(USAGE),
     }
 }
@@ -124,4 +132,5 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard>\n  \
     data-pipeline bake-equity <bg.geojson> <acs.json> <map_data.csv> <out.postcard>\n  \
     data-pipeline bake-dashcam-field <taxi_zones.geojson> <zone_trips.csv> <out.postcard>\n  \
-    data-pipeline bake-alpr <alpr_overpass.json> <out.postcard>";
+    data-pipeline bake-alpr <alpr_overpass.json> <out.postcard>\n  \
+    data-pipeline bake-dot <nyctmc_cameras.json> <out.postcard>";

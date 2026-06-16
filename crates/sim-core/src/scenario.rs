@@ -31,6 +31,22 @@ impl Default for FixedCameraDefaults {
     }
 }
 
+impl FixedCameraDefaults {
+    /// Model assumptions for NYC DOT traffic cameras: PTZ units mounted high at
+    /// intersections, covering the roadway from any bearing. Wider reach than a
+    /// storefront CCTV, but treated as a *monitoring* class — a live public feed
+    /// refreshing roughly once a second, not a high-frame-rate recorder — so its
+    /// per-pass frame contribution stays modest. The feed publishes no bearing,
+    /// so these are placed omnidirectional (`heading_deg = None`).
+    pub fn dot_monitoring() -> Self {
+        FixedCameraDefaults {
+            full_fov_deg: 360.0,
+            range_m: 30.0,
+            frame_rate: 1.0,
+        }
+    }
+}
+
 /// Convert a baked fixed-sensor layer into capture-testable instances. The
 /// vector index becomes the device id for distinct-device counting.
 pub fn sensors_from_layer(layer: &FixedSensorLayer, d: FixedCameraDefaults) -> Vec<SensorInstance> {

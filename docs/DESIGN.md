@@ -56,6 +56,7 @@ The palette is implemented three times against the same hex values:
 | The machine — slate intrusion | `#345169` | CSS `--cold`; egui tier-D + correlation/live-count text (`0x34,0x51,0x69`) |
 | CCTV — cold panopticon ink | `#2a3a52` | `cctv_mat` |
 | ALPR — steel plate-reader | `#41607e` | `alpr_mat` |
+| DOT traffic cam — cyan-slate | `#4d7a8c` | `dot_mat` |
 | ACE corridor — cold steel | `#7287a4` | `ace_mat` |
 | Camera FOV cone | `rgba(0.11,0.21,0.40,0.34)` | `wedge_mat` |
 | Walkshed in-shed camera ring | `rgba(0.16,0.30,0.50,0.85)` | `ring_mat` |
@@ -102,8 +103,9 @@ Every Bevy layer (`main.rs`) is colored to land on one side of the warm/cold spl
 | B marker | `#6e2f12` deep terracotta | warm | `spawn_marker` |
 | Walkshed reachable streets | `#c9892f` warm gold | warm | walkshed edge mesh |
 | Walkshed center | `#4e6638` lichen | warm | `center_mat` |
-| Fixed CCTV | `#2a3a52` panopticon ink | cold | `cctv_mat` |
+| Fixed CCTV (circles) | `#2a3a52` panopticon ink | cold | `cctv_mat` |
 | ALPR plate readers (squares) | `#41607e` steel | cold | `alpr_mat` |
+| DOT traffic cams (triangles) | `#4d7a8c` cyan-slate | cold | `dot_mat` |
 | ACE corridors (teal) | `#7287a4` cold steel | cold | `ace_mat` |
 | Camera field-of-view cone | `rgba(0.11,0.21,0.40,0.34)` | cold | `wedge_mat` |
 | Walkshed in-shed camera ring | `rgba(0.16,0.30,0.50,0.85)` | cold | `ring_mat` |

@@ -16,9 +16,9 @@ use bevy::prelude::*;
 use bevy::window::CursorMoved;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use bevy::math::primitives::Rectangle;
+use bevy::math::primitives::{Rectangle, RegularPolygon};
 use loading::{
-    AceRes, AlprRes, CamerasRes, DashcamFieldRes, EquityRes, GraphAssetRes, HeatmapRes,
+    AceRes, AlprRes, CamerasRes, DashcamFieldRes, DotRes, EquityRes, GraphAssetRes, HeatmapRes,
     LoadingHandles,
 };
 use sim_core::assets::{DashcamFieldLayer, EquityLayer, FixedSensorLayer, HeatmapLayer};
@@ -51,6 +51,7 @@ const HEATMAP_PATH: &str = "processed/heatmap.osheat";
 const EQUITY_PATH: &str = "processed/equity.osequity";
 const DASHCAM_FIELD_PATH: &str = "processed/dashcam_field.osfield";
 const ALPR_PATH: &str = "processed/alpr.osalpr";
+const DOT_PATH: &str = "processed/dot_cameras.osdot";
 
 /// Max Shannon entropy over 5 groups = ln(5), for normalizing the choropleth.
 const MAX_ENTROPY: f64 = 1.6094379;
@@ -306,6 +307,7 @@ fn start_loading(mut commands: Commands, asset_server: Res<AssetServer>, mut rou
         equity: asset_server.load(EQUITY_PATH),
         dashcam: asset_server.load(DASHCAM_FIELD_PATH),
         alpr: asset_server.load(ALPR_PATH),
+        dot: asset_server.load(DOT_PATH),
         built: false,
     });
     route.status = "Loading Manhattan map data…".into();
@@ -322,6 +324,7 @@ fn build_world(
     equities: Res<Assets<EquityRes>>,
     dashcams: Res<Assets<DashcamFieldRes>>,
     alprs: Res<Assets<AlprRes>>,
+    dots: Res<Assets<DotRes>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -330,7 +333,7 @@ fn build_world(
     if handles.built {
         return;
     }
-    let (Some(g), Some(c), Some(a), Some(h), Some(e), Some(df), Some(al)) = (
+    let (Some(g), Some(c), Some(a), Some(h), Some(e), Some(df), Some(al), Some(dot)) = (
         graphs.get(&handles.graph),
         cams.get(&handles.cameras),
         aces.get(&handles.ace),
@@ -338,17 +341,23 @@ fn build_world(
         equities.get(&handles.equity),
         dashcams.get(&handles.dashcam),
         alprs.get(&handles.alpr),
+        dots.get(&handles.dot),
     ) else {
         return; // still loading
     };
 
     let graph = StreetGraph::from_asset(g.0.clone());
     let layer = c.0.clone();
-    // Combine fixed-camera layers: Dahir CCTV + DeFlock ALPRs, re-indexing ids to
-    // the combined-vector position (used as the distinct-device key + dot index).
+    // Combine fixed-camera layers: Dahir CCTV + DeFlock ALPRs + NYC DOT traffic
+    // cameras, re-indexing ids to the combined-vector position (used as the
+    // distinct-device key + dot index). DOT cams use monitoring defaults
+    // (omnidirectional, wider reach, low frame rate).
     let mut sensors = sim_core::sensors_from_layer(&layer, FixedCameraDefaults::default());
     let cctv_count = sensors.len();
     sensors.extend(sim_core::sensors_from_layer(&al.0, FixedCameraDefaults::default()));
+    let alpr_count = sensors.len() - cctv_count;
+    sensors.extend(sim_core::sensors_from_layer(&dot.0, FixedCameraDefaults::dot_monitoring()));
+    let dot_count = sensors.len() - cctv_count - alpr_count;
     for (i, s) in sensors.iter_mut().enumerate() {
         s.id = i as u64;
     }
@@ -396,18 +405,21 @@ fn build_world(
     }
 
     // Camera markers + translucent FOV wedges. CCTV = slate circles, ALPRs =
-    // steel squares (shape + hue redundancy); both cold/foreign on the warm map.
+    // steel squares, DOT traffic cams = cold triangles (shape + hue redundancy);
+    // all cold/foreign on the warm map.
     let cctv_circle = meshes.add(Circle::new(11.0));
     let alpr_square = meshes.add(Rectangle::new(17.0, 17.0));
+    let dot_tri = meshes.add(RegularPolygon::new(12.0, 3));
     let cctv_mat = materials.add(Color::srgb_u8(0x2a, 0x3a, 0x52)); // cold panopticon ink
     let alpr_mat = materials.add(Color::srgb_u8(0x41, 0x60, 0x7e)); // steel plate-reader
+    let dot_mat = materials.add(Color::srgb_u8(0x4d, 0x7a, 0x8c)); // cold cyan-slate (DOT)
     let wedge_mat = materials.add(Color::srgba(0.11, 0.21, 0.40, 0.34)); // cold projected cone
     for s in &sensors {
         let apex = s.wedge.apex;
-        let (mesh, mat) = if s.kind == sim_core::SourceKind::Alpr {
-            (alpr_square.clone(), alpr_mat.clone())
-        } else {
-            (cctv_circle.clone(), cctv_mat.clone())
+        let (mesh, mat) = match s.kind {
+            sim_core::SourceKind::Alpr => (alpr_square.clone(), alpr_mat.clone()),
+            sim_core::SourceKind::DotLiveView => (dot_tri.clone(), dot_mat.clone()),
+            _ => (cctv_circle.clone(), cctv_mat.clone()),
         };
         commands.spawn((
             Mesh2d(mesh),
@@ -416,6 +428,12 @@ fn build_world(
             BaseMap,
             CameraDot { id: s.id, flash: 0.0 },
         ));
+        // Only draw a cone for directional sensors. Omnidirectional cameras
+        // (DOT PTZ, heading-less ALPRs) would render as large translucent discs
+        // that bury the map and overstate constant 360° capture.
+        if s.wedge.half_fov_rad >= std::f64::consts::PI {
+            continue;
+        }
         let wedge = meshes.add(world::wedge_mesh(
             s.wedge.heading_rad as f32,
             s.wedge.half_fov_rad as f32,
@@ -431,11 +449,12 @@ fn build_world(
     }
 
     info!(
-        "loaded {} nodes / {} edges, {} CCTV + {} ALPR cameras, {} ACE segments ({} routes)",
+        "loaded {} nodes / {} edges, {} CCTV + {} ALPR + {} DOT cameras, {} ACE segments ({} routes)",
         graph.node_count(),
         graph.edge_count(),
         cctv_count,
-        sensors.len() - cctv_count,
+        alpr_count,
+        dot_count,
         ace_segments.len(),
         ace_routes.len(),
     );

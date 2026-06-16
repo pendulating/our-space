@@ -25,6 +25,7 @@ const CAMERAS_PATH: &str = "crates/app-interactive/assets/processed/cameras_fixe
 const ACE_PATH: &str = "crates/app-interactive/assets/processed/ace_corridors.osace";
 const DASHCAM_PATH: &str = "crates/app-interactive/assets/processed/dashcam_field.osfield";
 const ALPR_PATH: &str = "crates/app-interactive/assets/processed/alpr.osalpr";
+const DOT_PATH: &str = "crates/app-interactive/assets/processed/dot_cameras.osdot";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -60,6 +61,12 @@ fn heatmap(out: &str, hour: f64) -> Result<()> {
     if let Ok(b) = std::fs::read(ALPR_PATH) {
         if let Ok(al) = FixedSensorLayer::from_bytes(&b) {
             sensors.extend(sensors_from_layer(&al, FixedCameraDefaults::default()));
+        }
+    }
+    // Add NYC DOT traffic cameras (monitoring defaults: omnidirectional, low fps).
+    if let Ok(b) = std::fs::read(DOT_PATH) {
+        if let Ok(dot) = FixedSensorLayer::from_bytes(&b) {
+            sensors.extend(sensors_from_layer(&dot, FixedCameraDefaults::dot_monitoring()));
         }
     }
     for (i, s) in sensors.iter_mut().enumerate() {

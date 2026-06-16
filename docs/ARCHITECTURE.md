@@ -4,8 +4,8 @@
 sensing devices entering NYC's public space. You enter a walking route (A→B), or
 drop a single point, on the real Manhattan street network and it estimates **how
 many cameras could capture you** — across fixed CCTV, Flock/ALPR plate readers,
-ACE bus cameras, rideshare-vehicle dashcams, and (speculatively) smart glasses —
-with time-of-day mattering. It is built in Rust with the [Bevy](https://bevy.org)
+NYC DOT traffic cameras, ACE bus cameras, rideshare-vehicle dashcams, and
+(speculatively) smart glasses — with time-of-day mattering. It is built in Rust with the [Bevy](https://bevy.org)
 engine and ships to the browser via WASM + WebGPU.
 
 It is an **honest estimate tool**, not a surveillance map: every number is a
@@ -20,8 +20,8 @@ See also: [`DESIGN.md`](DESIGN.md) (the visual/UX system), [`PLAN.md`](PLAN.md)
 The system has two halves joined by a set of compact **baked assets**:
 
 - An **offline pipeline** ingests NYC open data (OSM, Census, MTA, TLC, DeFlock,
-  the Dahir et al. CCTV dataset), normalizes it, projects it to local ENU meters,
-  and serializes it to small `postcard` binaries.
+  the NYC DOT traffic-camera feed, the Dahir et al. CCTV dataset), normalizes it,
+  projects it to local ENU meters, and serializes it to small `postcard` binaries.
 - A **render-agnostic simulation core** (`sim-core`) loads those assets and
   computes exposure. It runs in two hosts: the interactive **Bevy app**
   (native dev window; WebGPU/WASM for the public web build) and a native
@@ -236,6 +236,7 @@ Each subcommand writes to the `<out>` path it is given. Parent directories are a
 | `bake-equity` | `<bg.geojson> <acs.json> <map_data.csv> <out>` | `equity::bake` | `EquityLayer` |
 | `bake-dashcam-field` | `<taxi_zones.geojson> <zone_trips.csv> <out>` | `dashcam::bake` | `DashcamFieldLayer` |
 | `bake-alpr` | `<alpr_overpass.json> <out>` | `alpr::bake` | ALPR `FixedSensorLayer` |
+| `bake-dot` | `<nyctmc_cameras.json> <out>` | `dot::bake` | NYC DOT traffic-cam `FixedSensorLayer` (locations only) |
 
 The heatmap is **not** a `data-pipeline` subcommand — it is produced by the `batch` crate: `batch heatmap <out.postcard> [hour]` (default `hour = 17.0`).
 
@@ -246,6 +247,7 @@ The heatmap is **not** a `data-pipeline` subcommand — it is produced by the `b
 | OSM walk network | Pedestrian-usable highways, fetched as an Overpass API JSON dump | OpenStreetMap via Overpass API | ODbL 1.0 |
 | `map_data.csv` | Google Street View sample-points where a camera was detected (panorama-level, detector recall ~0.63 — **not** surveyed devices) | Dahir et al. 2025, Stanford Digital Repository (`purl.stanford.edu/jr882ny4955`) | CC BY 4.0 |
 | DeFlock ALPRs | Crowdsourced license-plate-reader points synced into OSM as `man_made=surveillance` + `surveillance:type=ALPR`, fetched via Overpass | DeFlock via OpenStreetMap (`deflock.me`) | ODbL 1.0 |
+| NYC DOT traffic cams | Public PTZ traffic-monitoring camera **locations** from the TMC feed (`webcams.nyctmc.org/api/cameras/`); the `imageUrl` field is never read or stored | NYC DOT Traffic Management Center (`nyctmc.org`) | No open license — **coordinates only, images not used or redistributed** |
 | MTA GTFS static | Bus route geometry (`routes.txt`, `trips.txt`, `shapes.txt`) | MTA | MTA / OPEN-NY Terms of Use |
 | ACE route list `ki2b-sg5y` | "MTA Bus Automated Camera Enforced Routes" JSON | data.ny.gov (`data.ny.gov/d/ki2b-sg5y`) | MTA / OPEN-NY Terms of Use |
 | HVFHV trip records | High-Volume For-Hire-Vehicle (Uber/Lyft) trips, aggregated per taxi zone (PU+DO) via DuckDB over the remote Parquet | NYC TLC Trip Record Data | NYC OpenData / TLC terms |
@@ -262,6 +264,7 @@ Counts are the real values produced by this build (from each module's summary).
 | `graph_manhattan.osgraph` | `.osgraph` | `GraphAsset` | OSM walk via Overpass (largest connected component, ODbL) | 151,339 nodes / 220,609 edges |
 | `cameras_fixed.oscam` | `.oscam` | `FixedSensorLayer` (`FixedCctv`, `recall: Some(0.63)`) | Dahir et al. 2025 `map_data.csv` (CC BY 4.0) | 217 unique Manhattan cameras |
 | `alpr.osalpr` | `.osalpr` | `FixedSensorLayer` (`Alpr`, `recall: None`) | DeFlock via OSM (ODbL) | 444 readers |
+| `dot_cameras.osdot` | `.osdot` | `FixedSensorLayer` (`DotLiveView`, `recall: None`) | NYC DOT TMC feed (locations only) | 370 Manhattan cams (online) |
 | `ace_corridors.osace` | `.osace` | `AceCorridorLayer` | MTA GTFS + data.ny.gov `ki2b-sg5y` | 20 routes / 15,361 segments |
 | `dashcam_field.osfield` | `.osfield` | `DashcamFieldLayer` | NYC TLC HVFHV trips per taxi zone (DuckDB over remote Parquet) | 354 zone parts |
 | `equity.osequity` | `.osequity` | `EquityLayer` | Census TIGER geometry + Census Reporter ACS B03002 + Dahir detections | 1,299 block groups |
@@ -271,7 +274,7 @@ Counts are the real values produced by this build (from each module's summary).
 
 All layers (de)serialize with **postcard** (compact, WASM-friendly binary; `to_bytes` → `postcard::to_allocvec`, `from_bytes` → `postcard::from_bytes`), defined on each type in `crates/sim-core/src/assets.rs`.
 
-The byte format is identical across the two CCTV/ALPR layers (both `FixedSensorLayer`), so the file *extension* is what disambiguates them. Each asset type gets a **distinct extension** registered to a typed `PostcardLoader<A>` in `crates/app-interactive/src/loading.rs` whose `extensions()` returns that single extension — so each file resolves to exactly one Rust type with no ambiguity.
+The byte format is identical across the three fixed-camera layers (CCTV, ALPR, DOT — all `FixedSensorLayer`), so the file *extension* is what disambiguates them. Each asset type gets a **distinct extension** registered to a typed `PostcardLoader<A>` in `crates/app-interactive/src/loading.rs` whose `extensions()` returns that single extension — so each file resolves to exactly one Rust type with no ambiguity.
 
 Every layer ships a `Provenance { source, url, license, as_of, notes }` struct so the UI can render an honest source/date/license badge.
 
@@ -281,7 +284,7 @@ Every layer ships a `Provenance { source, url, license, as_of, notes }` struct s
 
 Mechanics:
 
-- **Fixed cameras + ALPR** — CCTV and (if present) ALPR are merged into one fixed-sensor set via `sensors_from_layer`, reindexed with sequential ids. An `rstar::RTree<GeomWithData<[f64;2], usize>>` over the apex positions is queried per edge within `cam_query_r2 = 60.0² m²` (a generous cull; the true range is enforced by the FOV test). Recall correction is `1.0 / cam_layer.recall.unwrap_or(1.0)`.
+- **Fixed cameras (CCTV + ALPR + DOT)** — the CCTV layer plus (if present) ALPR and NYC DOT traffic cams are merged into one fixed-sensor set via `sensors_from_layer`, reindexed with sequential ids. DOT cams use `FixedCameraDefaults::dot_monitoring()` (omnidirectional, 30 m reach, 1 fps); CCTV/ALPR use the default 70°/15 m/15 fps. An `rstar::RTree<GeomWithData<[f64;2], usize>>` over the apex positions is queried per edge within `cam_query_r2 = 60.0² m²` (a generous cull; the true range is enforced by the FOV test). Recall correction is `1.0 / cam_layer.recall.unwrap_or(1.0)`.
 - **ACE** — corridor segments are densified to ~10 m points and bulk-loaded into an `RTree<[f64;2]>`; an edge is "near ACE" if any point is within `capture_range_m²`.
 - **Dashcam field** — passed through so the dashcam class is **spatial**, not uniform.
 - **Per edge** — at the edge polyline midpoint, `exposure_rates_per_minute(...)` returns per-class rates; the `glasses` field comes from `MobileScenario::fields_only()`.
@@ -319,9 +322,9 @@ The interactive front end (`crates/app-interactive`) is a [Bevy](https://bevy.or
 
 ### Cross-platform asset loading (`loading.rs`)
 
-Baked layers load through Bevy's `AssetServer`, so the same code path reads `assets/` natively and fetches over HTTP on web. Each layer is a transparent newtype `Asset` wrapper (via the `postcard_asset!` macro) around a `sim-core` type, with a **distinct extension** (`.osgraph`/`.oscam`/`.osace`/`.osheat`/`.osequity`/`.osfield`/`.osalpr`). `PostcardLoader<A>` is a generic `AssetLoader` whose `extensions()` returns the single extension it was constructed with — load-bearing, because `CamerasRes` and `AlprRes` share the inner type `FixedSensorLayer` and a shared extension would silently mis-decode.
+Baked layers load through Bevy's `AssetServer`, so the same code path reads `assets/` natively and fetches over HTTP on web. Each layer is a transparent newtype `Asset` wrapper (via the `postcard_asset!` macro) around a `sim-core` type, with a **distinct extension** (`.osgraph`/`.oscam`/`.osace`/`.osheat`/`.osequity`/`.osfield`/`.osalpr`/`.osdot`). `PostcardLoader<A>` is a generic `AssetLoader` whose `extensions()` returns the single extension it was constructed with — load-bearing, because `CamerasRes`, `AlprRes`, and `DotRes` all share the inner type `FixedSensorLayer` and a shared extension would silently mis-decode.
 
-Flow: `start_loading` (Startup) spawns the camera and inserts `LoadingHandles` (one handle per layer + `built: false`); `build_world` (Update) returns early until **all seven** assets resolve, then builds the `Sim` resource and spawns the static map meshes once (guarded by `built`).
+Flow: `start_loading` (Startup) spawns the camera and inserts `LoadingHandles` (one handle per layer + `built: false`); `build_world` (Update) returns early until **all eight** assets resolve, then builds the `Sim` resource and spawns the static map meshes once (guarded by `built`).
 
 ### ECS resources, components, systems
 
@@ -347,7 +350,8 @@ Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit
 | ACE corridors | `LineList` | `line_list_mesh` |
 | CCTV markers | `Circle::new(11.0)` | — |
 | ALPR markers | `Rectangle::new(17.0, 17.0)` | — (shape+hue redundancy) |
-| FOV wedges | `TriangleList` fan | `wedge_mesh(heading, half_fov, range, 16)` |
+| DOT traffic-cam markers | `RegularPolygon::new(12.0, 3)` | — (cold triangle; shape+hue redundancy) |
+| FOV wedges | `TriangleList` fan | `wedge_mesh(heading, half_fov, range, 16)` — **directional sensors only** (omnidirectional cams draw no cone) |
 | Route line | `LineStrip` | `line_strip_mesh(&r.points, 2.0)` |
 | Walker / markers | `Circle` | — |
 | Heatmap | `LineList` per bucket | `line_list_mesh` (6 intensity buckets) |
