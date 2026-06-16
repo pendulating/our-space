@@ -30,6 +30,12 @@ use sim_core::{
 
 const WALK_SPEED: f64 = sim_core::graph::DEFAULT_WALK_SPEED_MPS;
 
+/// Playback-only speed-up for the walker dot. The exposure estimate and walkshed
+/// are computed at the true `WALK_SPEED` (1.34 m/s); this multiplier *only*
+/// scales the on-screen animation so a 15-minute walk doesn't take 15 minutes to
+/// watch (≈40× → ~22 s of playback for a 15-min route). It touches no numbers.
+const ANIM_SPEEDUP: f64 = 40.0;
+
 // Zoom feel: gentle multiplicative zoom per normalized scroll notch.
 const ZOOM_PER_NOTCH: f32 = 0.06;
 const ZOOM_PIXEL_DIVISOR: f32 = 160.0;
@@ -817,7 +823,7 @@ fn animate_walker(time: Res<Time>, route: Res<RouteState>, mut q: Query<(&mut Tr
         return;
     }
     for (mut t, mut w) in &mut q {
-        w.progress_m += WALK_SPEED * time.delta_secs_f64();
+        w.progress_m += WALK_SPEED * ANIM_SPEEDUP * time.delta_secs_f64();
         if w.progress_m > r.total_m {
             w.progress_m = 0.0;
         }
