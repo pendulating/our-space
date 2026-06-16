@@ -1,0 +1,54 @@
+name: Deploy to GitHub Pages
+
+# Deploys the *prebuilt* web/dist/ bundle. The WASM build (slow Bevy compile)
+# and the baked assets (need GBs of raw NYC data via Overpass/DuckDB/Census)
+# are produced locally with ./web/build.sh and committed; this job only uploads
+# and publishes them. Rebuild + commit web/dist before pushing.
+
+on:
+  push:
+    branches: [ main ]
+    # Only redeploy when the published bundle (or this workflow) actually changes,
+    # so Rust-source-only commits don't trigger a no-op publish.
+    paths:
+      - 'web/dist/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Cancel an in-flight deploy if a newer one starts.
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify the prebuilt bundle exists
+        run: |
+          test -f web/dist/index.html || { echo "::error::web/dist/index.html missing — run ./web/build.sh and commit web/dist/"; exit 1; }
+          test -f web/dist/app-interactive_bg.wasm || { echo "::error::web/dist/app-interactive_bg.wasm missing — run ./web/build.sh and commit web/dist/"; exit 1; }
+          echo "Bundle size: $(du -sh web/dist | cut -f1)"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload web/dist as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

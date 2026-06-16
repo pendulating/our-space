@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>our·space — a survey of the watched commons</title>
+  <meta name="description" content="An earthy, honest estimate of how many cameras and sensing devices could capture you on a walk through Manhattan. A model, not a surveillance map." />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,900&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --page: #e3d7bf;     /* aged parchment */
+      --surface: #efe6d2;  /* lighter plate */
+      --ink: #3a2e21;      /* oak-gall ink */
+      --ink-strong: #241c12;
+      --muted: #67563f;    /* faded marginalia */
+      --rule: #c2b291;     /* engraved rule */
+      --rule-2: #b59c6f;
+      --terra: #a8541f;    /* iron-gall / rust pigment (graphic) */
+      --terra-link: #8c3f12;
+      --cold: #345169;     /* the machine — slate intrusion */
+      --lichen: #4e6638; --ochre: #7a5d18; --clay: #a8501f;
+      --display: "Fraunces", Georgia, serif;
+      --body: "Spectral", Georgia, serif;
+      --mono: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink);
+      font-family: var(--body); font-size: clamp(14px, 1.5vw, 16px); line-height: 1.6;
+      -webkit-font-smoothing: antialiased; }
+    #app { display: flex; flex-direction: column; height: 100%; }
+    code, .machine { font-family: var(--mono); font-size: 0.86em; letter-spacing: 0.02em;
+      color: var(--cold); }
+    a { color: var(--terra-link); text-decoration: none; border-bottom: 1px dotted currentColor; }
+    a:hover { border-bottom-style: solid; }
+
+    /* ---- header: the journal's cover-plate ---- */
+    header { position: relative; background: var(--surface);
+      padding: clamp(10px, 1.6vw, 16px) clamp(16px, 3vw, 30px) 12px;
+      border-bottom: 2px solid var(--rule);
+      box-shadow: 0 1px 0 var(--rule-2); }
+    header::before { /* riso mis-register: a terracotta hairline, offset left */
+      content: ""; position: absolute; left: 0; right: 3px; bottom: -1.5px; height: 2px;
+      background: var(--terra); opacity: .5; }
+    .plate { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+    h1 { margin: 0; font-family: var(--display); font-weight: 900;
+      font-size: clamp(22px, 3.4vw, 34px); letter-spacing: -0.01em; color: var(--ink-strong);
+      text-shadow: 0 1px 0 rgba(255, 250, 238, .55); }
+    h1 .dot { color: var(--terra); }
+    .seal { font-family: var(--display); font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: .14em; color: var(--terra);
+      border: 1px solid var(--terra); border-radius: 3px; padding: 3px 8px;
+      transform: rotate(-1.5deg); opacity: .82; }
+    .subtitle { margin: 4px 0 0; font-style: italic; color: var(--muted);
+      font-size: clamp(13px, 1.6vw, 15px); max-width: 64ch; }
+    .subtitle strong { font-style: normal; font-weight: 600; color: var(--ink); }
+
+    /* ---- the map stage ---- */
+    #stage { position: relative; flex: 1; min-height: 0; background: var(--page); }
+    #bevy-canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+    #overlay { position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+      background: var(--page); padding: 28px; transition: opacity .6s ease; }
+    #overlay .card { max-width: 38ch; }
+    .compass { width: 64px; height: 64px; margin: 0 auto 18px; display: block; }
+    .ink-path { fill: none; stroke: var(--terra); stroke-width: 2.2; stroke-linecap: round;
+      stroke-dasharray: var(--len); stroke-dashoffset: var(--len);
+      animation: ink 1.8s cubic-bezier(.22, .61, .36, 1) infinite alternate; }
+    .ink-tick { stroke: var(--terra); stroke-width: 2; opacity: .6; }
+    @keyframes ink { to { stroke-dashoffset: 0; } }
+    #ov-title { font-family: var(--display); font-weight: 600; font-size: 20px; margin: 0 0 6px; }
+    #ov-msg { color: var(--muted); font-style: italic; margin: 0; }
+    @media (prefers-reduced-motion: reduce) { .ink-path { animation: none; stroke-dashoffset: 0; } }
+
+    /* ---- footer: the engraving credit-line ---- */
+    footer { background: var(--page); padding: 9px clamp(16px, 3vw, 30px);
+      border-top: 2px solid var(--rule); box-shadow: 0 -1px 0 var(--rule-2) inset;
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      font-style: italic; color: var(--muted); font-size: 13.5px; }
+    .seals { display: flex; gap: 6px; font-style: normal; }
+    .chip { font-family: var(--display); font-weight: 600; font-size: 11px; letter-spacing: .04em;
+      padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; background: transparent; }
+    .chip.a { color: var(--lichen); } .chip.b { color: var(--ochre); }
+    .chip.c { color: var(--clay); } .chip.d { color: var(--cold); }
+    .prov { flex: 1; min-width: 240px; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="plate">
+        <h1>our<span class="dot">·</span>space</h1>
+        <span class="seal">Survey of the Watched Commons · Manhattan</span>
+      </div>
+      <p class="subtitle">How much of your walk is watched. Pick two points; trace the cameras and sensing
+        devices that could capture you. <strong>A model estimate, not a surveillance map — and your route never leaves this browser.</strong></p>
+    </header>
+
+    <div id="stage">
+      <canvas id="bevy-canvas" tabindex="0"></canvas>
+      <div id="overlay">
+        <div class="card">
+          <svg class="compass" viewBox="0 0 64 64" aria-hidden="true">
+            <circle class="ink-path" cx="32" cy="32" r="26" style="--len: 164" />
+            <line class="ink-tick" x1="32" y1="2" x2="32" y2="12" />
+            <line class="ink-tick" x1="32" y1="52" x2="32" y2="62" />
+            <line class="ink-tick" x1="2" y1="32" x2="12" y2="32" />
+            <line class="ink-tick" x1="52" y1="32" x2="62" y2="32" />
+            <path class="ink-path" d="M32 14 L40 32 L32 50 L24 32 Z" style="--len: 88" />
+          </svg>
+          <h2 id="ov-title">Surveying the commons…</h2>
+          <p id="ov-msg">Inking the street network, camera plates, ACE corridors, and the exposure field (~30&nbsp;MB).</p>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <span class="seals">
+        <span class="chip a">A mapped</span><span class="chip b">B estimated</span><span class="chip c">C modeled</span><span class="chip d">D speculative</span>
+      </span>
+      <span class="prov">Streets © OpenStreetMap (ODbL) · fixed CCTV: Dahir et&nbsp;al. 2025 (CC&nbsp;BY&nbsp;4.0, recall&nbsp;~0.63) · ALPR plate readers: DeFlock via OSM (crowdsourced) · ACE: MTA&nbsp;GTFS + NY&nbsp;OpenData · diversity: US&nbsp;Census&nbsp;ACS · rideshare-camera density: NYC&nbsp;TLC Uber/Lyft trips. Smart glasses remain a <em>scenario</em>.</span>
+    </footer>
+  </div>
+
+  <script type="module">
+    const overlay = document.getElementById('overlay');
+    const title = document.getElementById('ov-title');
+    const msg = document.getElementById('ov-msg');
+
+    function fail(heading, detail) {
+      document.querySelector('.compass')?.remove();
+      title.textContent = heading;
+      msg.innerHTML = detail;
+    }
+
+    if (!('gpu' in navigator)) {
+      fail('This survey needs WebGPU',
+        'Open in the latest <strong>Chrome, Edge, Firefox, or Safari&nbsp;26+</strong> on a desktop, served over <code>https</code> or <code>localhost</code>. WebGPU is how the map is drawn.');
+    } else {
+      import('./app-interactive.js')
+        .then((mod) => mod.default())
+        .then(() => {
+          // wasm is running; the in-canvas panel now reports asset-loading status.
+          overlay.style.opacity = '0';
+          setTimeout(() => (overlay.style.display = 'none'), 650);
+          document.getElementById('bevy-canvas').focus();
+        })
+        .catch((err) => {
+          console.error(err);
+          fail('Could not open the survey', 'Something went wrong loading the map. See the browser console for details.');
+        });
+    }
+  </script>
+</body>
+</html>
