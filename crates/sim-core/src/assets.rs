@@ -238,9 +238,64 @@ impl DashcamFieldLayer {
     }
 }
 
+/// One baked taxi/vehicle route: a densified ENU polyline plus its sampling
+/// weight (∝ O-D trip volume). Routed **offline** over the pedestrian walk graph
+/// (v1 limitation: ignores one-way / turn restrictions — these are decorative
+/// agents, not part of the citable exposure estimate). `f32` keeps the bundle
+/// small; sub-meter precision is irrelevant for a moving dot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VehicleRoute {
+    pub polyline: Vec<[f32; 2]>,
+    pub length_m: f32,
+    /// Relative sampling weight = O-D trip volume / total (Midtown corridors
+    /// carry more cars, tracking the same field the dashcam model integrates).
+    pub weight: f32,
+}
+
+/// Baked pool of representative vehicle (rideshare) routes for the animated
+/// dashcam agents. Sampled with replacement at runtime, weighted by `weight`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VehicleRoutesLayer {
+    pub origin: GeoOrigin,
+    pub routes: Vec<VehicleRoute>,
+    pub provenance: Provenance,
+}
+
+impl VehicleRoutesLayer {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vehicle_routes_round_trip() {
+        let layer = VehicleRoutesLayer {
+            origin: GeoOrigin::MANHATTAN,
+            routes: vec![VehicleRoute {
+                polyline: vec![[0.0, 0.0], [10.0, 5.0]],
+                length_m: 11.18,
+                weight: 0.5,
+            }],
+            provenance: Provenance {
+                source: "test".into(),
+                url: String::new(),
+                license: String::new(),
+                as_of: "2026-06-16".into(),
+                notes: String::new(),
+            },
+        };
+        let back = VehicleRoutesLayer::from_bytes(&layer.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.routes.len(), 1);
+        assert_eq!(back.routes[0].polyline.len(), 2);
+        assert!((back.routes[0].weight - 0.5).abs() < 1e-6);
+    }
 
     #[test]
     fn dashcam_field_intensity_lookup() {

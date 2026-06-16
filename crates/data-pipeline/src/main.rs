@@ -15,6 +15,7 @@ mod dot;
 mod equity;
 mod graph_osm;
 mod graph_synth;
+mod vehicle_routes;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -89,6 +90,16 @@ fn run() -> anyhow::Result<()> {
             dot::bake(json, out)?;
             Ok(())
         }
+        Some("bake-vehicle-routes") => {
+            let graph = args.get(2).context(USAGE)?;
+            let geojson = args.get(3).context(USAGE)?;
+            let od = args.get(4).context(USAGE)?;
+            let out = args.get(5).context(USAGE)?;
+            let max_routes: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(1000);
+            ensure_parent(out)?;
+            vehicle_routes::bake(graph, geojson, od, out, max_routes)?;
+            Ok(())
+        }
         _ => bail!(USAGE),
     }
 }
@@ -143,4 +154,5 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-equity <bg.geojson> <acs.json> <map_data.csv> <out.postcard>\n  \
     data-pipeline bake-dashcam-field <taxi_zones.geojson> <zone_trips.csv> <out.postcard>\n  \
     data-pipeline bake-alpr <alpr_overpass.json> <out.postcard>\n  \
-    data-pipeline bake-dot <nyctmc_cameras.json> <out.postcard>";
+    data-pipeline bake-dot <nyctmc_cameras.json> <out.postcard>\n  \
+    data-pipeline bake-vehicle-routes <graph.osgraph> <taxi_zones.geojson> <zone_od.csv> <out.osroutes> [max_routes]";

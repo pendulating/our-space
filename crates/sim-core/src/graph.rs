@@ -4,8 +4,10 @@
 use crate::assets::GraphAsset;
 use crate::math::Vec2;
 use crate::projection::GeoOrigin;
+use crate::rng::RngLike;
 use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -137,6 +139,65 @@ impl StreetGraph {
         }
     }
 
+    /// Incident edges of `node` as `(other_node_id, edge_index)` pairs. Used by
+    /// the ambient pedestrian agents' random walk (no routing).
+    pub fn neighbors(&self, node: u32) -> Vec<(u32, u32)> {
+        let ni = NodeIndex::new(node as usize);
+        self.g
+            .edges(ni)
+            .map(|e| {
+                let other = if e.source() == ni { e.target() } else { e.source() };
+                (other.index() as u32, *e.weight() as u32)
+            })
+            .collect()
+    }
+
+    /// One random-walk step from `node`: pick a uniform random incident edge,
+    /// avoiding an immediate U-turn back to `prev` when another option exists.
+    /// Returns `(next_node, edge_index)`, or `None` at a dead end. O(degree).
+    pub fn random_walk_step(
+        &self,
+        node: u32,
+        prev: Option<u32>,
+        rng: &mut impl RngLike,
+    ) -> Option<(u32, u32)> {
+        let mut opts = self.neighbors(node);
+        if opts.is_empty() {
+            return None;
+        }
+        if opts.len() > 1 {
+            if let Some(p) = prev {
+                // Avoid an immediate U-turn — but only if it leaves a choice
+                // (parallel edges can all lead back to `prev`).
+                let filtered: Vec<(u32, u32)> = opts.iter().copied().filter(|&(n, _)| n != p).collect();
+                if !filtered.is_empty() {
+                    opts = filtered;
+                }
+            }
+        }
+        Some(opts[rng.below(opts.len())])
+    }
+
+    /// Build a `Route` by random-walking up to `max_edges` steps from `start`,
+    /// reusing the same polyline stitching as routed paths. Cheap, O(max_edges),
+    /// and naturally organic — used for the wandering smart-glasses pedestrians.
+    pub fn random_walk_route(&self, start: u32, max_edges: usize, rng: &mut impl RngLike) -> Route {
+        let mut path = vec![NodeIndex::new(start as usize)];
+        let mut prev: Option<u32> = None;
+        let mut cur = start;
+        for _ in 0..max_edges {
+            match self.random_walk_step(cur, prev, rng) {
+                Some((next, _edge)) => {
+                    path.push(NodeIndex::new(next as usize));
+                    prev = Some(cur);
+                    cur = next;
+                }
+                None => break,
+            }
+        }
+        self.build_route(&path)
+    }
+
     /// Stitch the node path into a continuous ENU polyline, orienting each
     /// edge's stored geometry in the direction of travel.
     fn build_route(&self, path: &[NodeIndex]) -> Route {
@@ -245,6 +306,19 @@ impl Route {
             0.0
         };
         self.points[i0].lerp(self.points[i1], t)
+    }
+
+    /// Unit travel direction at arc-length `d` (for orienting a moving sprite).
+    /// Finite difference of `position_at`; falls back to +x for a degenerate
+    /// route. O(log n).
+    pub fn heading_at(&self, d: f64) -> Vec2 {
+        if self.total_m <= 0.0 {
+            return Vec2::new(1.0, 0.0);
+        }
+        let eps = 0.5_f64.min(self.total_m * 0.5);
+        let a = self.position_at((d - eps).max(0.0));
+        let b = self.position_at((d + eps).min(self.total_m));
+        b.sub(a).normalize()
     }
 
     /// Sample (elapsed_seconds, position) at a fixed time step `dt` while
@@ -362,6 +436,49 @@ mod tests {
         let all = g.walkshed(0, 1000.0, 1.0);
         assert_eq!(all.node_time.len(), 4);
         assert_eq!(all.edges.len(), 4);
+    }
+
+    #[test]
+    fn neighbors_lists_incident_edges() {
+        let g = StreetGraph::from_asset(square_graph());
+        // Node 0 connects to 1 (edge 0) and 3 (edge 3).
+        let mut ns: Vec<u32> = g.neighbors(0).iter().map(|&(n, _)| n).collect();
+        ns.sort();
+        assert_eq!(ns, vec![1, 3]);
+    }
+
+    #[test]
+    fn random_walk_avoids_immediate_backtrack() {
+        use crate::rng::WyRand;
+        let g = StreetGraph::from_asset(square_graph());
+        let mut rng = WyRand::new(1);
+        // From node 1 (neighbors 0 and 2), having come from 0, must go to 2.
+        for _ in 0..50 {
+            let (next, _) = g.random_walk_step(1, Some(0), &mut rng).unwrap();
+            assert_eq!(next, 2, "should not U-turn back to prev when alternative exists");
+        }
+    }
+
+    #[test]
+    fn random_walk_route_is_connected_and_monotone() {
+        use crate::rng::WyRand;
+        let g = StreetGraph::from_asset(square_graph());
+        let mut rng = WyRand::new(99);
+        let r = g.random_walk_route(0, 6, &mut rng);
+        assert!(r.points.len() >= 2);
+        assert!(r.total_m > 0.0);
+        // cumulative arc length is non-decreasing.
+        for w in r.cumulative_m.windows(2) {
+            assert!(w[1] >= w[0]);
+        }
+    }
+
+    #[test]
+    fn heading_points_along_segment() {
+        let g = StreetGraph::from_asset(square_graph());
+        let r = g.route(0, 1).unwrap(); // along +x from (0,0) to (10,0)
+        let h = r.heading_at(5.0);
+        assert!((h.x - 1.0).abs() < 1e-6 && h.y.abs() < 1e-6, "{h:?}");
     }
 
     #[test]

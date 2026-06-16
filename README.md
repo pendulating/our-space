@@ -70,6 +70,14 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   static `web/dist/` bundle (wasm-bindgen + wasm-opt) with `web/index.html` doing
   WebGPU-support detection, a loading screen, and the "estimate, not a
   surveillance map" + route-stays-client-side framing.
+- ✅ **Phase 5**: **animated ambient agents** — clay rideshare **dashcam vehicles**
+  following real TLC trip-O-D routes and slate smart-glasses **pedestrians**
+  wandering via graph random walks, on a fixed recycled entity pool (60 fps,
+  no runtime routing). Density scales with the hour + sliders. A **dual exposure
+  mode** lets you switch between the deterministic *Research estimate* (the
+  reproducible Poisson figure) and a *Live walk* where the agents that actually
+  pass you tally a stochastic "saw you" count — a Monte-Carlo sample of the
+  same model.
 
 ## Quick start
 
@@ -92,6 +100,9 @@ cargo run -p data-pipeline -- bake-equity  data/snapshots/census/blockgroups.geo
 # Rideshare-camera density (NYC TLC Uber/Lyft trips per taxi zone). Aggregate the
 # remote Parquet with DuckDB, then bake against the taxi-zone polygons:
 cargo run -p data-pipeline -- bake-dashcam-field data/snapshots/tlc/taxi_zones.geojson data/snapshots/tlc/zone_trips.csv assets/processed/dashcam_field.osfield
+# Animated rideshare-vehicle routes (real TLC zone O-D, routed over the walk
+# graph offline; drives the moving dashcam agents). Needs zone_od.csv (below):
+cargo run -p data-pipeline -- bake-vehicle-routes assets/processed/graph_manhattan.osgraph data/snapshots/tlc/taxi_zones.geojson data/snapshots/tlc/zone_od.csv assets/processed/vehicle_routes.osroutes 1000
 
 # Citywide exposure heatmap (per-edge intensities; arg = reference hour 0..23)
 cargo run -p batch --release -- heatmap assets/processed/heatmap.postcard 17
@@ -162,6 +173,16 @@ curl -L --create-dirs -o data/snapshots/amnesty/counts_per_intersections.csv \
 # NYC DOT traffic-camera locations (no open license — we keep only coordinates):
 curl -L --create-dirs -o data/snapshots/dot/cameras.json \
   "https://webcams.nyctmc.org/api/cameras/"
+
+# Taxi zone O-D matrix for the animated rideshare agents — aggregate a TLC HVFHV
+# Parquet month with DuckDB, filtered to Manhattan zones (IDS = the 69 Manhattan
+# LocationIDs from taxi_zones.geojson):
+#   duckdb -c "INSTALL httpfs; LOAD httpfs;
+#     COPY (SELECT PULocationID, DOLocationID, COUNT(*) AS trips
+#           FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2024-06.parquet')
+#           WHERE PULocationID IN (IDS) AND DOLocationID IN (IDS) AND PULocationID <> DOLocationID
+#           GROUP BY 1,2 HAVING COUNT(*) >= 200 ORDER BY trips DESC)
+#     TO 'data/snapshots/tlc/zone_od.csv' (HEADER);"
 ```
 
 ## Data sources & licenses

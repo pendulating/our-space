@@ -29,7 +29,10 @@ fn parse_trips(csv_path: &str) -> Result<HashMap<i64, f64>> {
 }
 
 /// Per-feature: `LocationID` + its exterior rings (one per polygon part) in ENU.
-fn parse_zones(json: &[u8], proj: &EnuProjection) -> Result<Vec<(i64, Vec<Vec<[f64; 2]>>)>> {
+pub(crate) fn parse_zones(
+    json: &[u8],
+    proj: &EnuProjection,
+) -> Result<Vec<(i64, Vec<Vec<[f64; 2]>>)>> {
     let fc: geojson::FeatureCollection =
         serde_json::from_slice(json).context("parsing taxi-zone GeoJSON")?;
     let to_enu = |ring: &[Vec<f64>]| -> Vec<[f64; 2]> {

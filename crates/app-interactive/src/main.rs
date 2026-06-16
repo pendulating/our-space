@@ -6,6 +6,7 @@
 //! smart glasses) is evaluated over the walk on a clock. Scenario sliders and the
 //! departure hour re-evaluate the existing route live.
 
+mod agents;
 mod loading;
 mod ui;
 mod world;
@@ -17,9 +18,10 @@ use bevy::window::CursorMoved;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
 use bevy::math::primitives::{Rectangle, RegularPolygon};
+use agents::AgentPool;
 use loading::{
     AceRes, AlprRes, CamerasRes, DashcamFieldRes, DotRes, EquityRes, GraphAssetRes, HeatmapRes,
-    LoadingHandles,
+    LoadingHandles, VehicleRoutesRes,
 };
 use sim_core::assets::{DashcamFieldLayer, EquityLayer, FixedSensorLayer, HeatmapLayer};
 use sim_core::simulation::SimParams;
@@ -34,7 +36,8 @@ const WALK_SPEED: f64 = sim_core::graph::DEFAULT_WALK_SPEED_MPS;
 /// are computed at the true `WALK_SPEED` (1.34 m/s); this multiplier *only*
 /// scales the on-screen animation so a 15-minute walk doesn't take 15 minutes to
 /// watch (≈40× → ~22 s of playback for a 15-min route). It touches no numbers.
-const ANIM_SPEEDUP: f64 = 40.0;
+/// Shared by the ambient agents so the whole scene runs on one time-lapse clock.
+pub(crate) const ANIM_SPEEDUP: f64 = 40.0;
 
 // Zoom feel: gentle multiplicative zoom per normalized scroll notch.
 const ZOOM_PER_NOTCH: f32 = 0.06;
@@ -52,6 +55,7 @@ const EQUITY_PATH: &str = "processed/equity.osequity";
 const DASHCAM_FIELD_PATH: &str = "processed/dashcam_field.osfield";
 const ALPR_PATH: &str = "processed/alpr.osalpr";
 const DOT_PATH: &str = "processed/dot_cameras.osdot";
+const VEHICLE_ROUTES_PATH: &str = "processed/vehicle_routes.osroutes";
 
 /// Max Shannon entropy over 5 groups = ln(5), for normalizing the choropleth.
 const MAX_ENTROPY: f64 = 1.6094379;
@@ -101,6 +105,8 @@ pub struct Sim {
     pub equity_corr: Option<f64>,
     /// Spatial rideshare-camera density field (from real TLC trips).
     pub dashcam_field: DashcamFieldLayer,
+    /// Baked weighted pool of vehicle (rideshare) routes for the dashcam agents.
+    pub vehicle_routes: Vec<sim_core::assets::VehicleRoute>,
 }
 
 #[derive(Resource, Default)]
@@ -127,6 +133,10 @@ pub struct Params {
     pub heatmap_class: HeatClass,
     pub equity_on: bool,
     pub mode: Mode,
+    /// Show the ambient moving agents (rideshare dashcams + glasses pedestrians).
+    pub show_agents: bool,
+    /// Which exposure figure the panel headlines (see [`ExposureMode`]).
+    pub exposure_mode: ExposureMode,
 }
 impl Default for Params {
     fn default() -> Self {
@@ -143,8 +153,20 @@ impl Default for Params {
             heatmap_class: HeatClass::Fixed,
             equity_on: false,
             mode: Mode::Route,
+            show_agents: true,
+            exposure_mode: ExposureMode::Analytical,
         }
     }
+}
+
+/// Which exposure figure the panel reports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExposureMode {
+    /// Deterministic Poisson-field expectation — reproducible, the citable estimate.
+    Analytical,
+    /// A single stochastic walk: the moving agents that actually pass you this
+    /// playback increment a live tally (a Monte-Carlo sample of the same model).
+    Narrative,
 }
 
 /// Whether egui currently wants pointer / keyboard input (so map controls yield).
@@ -170,6 +192,10 @@ pub struct ResetRequested(pub bool);
 pub struct WalkLive {
     pub seen: std::collections::HashSet<u64>,
     pub count: u32,
+    /// Narrative mode: stochastic rideshare-dashcam encounters this pass.
+    pub mobile_vehicle: u32,
+    /// Narrative mode: stochastic smart-glasses encounters this pass.
+    pub mobile_glasses: u32,
     pub last_progress: f64,
 }
 
@@ -234,6 +260,7 @@ fn main() {
     .init_resource::<ResetRequested>()
     .init_resource::<WalkLive>()
     .init_resource::<WalkshedState>()
+    .insert_resource(AgentPool::empty())
     .add_systems(Startup, start_loading)
     .add_systems(
         Update,
@@ -243,8 +270,10 @@ fn main() {
             handle_click,
             recompute_on_change,
             animate_walker,
-            walk_capture_events,
+            (walk_capture_events, agents::mobile_capture_events).chain(),
             camera_flash_decay,
+            agents::scale_agent_population,
+            agents::animate_agents,
             sync_mode,
             sync_visibility,
             rebuild_heatmap,
@@ -308,6 +337,7 @@ fn start_loading(mut commands: Commands, asset_server: Res<AssetServer>, mut rou
         dashcam: asset_server.load(DASHCAM_FIELD_PATH),
         alpr: asset_server.load(ALPR_PATH),
         dot: asset_server.load(DOT_PATH),
+        vehicle_routes: asset_server.load(VEHICLE_ROUTES_PATH),
         built: false,
     });
     route.status = "Loading Manhattan map data…".into();
@@ -325,6 +355,7 @@ fn build_world(
     dashcams: Res<Assets<DashcamFieldRes>>,
     alprs: Res<Assets<AlprRes>>,
     dots: Res<Assets<DotRes>>,
+    vroutes: Res<Assets<VehicleRoutesRes>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -333,7 +364,7 @@ fn build_world(
     if handles.built {
         return;
     }
-    let (Some(g), Some(c), Some(a), Some(h), Some(e), Some(df), Some(al), Some(dot)) = (
+    let (Some(g), Some(c), Some(a), Some(h), Some(e), Some(df), Some(al), Some(dot), Some(vr)) = (
         graphs.get(&handles.graph),
         cams.get(&handles.cameras),
         aces.get(&handles.ace),
@@ -342,6 +373,7 @@ fn build_world(
         dashcams.get(&handles.dashcam),
         alprs.get(&handles.alpr),
         dots.get(&handles.dot),
+        vroutes.get(&handles.vehicle_routes),
     ) else {
         return; // still loading
     };
@@ -461,14 +493,22 @@ fn build_world(
     route.status = "Click the map to set a start point (A).".into();
     info!("equity: diversity ~ detected cameras  r = {:?}", equity_corr);
 
+    // Ambient mobile agents: decode the baked vehicle-route pool and spawn the
+    // fixed entity pool (vehicles + pedestrians). Routes also live on `Sim` for
+    // runtime weighted resampling on recycle.
+    let vehicle_routes = vr.0.routes.clone();
+    let pool = agents::spawn_pool(&mut commands, &mut meshes, &mut materials, &vehicle_routes);
+    commands.insert_resource(pool);
+
     if std::env::var("OURSPACE_SMOKE").is_ok() {
         let _ = std::fs::write(
             "/tmp/ourspace_setup.txt",
             format!(
-                "setup_ok nodes={} cameras={} ace_segments={}\n",
+                "setup_ok nodes={} cameras={} ace_segments={} vehicle_routes={}\n",
                 graph.node_count(),
                 sensors.len(),
-                ace_segments.len()
+                ace_segments.len(),
+                vehicle_routes.len(),
             ),
         );
     }
@@ -483,6 +523,7 @@ fn build_world(
         equity,
         equity_corr,
         dashcam_field,
+        vehicle_routes,
     });
     handles.built = true;
 }
@@ -743,6 +784,8 @@ fn walk_capture_events(
     if walker.progress_m + 1.0 < walk_live.last_progress {
         walk_live.seen.clear();
         walk_live.count = 0;
+        walk_live.mobile_vehicle = 0;
+        walk_live.mobile_glasses = 0;
     }
     walk_live.last_progress = walker.progress_m;
 
@@ -863,14 +906,28 @@ fn set_vis<F: bevy::ecs::query::QueryFilter>(q: &mut Query<&mut Visibility, F>, 
 /// colored exposure overlay reads cleanly; otherwise FOV and ACE follow toggles.
 fn sync_visibility(
     params: Res<Params>,
-    mut base: Query<&mut Visibility, (With<BaseMap>, Without<FovWedge>, Without<AceVis>)>,
-    mut fov: Query<&mut Visibility, (With<FovWedge>, Without<BaseMap>, Without<AceVis>)>,
-    mut ace: Query<&mut Visibility, (With<AceVis>, Without<BaseMap>, Without<FovWedge>)>,
+    mut base: Query<&mut Visibility, (With<BaseMap>, Without<FovWedge>, Without<AceVis>, Without<agents::MobileVis>)>,
+    mut fov: Query<&mut Visibility, (With<FovWedge>, Without<BaseMap>, Without<AceVis>, Without<agents::MobileVis>)>,
+    mut ace: Query<&mut Visibility, (With<AceVis>, Without<BaseMap>, Without<FovWedge>, Without<agents::MobileVis>)>,
+    mut mobile: Query<(&mut Visibility, &agents::MobileAgent), (With<agents::MobileVis>, Without<BaseMap>, Without<FovWedge>, Without<AceVis>)>,
 ) {
     let hm = params.heatmap_on;
     set_vis(&mut base, !hm);
     set_vis(&mut fov, params.show_fov && !hm);
     set_vis(&mut ace, params.show_ace && !hm);
+    // Agents: hidden in heatmap mode or when toggled off; otherwise each follows
+    // its own `active` flag (population scaling), so only active ones show.
+    let show_agents = params.show_agents && !hm;
+    for (mut vis, agent) in &mut mobile {
+        let target = if show_agents && agent.active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != target {
+            *vis = target;
+        }
+    }
 }
 
 /// Heat gradient from low exposure (warm parchment-ochre) to high (cold slate) —

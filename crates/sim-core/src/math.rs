@@ -62,6 +62,17 @@ impl Vec2 {
         self.sub(o).length()
     }
 
+    /// Unit vector in the same direction; returns +x for a near-zero vector.
+    #[inline]
+    pub fn normalize(self) -> Vec2 {
+        let len = self.length();
+        if len < 1e-9 {
+            Vec2::new(1.0, 0.0)
+        } else {
+            self.scale(1.0 / len)
+        }
+    }
+
     /// Linear interpolation; `t` in [0, 1].
     #[inline]
     pub fn lerp(self, o: Vec2, t: f64) -> Vec2 {

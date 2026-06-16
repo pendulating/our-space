@@ -20,6 +20,7 @@ pub mod graph;
 pub mod math;
 pub mod mobile;
 pub mod projection;
+pub mod rng;
 pub mod scenario;
 pub mod simulation;
 
@@ -33,6 +34,7 @@ pub use graph::{Route, RouteError, StreetGraph, Walkshed, DEFAULT_WALK_SPEED_MPS
 pub use math::Vec2;
 pub use mobile::{AceConfig, DashcamConfig, GlassesConfig, MobileScenario};
 pub use projection::{EnuProjection, GeoOrigin};
+pub use rng::{RngLike, WyRand};
 pub use scenario::{
     run_route, sensors_from_layer, summarize, walkshed_exposure, FixedCameraDefaults, RouteSummary,
     SourceBreakdown, WalkshedSummary,

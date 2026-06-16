@@ -109,6 +109,8 @@ Every Bevy layer (`main.rs`) is colored to land on one side of the warm/cold spl
 | ACE corridors (teal) | `#7287a4` cold steel | cold | `ace_mat` |
 | Camera field-of-view cone | `rgba(0.11,0.21,0.40,0.34)` | cold | `wedge_mat` |
 | Walkshed in-shed camera ring | `rgba(0.16,0.30,0.50,0.85)` | cold | `ring_mat` |
+| Dashcam-vehicle agents (triangles, moving) | `#a8501f` clay | warm (Tier C) | `agents.rs` |
+| Glasses-pedestrian agents (dots, moving) | `#345169` slate | cold (Tier D) | `agents.rs` |
 
 #### Heatmap gradient (`HEAT_COLORS`)
 

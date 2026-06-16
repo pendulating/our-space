@@ -6,7 +6,10 @@ use bevy_egui::{egui, EguiContexts};
 
 use sim_core::ConfidenceTier;
 
-use crate::{EguiWants, HeatClass, Mode, Params, ResetRequested, RouteState, Sim, WalkLive, WalkshedState};
+use crate::{
+    EguiWants, ExposureMode, HeatClass, Mode, Params, ResetRequested, RouteState, Sim, WalkLive,
+    WalkshedState,
+};
 
 /// egui legend colors mirroring the map's heat gradient (warm low -> cold high).
 const LEGEND: [egui::Color32; 6] = [
@@ -132,55 +135,85 @@ pub fn ui_panel(
 
             // ---- results: route mode ----
             if params.mode == Mode::Route {
+            // Exposure-mode selector: the reproducible estimate vs the live walk.
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut params.exposure_mode, ExposureMode::Analytical, "Research estimate");
+                ui.selectable_value(&mut params.exposure_mode, ExposureMode::Narrative, "Live walk");
+            });
+            ui.add_space(4.0);
+
             if let Some(s) = &route.summary {
-                ui.heading(
-                    egui::RichText::new(format!("~{} devices could have captured you", s.headline_devices))
-                        .color(egui::Color32::from_rgb(0x9a, 0x4a, 0x17))
-                        .size(22.0),
-                );
                 ui.label(format!(
                     "walk: {:.0} m  (~{:.0} min)  ·  departing {:02}:00",
                     s.route_len_m,
                     s.duration_s / 60.0,
                     params.departure_hour as i32,
                 ));
-                // Live tally as the animated walker passes cameras.
-                if walk_live.count > 0 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "▸ passed {} fixed cameras so far this walk",
-                            walk_live.count
-                        ))
-                        .color(egui::Color32::from_rgb(0x34, 0x51, 0x69)),
-                    );
-                }
-                ui.add_space(6.0);
 
-                egui::Grid::new("breakdown").num_columns(4).striped(true).show(ui, |ui| {
-                    ui.label(egui::RichText::new("source").strong());
-                    ui.label(egui::RichText::new("tier").strong());
-                    ui.label(egui::RichText::new("devices").strong());
-                    ui.label(egui::RichText::new("P(seen)").strong());
-                    ui.end_row();
-                    for b in &s.breakdown {
-                        let (tname, color) = tier_style(b.tier);
-                        ui.label(b.kind.label());
-                        ui.colored_label(color, tname);
-                        ui.label(format!("~{:.1}", b.devices));
-                        ui.label(format!("{:.0}%", b.p_at_least_one * 100.0));
-                        ui.end_row();
+                match params.exposure_mode {
+                    ExposureMode::Analytical => {
+                        ui.heading(
+                            egui::RichText::new(format!("~{} devices could have captured you", s.headline_devices))
+                                .color(egui::Color32::from_rgb(0x9a, 0x4a, 0x17))
+                                .size(22.0),
+                        );
+                        ui.add_space(6.0);
+                        egui::Grid::new("breakdown").num_columns(4).striped(true).show(ui, |ui| {
+                            ui.label(egui::RichText::new("source").strong());
+                            ui.label(egui::RichText::new("tier").strong());
+                            ui.label(egui::RichText::new("devices").strong());
+                            ui.label(egui::RichText::new("P(seen)").strong());
+                            ui.end_row();
+                            for b in &s.breakdown {
+                                let (tname, color) = tier_style(b.tier);
+                                ui.label(b.kind.label());
+                                ui.colored_label(color, tname);
+                                ui.label(format!("~{:.1}", b.devices));
+                                ui.label(format!("{:.0}%", b.p_at_least_one * 100.0));
+                                ui.end_row();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.0} expected capture-events · {:.1}% of walk under fixed CCTV",
+                                s.total_expected_frames,
+                                s.fraction_surveilled * 100.0
+                            ))
+                            .weak(),
+                        );
                     }
-                });
-
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{:.0} expected capture-events · {:.1}% of walk under fixed CCTV",
-                        s.total_expected_frames,
-                        s.fraction_surveilled * 100.0
-                    ))
-                    .weak(),
-                );
+                    ExposureMode::Narrative => {
+                        let live = walk_live.count + walk_live.mobile_vehicle + walk_live.mobile_glasses;
+                        ui.heading(
+                            egui::RichText::new(format!("~{live} devices saw you this walk"))
+                                .color(egui::Color32::from_rgb(0x9a, 0x4a, 0x17))
+                                .size(22.0),
+                        );
+                        ui.add_space(6.0);
+                        let slate = egui::Color32::from_rgb(0x34, 0x51, 0x69);
+                        egui::Grid::new("live_breakdown").num_columns(2).striped(true).show(ui, |ui| {
+                            ui.label("fixed cameras");
+                            ui.colored_label(slate, format!("{}", walk_live.count));
+                            ui.end_row();
+                            ui.label("rideshare dashcams");
+                            ui.colored_label(egui::Color32::from_rgb(0xa8, 0x50, 0x1f), format!("{}", walk_live.mobile_vehicle));
+                            ui.end_row();
+                            ui.label("smart glasses");
+                            ui.colored_label(slate, format!("{}", walk_live.mobile_glasses));
+                            ui.end_row();
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "a single stochastic walk — a Monte-Carlo sample of the model. \
+                                 Switch to Research estimate for the reproducible figure.",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                    }
+                }
             } else {
                 ui.label(
                     egui::RichText::new(if route.status.is_empty() {
@@ -226,6 +259,13 @@ pub fn ui_panel(
                         .text("/1k peds"),
                 );
             });
+            ui.add_space(4.0);
+            ui.checkbox(&mut params.show_agents, "Animate moving dashcams & glasses");
+            ui.label(
+                egui::RichText::new("clay = rideshare dashcams · slate = glasses wearers; density scales with hour + sliders")
+                    .weak()
+                    .size(11.0),
+            );
             } // end route-mode controls
 
             ui.separator();

@@ -239,6 +239,7 @@ Each subcommand writes to the `<out>` path it is given. Parent directories are a
 | `bake-dashcam-field` | `<taxi_zones.geojson> <zone_trips.csv> <out>` | `dashcam::bake` | `DashcamFieldLayer` |
 | `bake-alpr` | `<alpr_overpass.json> <out>` | `alpr::bake` | ALPR `FixedSensorLayer` |
 | `bake-dot` | `<nyctmc_cameras.json> <out>` | `dot::bake` | NYC DOT traffic-cam `FixedSensorLayer` (locations only) |
+| `bake-vehicle-routes` | `<graph.osgraph> <taxi_zones.geojson> <zone_od.csv> <out> [max_routes]` | `vehicle_routes::bake` | `VehicleRoutesLayer` (weighted rideshare route pool for the animated agents) |
 
 The heatmap is **not** a `data-pipeline` subcommand — it is produced by the `batch` crate: `batch heatmap <out.postcard> [hour]` (default `hour = 17.0`).
 
@@ -268,6 +269,7 @@ Counts are the real values produced by this build (from each module's summary).
 | `cameras_fixed.oscam` | `.oscam` | `FixedSensorLayer` (`FixedCctv`, `recall: None`) | Amnesty Decode NYC census + Dahir et al. (de-duplicated) | 4,422 cameras (4,266 Amnesty + 156 Dahir-unique) |
 | `alpr.osalpr` | `.osalpr` | `FixedSensorLayer` (`Alpr`, `recall: None`) | DeFlock via OSM (ODbL) | 444 readers |
 | `dot_cameras.osdot` | `.osdot` | `FixedSensorLayer` (`DotLiveView`, `recall: None`) | NYC DOT TMC feed (locations only) | 370 Manhattan cams (online) |
+| `vehicle_routes.osroutes` | `.osroutes` | `VehicleRoutesLayer` | TLC HVFHV zone O-D routed over the walk graph (decorative) | 1,000 weighted routes (~159 KB) |
 | `ace_corridors.osace` | `.osace` | `AceCorridorLayer` | MTA GTFS + data.ny.gov `ki2b-sg5y` | 20 routes / 15,361 segments |
 | `dashcam_field.osfield` | `.osfield` | `DashcamFieldLayer` | NYC TLC HVFHV trips per taxi zone (DuckDB over remote Parquet) | 354 zone parts |
 | `equity.osequity` | `.osequity` | `EquityLayer` | Census TIGER geometry + Census Reporter ACS B03002 + Dahir detections | 1,299 block groups |
@@ -352,6 +354,14 @@ Flow: `start_loading` (Startup) spawns the camera and inserts `LoadingHandles` (
 
 **Walkshed mode**: one click snaps to the nearest node, runs `graph.walkshed(node, WALKSHED_SECONDS = 600.0, WALK_SPEED)` then `walkshed_exposure(...)`. Reachable streets light up warm gold, in-shed cameras get cold emphasis rings, and the click point gets a center marker; the result lands in `WalkshedState`.
 
+### Ambient moving agents & dual-mode exposure (`agents.rs`)
+
+The mobile sensing classes are also rendered as moving agents: clay **dashcam vehicles** (Tier C) replaying baked `VehicleRoute`s, and slate **glasses pedestrians** (Tier D) following on-device graph **random walks** (`StreetGraph::random_walk_route`). A fixed entity **pool** (`AgentPool`, `MAX_VEHICLES = 250` + `MAX_PEDS = 400`) is spawned once with one shared mesh+material per class; `scale_agent_population` activates/deactivates slots (≤32/frame) toward a target = `MAX × {traffic,pedestrian}_multiplier(hour) × (slider / default)`, so on-screen density tracks the hour and the dashcam/glasses sliders. `animate_agents` advances each active agent (`speed × ANIM_SPEEDUP × dt`, the same time-lapse clock as the walker), sets its `Transform` via `Route::position_at` (O(log n)), orients vehicles by `Route::heading_at`, and **recycles in place** on completion (vehicles re-sample the weighted pool; peds random-walk on from the nearest node) — no spawn/despawn churn. There is **no runtime A***: vehicle paths are baked offline, ped paths are O(1) random walks. Agents are hidden in heatmap mode / when `show_agents` is off, and inactive agents early-out of every system.
+
+`Params.exposure_mode` selects what the panel headlines:
+- **Analytical** (default, citable): the deterministic `summarize` Poisson estimate — unchanged.
+- **Narrative**: `mobile_capture_events` (chained after `walk_capture_events`) tests the walker's animated position against each active agent's capture range; on a debounced fresh entry it rolls a Bernoulli folding the device∧capture probability (`penetration × capture_prob` for dashcams; `(per_1000/1000) × p_recording × capture_prob` for glasses) and increments a per-class live tally with a pulse. Because agent flux already scales with the same multipliers/sliders the analytical rate uses, the tally is a Monte-Carlo sample whose expectation tracks the analytical figure; the UI labels it as such and keeps Analytical as the reproducible number.
+
 ### Rendering (`world.rs` + `main.rs`)
 
 Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit = 1 ENU meter** (`world::to_world`); z orders layers.
@@ -366,6 +376,8 @@ Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit
 | FOV wedges | `TriangleList` fan | `wedge_mesh(heading, half_fov, range, 16)` — **directional sensors only** (omnidirectional cams draw no cone) |
 | Route line | `LineStrip` | `line_strip_mesh(&r.points, 2.0)` |
 | Walker / markers | `Circle` | — |
+| Dashcam-vehicle agents | `RegularPolygon::new(7.0, 3)` clay | — (oriented by `heading_at`; one shared mesh, batched) |
+| Glasses-pedestrian agents | `Circle::new(4.0)` slate | — (one shared mesh, batched) |
 | Heatmap | `LineList` per bucket | `line_list_mesh` (6 intensity buckets) |
 | Equity choropleth | `TriangleList` | `filled_polygon_mesh` (earcut-triangulated) |
 
