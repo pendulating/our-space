@@ -11,8 +11,16 @@ It is an **honest estimate tool**, not a surveillance map or an evasion guide.
 Every number is a model estimate with stated provenance and uncertainty. The
 route never leaves your browser.
 
-See [`docs/PLAN.md`](docs/PLAN.md) for the full design, data-source decisions,
-and roadmap.
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system architecture: the
+  simulation core + exposure model, the data pipeline and baked assets, and the
+  app/rendering/web-build layer, with file/line references throughout.
+- [`docs/DESIGN.md`](docs/DESIGN.md) — the "Survey of the Watched Commons" visual
+  system: the warm-vs-cold palette, typography, confidence-tier coding, map-layer
+  treatment, and interaction/motion.
+- [`docs/PLAN.md`](docs/PLAN.md) — the original design, data-source decisions, and
+  phased roadmap.
 
 ## Workspace layout
 
@@ -102,8 +110,24 @@ python3 -m http.server -d web/dist 8080           # open http://localhost:8080 (
 `web/dist/` is a fully static bundle — deploy it to any static host with HTTPS
 (WebGPU requires a secure context): Cloudflare Pages, GitHub Pages, Netlify,
 Vercel. No server, API keys, or backend: the route is computed entirely in the
-browser and never transmitted. Note the ~30 MB asset payload (graph + layers);
-the page shows a loading screen while it fetches.
+browser and never transmitted. Note the ~46 MB payload (22 MB WASM + 24 MB baked
+layers); the page shows a loading screen while it fetches.
+
+**GitHub Pages (continuous deployment).** `.github/workflows/deploy.yml` publishes
+the committed `web/dist/` to Pages on every push to `main` that touches it (or via
+the Actions "Run workflow" button). Because the WASM build is slow and the baked
+assets need gigabytes of raw NYC data, the bundle is **built locally and committed**
+rather than reproduced in CI — the workflow only uploads and publishes it:
+
+```sh
+./web/build.sh            # rebuild web/dist/ (WASM + assets + index.html)
+git add web/dist && git commit -m "Rebuild web bundle"
+git push                  # → Actions deploys to https://pendulating.github.io/our-space/
+```
+
+One-time setup: in the repo's **Settings → Pages**, set **Source = GitHub Actions**.
+The relative asset paths and Bevy's page-relative asset fetches work unchanged under
+the `/our-space/` project subpath, so no base-path config is needed.
 
 ### Interactive controls
 

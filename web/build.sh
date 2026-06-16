@@ -33,6 +33,8 @@ echo "==> copy page + assets"
 cp web/index.html "$OUT/index.html"
 rm -rf "$OUT/assets"
 cp -r crates/app-interactive/assets "$OUT/assets"
+# Serve the bundle verbatim on GitHub Pages (no Jekyll processing).
+touch "$OUT/.nojekyll"
 
 echo "==> done: $(du -sh "$OUT" | cut -f1) in $OUT"
 ls -lah "$OUT"/*.wasm

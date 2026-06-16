@@ -18,5 +18,8 @@ Cargo.lock.orig
 __pycache__/
 
 # Web build output
-/web/dist
+#   web/dist/ IS committed: GitHub Pages deploys the prebuilt bundle as-is
+#   (the WASM build + the gitignored baked assets can't be reproduced in CI).
+#   Rebuild with ./web/build.sh and commit before pushing — see
+#   .github/workflows/deploy.yml.
 /web/node_modules
