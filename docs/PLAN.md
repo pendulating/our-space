@@ -1,5 +1,14 @@
 # our-space — Implementation Plan
 
+> **Status (current):** this is the *original* roadmap, kept for historical and
+> design-rationale context. All of Phases 0–4 shipped, plus a Phase 5 (animated
+> ambient agents + dual-mode exposure) and several post-plan additions: **NYC DOT
+> traffic cameras**, a **merged + de-duplicated fixed-CCTV census** (Amnesty
+> *Decode Surveillance NYC* + Dahir et al.), **ALPR** readers (DeFlock), a **40×
+> walker playback time-lapse**, and **GitHub Pages continuous deployment**. For
+> the as-built system see [`ARCHITECTURE.md`](ARCHITECTURE.md); for the visual
+> system see [`DESIGN.md`](DESIGN.md).
+
 A geospatial **simulation + visualization of NYC's growing sensing layer** (fixed CCTV, ACE bus cameras, dashcams, smart glasses), built on the real Manhattan street network. The user enters a walking route A→B; the sim estimates **how many cameras could capture them** and the **frequency of capture**, with **time-of-day** mattering. Built in **Bevy (Rust/ECS)**, shipping to the browser via **WASM + WebGPU**. Interactive single-route mode first; a batch/citywide mode later.
 
 ## Context

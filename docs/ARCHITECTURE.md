@@ -81,10 +81,11 @@ batch, and a headless `route_demo` example.
 | `geometry` | `crates/sim-core/src/geometry.rs` | `FrustumWedge` FOV wedges + 2D line-of-sight occlusion (`captures`, `OccluderEdge`). |
 | `exposure` | `crates/sim-core/src/exposure.rs` | The exposure model: `SourceKind`, `ConfidenceTier`, `ExposureTally`, `DAHIR_RECALL`. |
 | `mobile` | `crates/sim-core/src/mobile.rs` | Time-of-day functions + mobile/ambient scenario configs. |
-| `graph` | `crates/sim-core/src/graph.rs` | `StreetGraph` (petgraph), A* `route`, `Walkshed`/Dijkstra isochrone, position-over-time. |
+| `graph` | `crates/sim-core/src/graph.rs` | `StreetGraph` (petgraph), A* `route`, `Walkshed`/Dijkstra isochrone, position-over-time; `neighbors`/`random_walk_route` + `Route::heading_at` for the ambient agents. |
 | `simulation` | `crates/sim-core/src/simulation.rs` | The discrete-clock walk loop (`simulate_full`) and per-minute heatmap rates. |
 | `scenario` | `crates/sim-core/src/scenario.rs` | Orchestration: assets → sensors, `run_route`, `summarize`, `walkshed_exposure`. |
-| `assets` | `crates/sim-core/src/assets.rs` | Serde/postcard structs for baked layers, incl. `DashcamFieldLayer`. |
+| `assets` | `crates/sim-core/src/assets.rs` | Serde/postcard structs for baked layers, incl. `DashcamFieldLayer`, `VehicleRoutesLayer`. |
+| `rng` | `crates/sim-core/src/rng.rs` | Minimal `RngLike` trait + `WyRand` (no heavy `rand` dep in the WASM core); drives random walks + agent variety. |
 
 ### ENU projection
 
@@ -342,15 +343,15 @@ Flow: `start_loading` (Startup) spawns the camera and inserts `LoadingHandles` (
 
 ### ECS resources, components, systems
 
-**Resources:** `Sim` (graph, sensors, layer, ace_segments/routes, heatmap, equity, `equity_corr` = Pearson r diversity↔cameras, dashcam_field), `RouteState`, `Params` (toggles, `departure_hour=17.0`, `dashcam_penetration=0.40`, `glasses_per_1000=10.0`, `heatmap_class`, `mode`), `WalkshedState`, `WalkLive` (`seen`, `count`, `last_progress`), `EguiWants` (pointer/keyboard), `DragState` (click-vs-drag), `ResetRequested`, `LoadingHandles`.
+**Resources:** `Sim` (graph, sensors, layer, ace_segments/routes, heatmap, equity, `equity_corr` = Pearson r diversity↔cameras, dashcam_field, `vehicle_routes`), `RouteState`, `Params` (toggles, `departure_hour=17.0`, `dashcam_penetration=0.40`, `glasses_per_1000=10.0`, `heatmap_class`, `mode`, `show_agents`, `exposure_mode`), `WalkshedState`, `WalkLive` (`seen`, `count`, `mobile_vehicle`, `mobile_glasses`, `last_progress`), `AgentPool` (pooled agent entities + weighted-route sampler + RNG), `EguiWants` (pointer/keyboard), `DragState` (click-vs-drag), `ResetRequested`, `LoadingHandles`.
 
-**Components:** `BaseMap`, `FovWedge`, `AceVis`, `HeatmapVis`, `EquityVis`, `RouteVis`, `WalkshedVis`, `CameraDot { id, flash }`, `Walker { progress_m }`.
+**Components:** `BaseMap`, `FovWedge`, `AceVis`, `HeatmapVis`, `EquityVis`, `RouteVis`, `WalkshedVis`, `CameraDot { id, flash }`, `Walker { progress_m }`, `MobileAgent { class, route, progress_m, speed_mps, active, flash, counted }`, `MobileVis`.
 
-**Systems** (Update): `build_world`, `camera_control`, `handle_click`, `recompute_on_change`, `animate_walker`, `walk_capture_events`, `camera_flash_decay`, `sync_mode`, `sync_visibility`, `rebuild_heatmap`, `rebuild_equity`, `apply_reset`, `smoke_exit` (a headless-CI helper gated on `OURSPACE_SMOKE`). `ui::ui_panel` runs in `EguiPrimaryContextPass`.
+**Systems** (Update): `build_world`, `camera_control`, `handle_click`, `recompute_on_change`, `animate_walker`, `(walk_capture_events, mobile_capture_events).chain()`, `camera_flash_decay`, `scale_agent_population`, `animate_agents`, `sync_mode`, `sync_visibility`, `rebuild_heatmap`, `rebuild_equity`, `apply_reset`, `smoke_exit` (a headless-CI helper gated on `OURSPACE_SMOKE`). `ui::ui_panel` runs in `EguiPrimaryContextPass`.
 
 ### The two modes (`Params.mode`)
 
-**Route mode** (`handle_click`): first click sets A (lichen), second sets B (terracotta) and calls `run_route(...)`, spawning a `LineStrip` route + a `Walker`. `animate_walker` advances the walker at `WALK_SPEED` and loops; `walk_capture_events` tests every `CameraDot` against its sensor wedge with `captures`, increments `WalkLive.count` and sets `flash = 1.0` the first time each camera is seen this pass; `camera_flash_decay` decays the pulse. `recompute_on_change` re-runs `summarize` whenever `Params` changes (sliders/hour re-evaluate without re-routing).
+**Route mode** (`handle_click`): first click sets A (lichen), second sets B (terracotta) and calls `run_route(...)`, spawning a `LineStrip` route + a `Walker`. `animate_walker` advances the walker for **playback only** at `WALK_SPEED × ANIM_SPEEDUP` (a 40× time-lapse, so a 15-minute walk replays in ~22 s) and loops; this multiplier is purely visual — the exposure model and walkshed use the true `WALK_SPEED` (1.34 m/s), so no number changes. `walk_capture_events` tests every `CameraDot` against its sensor wedge with `captures`, increments `WalkLive.count` and sets `flash = 1.0` the first time each camera is seen this pass; `camera_flash_decay` decays the pulse. `recompute_on_change` re-runs `summarize` whenever `Params` changes (sliders/hour re-evaluate without re-routing).
 
 **Walkshed mode**: one click snaps to the nearest node, runs `graph.walkshed(node, WALKSHED_SECONDS = 600.0, WALK_SPEED)` then `walkshed_exposure(...)`. Reachable streets light up warm gold, in-shed cameras get cold emphasis rings, and the click point gets a center marker; the result lands in `WalkshedState`.
 
@@ -412,6 +413,10 @@ A static, backend-free pipeline:
 Prereqs (in-script): `rustup target add wasm32-unknown-unknown`, `cargo install wasm-bindgen-cli --version 0.2.125` (matched to the crate), `brew install binaryen`. The optimized wasm is ~21 MB; total payload ~44 MB with assets.
 
 `web/index.html` is a self-contained "field-journal" page that: hosts the `#bevy-canvas` + a self-inking compass loading overlay; performs **WebGPU detection** (`'gpu' in navigator`) with a graceful fallback message; dynamically imports `./app-interactive.js` and calls its default init; and carries the A–D confidence chips + full provenance line. No backend.
+
+### Continuous deployment to GitHub Pages (`.github/workflows/deploy.yml`)
+
+The site is served at **`https://pendulating.github.io/our-space/`** (a project page). Because the WASM build is slow and the baked assets need gigabytes of raw NYC data that can't be reproduced in CI, the pipeline ships the **prebuilt `web/dist/` committed to the repo**: the workflow only uploads and publishes it. On every push to `main` that touches `web/dist/**` (or via manual dispatch) it runs `configure-pages` → `upload-pages-artifact` (`path: web/dist`) → `deploy-pages@v4`, gated on a bundle-exists check; a `.nojekyll` marker makes Pages serve the bundle verbatim. The relative asset paths and Bevy's page-relative fetches work unchanged under the `/our-space/` subpath, so no base-path config is needed. The loop is: edit → `./web/build.sh` → commit `web/dist` → push → auto-deploy.
 
 ### Privacy
 
