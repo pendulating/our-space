@@ -9,7 +9,7 @@
 //! mesh+material per class (draw-call batching), O(log n) `position_at` per agent
 //! per frame, no runtime A* (vehicles replay baked polylines; peds random-walk).
 
-use bevy::math::primitives::{Circle, RegularPolygon};
+use bevy::math::primitives::RegularPolygon;
 use bevy::prelude::*;
 use std::f64::consts::FRAC_PI_2;
 
@@ -108,11 +108,18 @@ pub fn spawn_pool(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ColorMaterial>,
     vehicle_routes: &[VehicleRoute],
+    glasses_icon: Handle<Image>,
 ) -> AgentPool {
+    // Dashcam vehicles stay clay triangles (they read as moving cars); glasses
+    // pedestrians get the eyeglasses icon as a small textured quad.
     let veh_mesh = meshes.add(RegularPolygon::new(7.0, 3));
     let veh_mat = materials.add(Color::srgb_u8(0xa8, 0x50, 0x1f)); // clay (Tier C)
-    let ped_mesh = meshes.add(Circle::new(4.0));
-    let ped_mat = materials.add(Color::srgb_u8(0x34, 0x51, 0x69)); // slate (Tier D)
+    let ped_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 16.0));
+    let ped_mat = materials.add(ColorMaterial {
+        color: Color::WHITE,
+        texture: Some(glasses_icon),
+        ..default()
+    });
 
     let mut vehicles = Vec::with_capacity(MAX_VEHICLES);
     for _ in 0..MAX_VEHICLES {

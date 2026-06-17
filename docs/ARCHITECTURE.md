@@ -371,13 +371,13 @@ Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit
 |---------|-----------------|---------|
 | Streets | `LineList` | `line_list_mesh(street_line_positions(...))` |
 | ACE corridors | `LineList` | `line_list_mesh` |
-| Camera markers (CCTV/ALPR/DOT) | one **merged** `TriangleList` per class | `merged_markers_mesh(pts, r, sides, rot)` — circle/square/triangle; 3 entities, not ~5k |
+| Camera markers (CCTV/ALPR/DOT) | one **merged** textured-quad `TriangleList` per class | `merged_icon_quads(pts, size)` + `ColorMaterial{texture}` — paints `icons/{cctv,owl,dot}.png`; 3 draw calls, not ~5k entities |
+| Glasses-pedestrian agents | textured quad | `merged_icon_quads(&[origin], 16)` + `icons/glasses.png` |
 | Capture pulse (live walk) | `Annulus::new(9.0, 14.0)` | pooled `Ping` ring, expands + retires |
 | FOV wedges | `TriangleList` fan | `wedge_mesh(heading, half_fov, range, 16)` — **directional sensors only** (omnidirectional cams draw no cone) |
 | Route line | `LineStrip` | `line_strip_mesh(&r.points, 2.0)` |
 | Walker / markers | `Circle` | — |
 | Dashcam-vehicle agents | `RegularPolygon::new(7.0, 3)` clay | — (oriented by `heading_at`; one shared mesh, batched) |
-| Glasses-pedestrian agents | `Circle::new(4.0)` slate | — (one shared mesh, batched) |
 | Heatmap | `LineList` per bucket | `line_list_mesh` (6 intensity buckets) |
 | Equity choropleth | `TriangleList` | `filled_polygon_mesh` (earcut-triangulated) |
 

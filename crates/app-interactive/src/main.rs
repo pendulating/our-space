@@ -384,6 +384,7 @@ fn build_world(
     alprs: Res<Assets<AlprRes>>,
     dots: Res<Assets<DotRes>>,
     vroutes: Res<Assets<VehicleRoutesRes>>,
+    asset_server: Res<AssetServer>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -464,11 +465,11 @@ fn build_world(
         ));
     }
 
-    // Camera markers: one MERGED mesh per class (CCTV slate circles, ALPR steel
-    // squares, DOT cold triangles) instead of ~5k individual entities — collapses
-    // the dominant per-frame extraction cost to 3 draw calls. Shape+hue redundancy
-    // keeps the classes legible. FOV wedges stay per-camera (directional only,
-    // hidden unless toggled, so cheap).
+    // Camera markers: one MERGED textured-quad mesh per class, each painting a
+    // recognizable icon (CCTV camera, owl for Flock/ALPR, traffic-cam for DOT)
+    // via a single ColorMaterial+texture — 3 draw calls for ~5k cameras, not one
+    // entity each. FOV wedges stay per-camera (directional only, hidden unless
+    // toggled, so cheap).
     let mut cctv_pts: Vec<Enu> = Vec::new();
     let mut alpr_pts: Vec<Enu> = Vec::new();
     let mut dot_pts: Vec<Enu> = Vec::new();
@@ -496,17 +497,20 @@ fn build_world(
             ));
         }
     }
-    let quarter = std::f32::consts::FRAC_PI_4;
-    for (pts, radius, sides, rot, rgb) in [
-        (&cctv_pts, 11.0_f32, 12usize, 0.0_f32, (0x2a, 0x3a, 0x52)), // circle
-        (&alpr_pts, 12.0, 4, quarter, (0x41, 0x60, 0x7e)),          // square
-        (&dot_pts, 13.0, 3, std::f32::consts::FRAC_PI_2, (0x4d, 0x7a, 0x8c)), // triangle (point up)
+    for (pts, size, icon) in [
+        (&cctv_pts, 26.0_f32, "icons/cctv.png"),
+        (&alpr_pts, 28.0, "icons/owl.png"),
+        (&dot_pts, 28.0, "icons/dot.png"),
     ] {
         if pts.is_empty() {
             continue;
         }
-        let mesh = meshes.add(world::merged_markers_mesh(pts, radius, sides, rot));
-        let mat = materials.add(Color::srgb_u8(rgb.0, rgb.1, rgb.2));
+        let mesh = meshes.add(world::merged_icon_quads(pts, size));
+        let mat = materials.add(ColorMaterial {
+            color: Color::WHITE,
+            texture: Some(asset_server.load(icon)),
+            ..default()
+        });
         commands.spawn((
             Mesh2d(mesh),
             MeshMaterial2d(mat),
@@ -563,7 +567,8 @@ fn build_world(
     // fixed entity pool (vehicles + pedestrians). Routes also live on `Sim` for
     // runtime weighted resampling on recycle.
     let vehicle_routes = vr.0.routes.clone();
-    let pool = agents::spawn_pool(&mut commands, &mut meshes, &mut materials, &vehicle_routes);
+    let glasses_icon = asset_server.load("icons/glasses.png");
+    let pool = agents::spawn_pool(&mut commands, &mut meshes, &mut materials, &vehicle_routes, glasses_icon);
     commands.insert_resource(pool);
 
     if std::env::var("OURSPACE_SMOKE").is_ok() {

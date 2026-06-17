@@ -103,14 +103,31 @@ Every Bevy layer (`main.rs`) is colored to land on one side of the warm/cold spl
 | B marker | `#6e2f12` deep terracotta | warm | `spawn_marker` |
 | Walkshed reachable streets | `#c9892f` warm gold | warm | walkshed edge mesh |
 | Walkshed center | `#4e6638` lichen | warm | `center_mat` |
-| Fixed CCTV (circles) | `#2a3a52` panopticon ink | cold | `cctv_mat` |
-| ALPR plate readers (squares) | `#41607e` steel | cold | `alpr_mat` |
-| DOT traffic cams (triangles) | `#4d7a8c` cyan-slate | cold | `dot_mat` |
+| Fixed CCTV (CCTV-camera icon) | `#2a3a52` panopticon ink | cold | `icons/cctv.png` |
+| ALPR plate readers (owl icon) | `#41607e` steel | cold | `icons/owl.png` |
+| DOT traffic cams (traffic-cam icon) | `#4d7a8c` cyan-slate | cold | `icons/dot.png` |
 | ACE corridors (teal) | `#7287a4` cold steel | cold | `ace_mat` |
 | Camera field-of-view cone | `rgba(0.11,0.21,0.40,0.34)` | cold | `wedge_mat` |
 | Walkshed in-shed camera ring | `rgba(0.16,0.30,0.50,0.85)` | cold | `ring_mat` |
 | Dashcam-vehicle agents (triangles, moving) | `#a8501f` clay | warm (Tier C) | `agents.rs` |
-| Glasses-pedestrian agents (dots, moving) | `#345169` slate | cold (Tier D) | `agents.rs` |
+| Glasses-pedestrian agents (glasses icon, moving) | `#345169` slate | cold (Tier D) | `icons/glasses.png` |
+
+#### Sensor icons
+
+The fixed sensor classes are drawn as **recognizable icons** rather than bare
+shapes, so the map reads at a glance: a **CCTV camera** (fixed CCTV), an **owl**
+(Flock/ALPR — echoing the DeFlock motif), a **traffic camera on a mast** (NYC
+DOT), and **eyeglasses** with a recording glint (smart-glasses agents). These are
+**original silhouettes** in the cold palette (`tools/generate_icons.py` → 128px
+PNGs in `assets/icons/`), not third-party logos — same instant read, no trademark
+entanglement. They render as merged textured quads (see `ARCHITECTURE.md`) so
+the icon upgrade keeps the one-draw-call-per-class performance. Dashcam vehicles
+stay clay triangles (they read as moving cars).
+
+*Planned UX direction — aggregate by operator:* surface exposure grouped by who
+holds the images (e.g. Meta vs. government/DOT vs. Nexar and other dashcam
+makers), so a walker sees not just "how many cameras" but "whose." This is a
+later addition layered on the existing per-`SourceKind` breakdown.
 
 #### Heatmap gradient (`HEAT_COLORS`)
 

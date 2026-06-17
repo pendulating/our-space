@@ -182,11 +182,15 @@
         }
       }
 
-      // Bevy (wasm) calls this every frame with the camera center + meters/CSS-px.
-      // Web-Mercator: metersPerPixel = 156543.03392 * cos(lat) / 2^zoom.
+      // Bevy (wasm) calls this every frame with the camera center + meters per
+      // CSS pixel (Bevy's ortho uses logical/CSS pixels, so scale.x maps 1:1 —
+      // no devicePixelRatio factor). MapLibre uses 512px tiles, so its zoom is
+      // metersPerPixel = 78271.517 * cos(lat) / 2^zoom  (NOT the 256-tile
+      // 156543 constant — that would put the basemap one zoom level too deep).
+      const MAPLIBRE_C = 78271.51696401048; // 40075016.686 / 512
       window.ourspaceSetView = function (lon, lat, metersPerPx) {
         if (!map || !metersPerPx || metersPerPx <= 0) return;
-        const z = Math.log2(156543.03392804097 * Math.cos((lat * Math.PI) / 180) / metersPerPx);
+        const z = Math.log2(MAPLIBRE_C * Math.cos((lat * Math.PI) / 180) / metersPerPx);
         map.jumpTo({ center: [lon, lat], zoom: z });
       };
 

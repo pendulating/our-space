@@ -25,36 +25,31 @@ pub fn street_line_positions(asset: &GraphAsset) -> Vec<[f32; 3]> {
     v
 }
 
-/// One merged `TriangleList` mesh drawing a small regular polygon (`sides`,
-/// `radius` m, `rot` radians) at every position. Collapses thousands of camera
-/// dots into a single mesh/entity/draw-call instead of one entity per camera —
-/// the per-frame extraction cost of ~5k individual `Mesh2d` entities was the
-/// dominant render load. `sides`: 3 = triangle, 4 = square, ~12 ≈ circle.
-pub fn merged_markers_mesh(positions: &[Enu], radius: f32, sides: usize, rot: f32) -> Mesh {
+/// One merged `TriangleList` of textured `size`-meter quads, one per position,
+/// each UV-mapped 0..1 so a `ColorMaterial { texture }` paints the class icon at
+/// every camera. Collapses thousands of camera markers into a single
+/// mesh/entity/draw-call (a 4-vert quad is even cheaper than the old polygon
+/// dots), preserving the perf win while showing recognizable icons.
+pub fn merged_icon_quads(positions: &[Enu], size: f32) -> Mesh {
+    let h = size * 0.5;
     let n = positions.len();
-    let mut verts: Vec<[f32; 3]> = Vec::with_capacity(n * (sides + 1));
-    let mut indices: Vec<u32> = Vec::with_capacity(n * sides * 3);
-    let unit: Vec<(f32, f32)> = (0..sides)
-        .map(|i| {
-            let a = rot + std::f32::consts::TAU * (i as f32) / (sides as f32);
-            (radius * a.cos(), radius * a.sin())
-        })
-        .collect();
+    let mut verts: Vec<[f32; 3]> = Vec::with_capacity(n * 4);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(n * 4);
+    let mut indices: Vec<u32> = Vec::with_capacity(n * 6);
     for p in positions {
+        let (x, y) = (p.x as f32, p.y as f32);
         let base = verts.len() as u32;
-        let (cx, cy) = (p.x as f32, p.y as f32);
-        verts.push([cx, cy, 0.0]); // center
-        for &(dx, dy) in &unit {
-            verts.push([cx + dx, cy + dy, 0.0]);
-        }
-        for i in 0..sides as u32 {
-            indices.push(base);
-            indices.push(base + 1 + i);
-            indices.push(base + 1 + (i + 1) % sides as u32);
-        }
+        // World +y is north (up); image v increases downward, so the top corners
+        // (higher y) get v = 0.
+        verts.push([x - h, y + h, 0.0]); uvs.push([0.0, 0.0]); // top-left
+        verts.push([x + h, y + h, 0.0]); uvs.push([1.0, 0.0]); // top-right
+        verts.push([x + h, y - h, 0.0]); uvs.push([1.0, 1.0]); // bottom-right
+        verts.push([x - h, y - h, 0.0]); uvs.push([0.0, 1.0]); // bottom-left
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }
