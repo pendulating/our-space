@@ -28,6 +28,34 @@ struct RawElement {
     lon: Option<f64>,
     #[serde(default)]
     nodes: Vec<i64>,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+/// Highway types kept as the **street-centerline** network. OSM separately maps
+/// each sidewalk/crossing as a `footway`, so the raw walk dump has ~3 parallel
+/// lines per street; keeping only carriageway centerlines + pedestrian plazas
+/// collapses that to one line per street (~75% fewer segments) — far less visual
+/// clutter and a much smaller render mesh, while A* still routes (roads meet at
+/// shared intersection nodes). Pedestrian fidelity (individual sidewalks, mid-
+/// block crossings) is intentionally traded away — the v1 design is centerline.
+fn is_kept_highway(hw: &str) -> bool {
+    matches!(
+        hw,
+        "residential"
+            | "primary"
+            | "secondary"
+            | "tertiary"
+            | "unclassified"
+            | "living_street"
+            | "pedestrian"
+            | "road"
+            | "trunk"
+            | "primary_link"
+            | "secondary_link"
+            | "tertiary_link"
+            | "trunk_link"
+    )
 }
 
 /// Intern an OSM node id into a compact graph-node index, recording its ENU
@@ -89,9 +117,11 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
 
     let proj = EnuProjection::default();
 
-    // 1. Node coords (projected) + ways.
+    // 1. Node coords (projected) + ways, filtered to the street-centerline
+    //    keep-set (drops separately-mapped sidewalks/footways/steps/etc.).
     let mut coords: HashMap<i64, Vec2> = HashMap::new();
     let mut ways: Vec<(i64, Vec<i64>)> = Vec::new();
+    let (mut total_ways, mut kept_ways) = (0usize, 0usize);
     for el in &resp.elements {
         match el.kind.as_str() {
             "node" => {
@@ -99,10 +129,23 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
                     coords.insert(el.id, proj.to_enu(la, lo));
                 }
             }
-            "way" if el.nodes.len() >= 2 => ways.push((el.id, el.nodes.clone())),
+            "way" if el.nodes.len() >= 2 => {
+                total_ways += 1;
+                // Keep a way if it carries a kept highway tag. Untagged ways
+                // (geometry-only dumps) are kept so a tagless export still works.
+                let keep = match el.tags.get("highway") {
+                    Some(hw) => is_kept_highway(hw),
+                    None => el.tags.is_empty(),
+                };
+                if keep {
+                    kept_ways += 1;
+                    ways.push((el.id, el.nodes.clone()));
+                }
+            }
             _ => {}
         }
     }
+    eprintln!("OSM ways: {kept_ways}/{total_ways} kept (street centerlines)");
 
     // 2. Usage counts -> which nodes are graph (split) nodes.
     let mut usage: HashMap<i64, u32> = HashMap::new();
