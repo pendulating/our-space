@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use bevy::window::CursorMoved;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use bevy::math::primitives::{Rectangle, RegularPolygon};
+use bevy::math::primitives::Annulus;
 use rstar::primitives::GeomWithData;
 use rstar::RTree;
 use agents::AgentPool;
@@ -114,8 +114,6 @@ pub struct Sim {
     pub cam_index: RTree<GeomWithData<[f64; 2], u64>>,
     /// Squared query radius (m²) = (max camera range + margin)² for the cull.
     pub cam_query_r2: f64,
-    /// Camera-dot entity per sensor id (id-ordered), for O(1) flash on capture.
-    pub cam_entities: Vec<Entity>,
 }
 
 #[derive(Resource, Default)]
@@ -231,11 +229,16 @@ struct RouteVis;
 /// Walkshed visuals (reachable streets + in-shed camera rings + center) — cleared per query.
 #[derive(Component)]
 struct WalkshedVis;
-/// A fixed-camera dot; carries its sensor id and a flash pulse for the animated walk.
+/// A transient "you were seen" pulse overlay (pooled), placed on a fixed camera
+/// the moment the live walk passes it. `life` counts down 1→0.
 #[derive(Component)]
-struct CameraDot {
-    id: u64,
-    flash: f32,
+struct Ping {
+    life: f32,
+}
+/// Fixed pool of pulse entities, recycled (no per-capture spawn/despawn).
+#[derive(Resource, Default)]
+struct PingPool {
+    entities: Vec<Entity>,
 }
 #[derive(Component)]
 struct Walker {
@@ -269,6 +272,7 @@ fn main() {
     .init_resource::<ResetRequested>()
     .init_resource::<WalkLive>()
     .init_resource::<WalkshedState>()
+    .init_resource::<PingPool>()
     .insert_resource(AgentPool::empty())
     .add_systems(Startup, start_loading)
     .add_systems(
@@ -280,7 +284,7 @@ fn main() {
             recompute_on_change,
             animate_walker,
             (walk_capture_events, agents::mobile_capture_events).chain(),
-            camera_flash_decay,
+            decay_pings,
             agents::scale_agent_population,
             agents::animate_agents,
             sync_mode,
@@ -445,51 +449,54 @@ fn build_world(
         ));
     }
 
-    // Camera markers + translucent FOV wedges. CCTV = slate circles, ALPRs =
-    // steel squares, DOT traffic cams = cold triangles (shape + hue redundancy);
-    // all cold/foreign on the warm map.
-    let cctv_circle = meshes.add(Circle::new(11.0));
-    let alpr_square = meshes.add(Rectangle::new(17.0, 17.0));
-    let dot_tri = meshes.add(RegularPolygon::new(12.0, 3));
-    let cctv_mat = materials.add(Color::srgb_u8(0x2a, 0x3a, 0x52)); // cold panopticon ink
-    let alpr_mat = materials.add(Color::srgb_u8(0x41, 0x60, 0x7e)); // steel plate-reader
-    let dot_mat = materials.add(Color::srgb_u8(0x4d, 0x7a, 0x8c)); // cold cyan-slate (DOT)
+    // Camera markers: one MERGED mesh per class (CCTV slate circles, ALPR steel
+    // squares, DOT cold triangles) instead of ~5k individual entities — collapses
+    // the dominant per-frame extraction cost to 3 draw calls. Shape+hue redundancy
+    // keeps the classes legible. FOV wedges stay per-camera (directional only,
+    // hidden unless toggled, so cheap).
+    let mut cctv_pts: Vec<Enu> = Vec::new();
+    let mut alpr_pts: Vec<Enu> = Vec::new();
+    let mut dot_pts: Vec<Enu> = Vec::new();
     let wedge_mat = materials.add(Color::srgba(0.11, 0.21, 0.40, 0.34)); // cold projected cone
-    let mut cam_entities: Vec<Entity> = Vec::with_capacity(sensors.len());
     for s in &sensors {
-        let apex = s.wedge.apex;
-        let (mesh, mat) = match s.kind {
-            sim_core::SourceKind::Alpr => (alpr_square.clone(), alpr_mat.clone()),
-            sim_core::SourceKind::DotLiveView => (dot_tri.clone(), dot_mat.clone()),
-            _ => (cctv_circle.clone(), cctv_mat.clone()),
-        };
-        let entity = commands
-            .spawn((
-                Mesh2d(mesh),
-                MeshMaterial2d(mat),
-                Transform::from_translation(world::to_world(apex, 1.0)),
-                BaseMap,
-                CameraDot { id: s.id, flash: 0.0 },
-            ))
-            .id();
-        cam_entities.push(entity); // sensors are id-ordered, so cam_entities[id] = entity
-        // Only draw a cone for directional sensors. Omnidirectional cameras
-        // (DOT PTZ, heading-less ALPRs) would render as large translucent discs
-        // that bury the map and overstate constant 360° capture.
-        if s.wedge.half_fov_rad >= std::f64::consts::PI {
+        match s.kind {
+            sim_core::SourceKind::Alpr => alpr_pts.push(s.wedge.apex),
+            sim_core::SourceKind::DotLiveView => dot_pts.push(s.wedge.apex),
+            _ => cctv_pts.push(s.wedge.apex),
+        }
+        // Directional sensors get a cone; omnidirectional (DOT PTZ, heading-less
+        // ALPR) draw none (a 30 m disc would bury the map). Wedges default hidden.
+        if s.wedge.half_fov_rad < std::f64::consts::PI {
+            let wedge = meshes.add(world::wedge_mesh(
+                s.wedge.heading_rad as f32,
+                s.wedge.half_fov_rad as f32,
+                s.wedge.range_m as f32,
+                16,
+            ));
+            commands.spawn((
+                Mesh2d(wedge),
+                MeshMaterial2d(wedge_mat.clone()),
+                Transform::from_translation(world::to_world(s.wedge.apex, 0.5)),
+                FovWedge,
+            ));
+        }
+    }
+    let quarter = std::f32::consts::FRAC_PI_4;
+    for (pts, radius, sides, rot, rgb) in [
+        (&cctv_pts, 11.0_f32, 12usize, 0.0_f32, (0x2a, 0x3a, 0x52)), // circle
+        (&alpr_pts, 12.0, 4, quarter, (0x41, 0x60, 0x7e)),          // square
+        (&dot_pts, 13.0, 3, std::f32::consts::FRAC_PI_2, (0x4d, 0x7a, 0x8c)), // triangle (point up)
+    ] {
+        if pts.is_empty() {
             continue;
         }
-        let wedge = meshes.add(world::wedge_mesh(
-            s.wedge.heading_rad as f32,
-            s.wedge.half_fov_rad as f32,
-            s.wedge.range_m as f32,
-            16,
-        ));
+        let mesh = meshes.add(world::merged_markers_mesh(pts, radius, sides, rot));
+        let mat = materials.add(Color::srgb_u8(rgb.0, rgb.1, rgb.2));
         commands.spawn((
-            Mesh2d(wedge),
-            MeshMaterial2d(wedge_mat.clone()),
-            Transform::from_translation(world::to_world(apex, 0.5)),
-            FovWedge,
+            Mesh2d(mesh),
+            MeshMaterial2d(mat),
+            Transform::from_xyz(0.0, 0.0, 1.0),
+            BaseMap,
         ));
     }
 
@@ -516,6 +523,26 @@ fn build_world(
     );
     let cam_max_range = sensors.iter().map(|s| s.wedge.range_m).fold(0.0_f64, f64::max);
     let cam_query_r2 = (cam_max_range + 2.0).powi(2);
+
+    // Pulse-overlay pool: a handful of recycled "seen you" rings that flash on a
+    // camera as the live walk passes it (replaces per-camera flash now that dots
+    // are a merged static mesh).
+    let ping_mesh = meshes.add(Annulus::new(9.0, 14.0));
+    let ping_mat = materials.add(Color::srgb_u8(0xa8, 0x54, 0x1f)); // terracotta accent
+    let ping_entities: Vec<Entity> = (0..32)
+        .map(|_| {
+            commands
+                .spawn((
+                    Mesh2d(ping_mesh.clone()),
+                    MeshMaterial2d(ping_mat.clone()),
+                    Transform::from_xyz(0.0, 0.0, 3.5),
+                    Visibility::Hidden,
+                    Ping { life: 0.0 },
+                ))
+                .id()
+        })
+        .collect();
+    commands.insert_resource(PingPool { entities: ping_entities });
 
     // Ambient mobile agents: decode the baked vehicle-route pool and spawn the
     // fixed entity pool (vehicles + pedestrians). Routes also live on `Sim` for
@@ -550,7 +577,6 @@ fn build_world(
         vehicle_routes,
         cam_index,
         cam_query_r2,
-        cam_entities,
     });
     handles.built = true;
 }
@@ -792,13 +818,15 @@ fn handle_click(
 
 /// Animated walk: pulse each camera as the looping walker enters its view, and
 /// keep a live "captured this pass" tally (resets each loop).
+#[allow(clippy::too_many_arguments)]
 fn walk_capture_events(
     params: Res<Params>,
     route: Res<RouteState>,
     sim: Option<Res<Sim>>,
+    ping_pool: Res<PingPool>,
     mut walk_live: ResMut<WalkLive>,
     walker_q: Query<&Walker>,
-    mut cams: Query<&mut CameraDot>,
+    mut pings: Query<(&mut Ping, &mut Transform, &mut Visibility)>,
 ) {
     if params.mode != Mode::Route {
         return;
@@ -823,31 +851,45 @@ fn walk_capture_events(
         if walk_live.seen.contains(&id) {
             continue;
         }
-        let wedge = &sim.sensors[id as usize].wedge;
-        if sim_core::captures(wedge, pos, &[]) && walk_live.seen.insert(id) {
+        let s = &sim.sensors[id as usize];
+        if sim_core::captures(&s.wedge, pos, &[]) && walk_live.seen.insert(id) {
             walk_live.count += 1;
-            if let Some(&entity) = sim.cam_entities.get(id as usize) {
-                if let Ok(mut dot) = cams.get_mut(entity) {
-                    dot.flash = 1.0;
-                }
+            activate_ping(&ping_pool, &mut pings, s.wedge.apex);
+        }
+    }
+}
+
+/// Light up a free pulse ring at `at` (an idle pool slot). No-op if all busy.
+fn activate_ping(
+    pool: &PingPool,
+    pings: &mut Query<(&mut Ping, &mut Transform, &mut Visibility)>,
+    at: sim_core::Vec2,
+) {
+    for &e in &pool.entities {
+        if let Ok((mut ping, mut tf, mut vis)) = pings.get_mut(e) {
+            if ping.life <= 0.0 {
+                ping.life = 1.0;
+                tf.translation = world::to_world(at, 3.5);
+                tf.scale = Vec3::splat(0.6);
+                *vis = Visibility::Inherited;
+                return;
             }
         }
     }
 }
 
-/// Decay camera flash pulses (animated-walk capture feedback).
-fn camera_flash_decay(time: Res<Time>, mut q: Query<(&mut CameraDot, &mut Transform)>) {
+/// Decay active pulse rings: expand + retire (recycle the slot when life hits 0).
+fn decay_pings(time: Res<Time>, mut q: Query<(&mut Ping, &mut Transform, &mut Visibility)>) {
     let dt = time.delta_secs();
-    for (mut dot, mut t) in &mut q {
-        // Only touch the Transform of cameras that are actually flashing — writing
-        // every dot's scale each frame marks all ~5k Transforms changed and forces
-        // a full GPU re-extraction. Idle dots (flash == 0, scale already 1) are
-        // left alone. The frame flash reaches 0 does the final reset write.
-        if dot.flash <= 0.0 {
+    for (mut ping, mut tf, mut vis) in &mut q {
+        if ping.life <= 0.0 {
             continue;
         }
-        dot.flash = (dot.flash - dt * 2.5).max(0.0);
-        t.scale = Vec3::splat(1.0 + dot.flash * 1.8);
+        ping.life = (ping.life - dt * 2.0).max(0.0);
+        tf.scale = Vec3::splat(0.6 + (1.0 - ping.life) * 1.4);
+        if ping.life <= 0.0 {
+            *vis = Visibility::Hidden;
+        }
     }
 }
 

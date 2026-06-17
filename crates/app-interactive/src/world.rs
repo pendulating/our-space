@@ -25,6 +25,40 @@ pub fn street_line_positions(asset: &GraphAsset) -> Vec<[f32; 3]> {
     v
 }
 
+/// One merged `TriangleList` mesh drawing a small regular polygon (`sides`,
+/// `radius` m, `rot` radians) at every position. Collapses thousands of camera
+/// dots into a single mesh/entity/draw-call instead of one entity per camera —
+/// the per-frame extraction cost of ~5k individual `Mesh2d` entities was the
+/// dominant render load. `sides`: 3 = triangle, 4 = square, ~12 ≈ circle.
+pub fn merged_markers_mesh(positions: &[Enu], radius: f32, sides: usize, rot: f32) -> Mesh {
+    let n = positions.len();
+    let mut verts: Vec<[f32; 3]> = Vec::with_capacity(n * (sides + 1));
+    let mut indices: Vec<u32> = Vec::with_capacity(n * sides * 3);
+    let unit: Vec<(f32, f32)> = (0..sides)
+        .map(|i| {
+            let a = rot + std::f32::consts::TAU * (i as f32) / (sides as f32);
+            (radius * a.cos(), radius * a.sin())
+        })
+        .collect();
+    for p in positions {
+        let base = verts.len() as u32;
+        let (cx, cy) = (p.x as f32, p.y as f32);
+        verts.push([cx, cy, 0.0]); // center
+        for &(dx, dy) in &unit {
+            verts.push([cx + dx, cy + dy, 0.0]);
+        }
+        for i in 0..sides as u32 {
+            indices.push(base);
+            indices.push(base + 1 + i);
+            indices.push(base + 1 + (i + 1) % sides as u32);
+        }
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
 /// A `LineList` mesh from raw segment endpoints.
 pub fn line_list_mesh(positions: Vec<[f32; 3]>) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());

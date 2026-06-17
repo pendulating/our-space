@@ -343,15 +343,15 @@ Flow: `start_loading` (Startup) spawns the camera and inserts `LoadingHandles` (
 
 ### ECS resources, components, systems
 
-**Resources:** `Sim` (graph, sensors, layer, ace_segments/routes, heatmap, equity, `equity_corr` = Pearson r diversity↔cameras, dashcam_field, `vehicle_routes`), `RouteState`, `Params` (toggles, `departure_hour=17.0`, `dashcam_penetration=0.40`, `glasses_per_1000=10.0`, `heatmap_class`, `mode`, `show_agents`, `exposure_mode`), `WalkshedState`, `WalkLive` (`seen`, `count`, `mobile_vehicle`, `mobile_glasses`, `last_progress`), `AgentPool` (pooled agent entities + weighted-route sampler + RNG), `EguiWants` (pointer/keyboard), `DragState` (click-vs-drag), `ResetRequested`, `LoadingHandles`.
+**Resources:** `Sim` (graph, sensors, layer, ace_segments/routes, heatmap, equity, `equity_corr` = Pearson r diversity↔cameras, dashcam_field, `vehicle_routes`, `cam_index` = R-tree over camera apexes, `cam_query_r2`), `RouteState`, `Params` (toggles, `departure_hour=17.0`, `dashcam_penetration=0.40`, `glasses_per_1000=10.0`, `heatmap_class`, `mode`, `show_agents`, `exposure_mode`), `WalkshedState`, `WalkLive` (`seen`, `count`, `mobile_vehicle`, `mobile_glasses`, `last_progress`), `AgentPool` (pooled agent entities + weighted-route sampler + RNG), `PingPool` (pooled capture-pulse entities), `EguiWants` (pointer/keyboard), `DragState` (click-vs-drag), `ResetRequested`, `LoadingHandles`.
 
-**Components:** `BaseMap`, `FovWedge`, `AceVis`, `HeatmapVis`, `EquityVis`, `RouteVis`, `WalkshedVis`, `CameraDot { id, flash }`, `Walker { progress_m }`, `MobileAgent { class, route, progress_m, speed_mps, active, flash, counted }`, `MobileVis`.
+**Components:** `BaseMap`, `FovWedge`, `AceVis`, `HeatmapVis`, `EquityVis`, `RouteVis`, `WalkshedVis`, `Ping { life }`, `Walker { progress_m }`, `MobileAgent { class, route, progress_m, speed_mps, active, flash, counted }`, `MobileVis`.
 
-**Systems** (Update): `build_world`, `camera_control`, `handle_click`, `recompute_on_change`, `animate_walker`, `(walk_capture_events, mobile_capture_events).chain()`, `camera_flash_decay`, `scale_agent_population`, `animate_agents`, `sync_mode`, `sync_visibility`, `rebuild_heatmap`, `rebuild_equity`, `apply_reset`, `smoke_exit` (a headless-CI helper gated on `OURSPACE_SMOKE`). `ui::ui_panel` runs in `EguiPrimaryContextPass`.
+**Systems** (Update): `build_world`, `camera_control`, `handle_click`, `recompute_on_change`, `animate_walker`, `(walk_capture_events, mobile_capture_events).chain()`, `decay_pings`, `scale_agent_population`, `animate_agents`, `sync_mode`, `sync_visibility`, `rebuild_heatmap`, `rebuild_equity`, `apply_reset`, `smoke_exit` (a headless-CI helper gated on `OURSPACE_SMOKE`). `ui::ui_panel` runs in `EguiPrimaryContextPass`.
 
 ### The two modes (`Params.mode`)
 
-**Route mode** (`handle_click`): first click sets A (lichen), second sets B (terracotta) and calls `run_route(...)`, spawning a `LineStrip` route + a `Walker`. `animate_walker` advances the walker for **playback only** at `WALK_SPEED × ANIM_SPEEDUP` (a 40× time-lapse, so a 15-minute walk replays in ~22 s) and loops; this multiplier is purely visual — the exposure model and walkshed use the true `WALK_SPEED` (1.34 m/s), so no number changes. `walk_capture_events` tests every `CameraDot` against its sensor wedge with `captures`, increments `WalkLive.count` and sets `flash = 1.0` the first time each camera is seen this pass; `camera_flash_decay` decays the pulse. `recompute_on_change` re-runs `summarize` whenever `Params` changes (sliders/hour re-evaluate without re-routing).
+**Route mode** (`handle_click`): first click sets A (lichen), second sets B (terracotta) and calls `run_route(...)`, spawning a `LineStrip` route + a `Walker`. `animate_walker` advances the walker for **playback only** at `WALK_SPEED × ANIM_SPEEDUP` (a 40× time-lapse, so a 15-minute walk replays in ~22 s) and loops; this multiplier is purely visual — the exposure model and walkshed use the true `WALK_SPEED` (1.34 m/s), so no number changes. `walk_capture_events` queries the `cam_index` R-tree for cameras within range of the walker's position (an O(log n + k) cull, not a scan over all ~5k), tests those against their sensor wedge with `captures`, increments `WalkLive.count` the first time each is seen this pass, and lights a pooled `Ping` pulse on it; `decay_pings` expands and retires the pulse. `recompute_on_change` re-runs `summarize` whenever `Params` changes (sliders/hour re-evaluate without re-routing).
 
 **Walkshed mode**: one click snaps to the nearest node, runs `graph.walkshed(node, WALKSHED_SECONDS = 600.0, WALK_SPEED)` then `walkshed_exposure(...)`. Reachable streets light up warm gold, in-shed cameras get cold emphasis rings, and the click point gets a center marker; the result lands in `WalkshedState`.
 
@@ -371,9 +371,8 @@ Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit
 |---------|-----------------|---------|
 | Streets | `LineList` | `line_list_mesh(street_line_positions(...))` |
 | ACE corridors | `LineList` | `line_list_mesh` |
-| CCTV markers | `Circle::new(11.0)` | — |
-| ALPR markers | `Rectangle::new(17.0, 17.0)` | — (shape+hue redundancy) |
-| DOT traffic-cam markers | `RegularPolygon::new(12.0, 3)` | — (cold triangle; shape+hue redundancy) |
+| Camera markers (CCTV/ALPR/DOT) | one **merged** `TriangleList` per class | `merged_markers_mesh(pts, r, sides, rot)` — circle/square/triangle; 3 entities, not ~5k |
+| Capture pulse (live walk) | `Annulus::new(9.0, 14.0)` | pooled `Ping` ring, expands + retires |
 | FOV wedges | `TriangleList` fan | `wedge_mesh(heading, half_fov, range, 16)` — **directional sensors only** (omnidirectional cams draw no cone) |
 | Route line | `LineStrip` | `line_strip_mesh(&r.points, 2.0)` |
 | Walker / markers | `Circle` | — |
