@@ -7,6 +7,8 @@
 //! departure hour re-evaluate the existing route live.
 
 mod agents;
+#[cfg(target_arch = "wasm32")]
+mod basemap;
 mod loading;
 mod ui;
 mod world;
@@ -259,12 +261,22 @@ fn main() {
             canvas: Some("#bevy-canvas".into()),
             fit_canvas_to_parent: true,
             prevent_default_event_handling: true,
+            // Web: transparent canvas so the MapLibre basemap shows through behind
+            // the sim layers. Native keeps an opaque parchment background.
+            transparent: cfg!(target_arch = "wasm32"),
+            #[cfg(target_arch = "wasm32")]
+            composite_alpha_mode: bevy::window::CompositeAlphaMode::PreMultiplied,
             ..default()
         }),
         ..default()
     }))
     .add_plugins(EguiPlugin::default())
-    .insert_resource(ClearColor(Color::srgb_u8(0xe7, 0xdc, 0xc4))) // parchment
+    // Transparent on web (basemap behind); warm parchment on native.
+    .insert_resource(ClearColor(if cfg!(target_arch = "wasm32") {
+        Color::NONE
+    } else {
+        Color::srgb_u8(0xe7, 0xdc, 0xc4)
+    }))
     .init_resource::<RouteState>()
     .init_resource::<Params>()
     .init_resource::<EguiWants>()
@@ -296,6 +308,9 @@ fn main() {
         ),
     )
     .add_systems(EguiPrimaryContextPass, ui::ui_panel);
+    // Web: keep the MapLibre basemap synced to the Bevy camera each frame.
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, basemap::sync_basemap);
     loading::register(&mut app);
     app.run();
 }

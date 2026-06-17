@@ -10,6 +10,11 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,900&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
 
+  <!-- MapLibre GL: renders the NYC Human Geography vector basemap behind the
+       transparent Bevy canvas. -->
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
   <style>
     :root {
       --page: #e3d7bf;     /* aged parchment */
@@ -60,8 +65,14 @@
 
     /* ---- the map stage ---- */
     #stage { position: relative; flex: 1; min-height: 0; background: var(--page); }
-    #bevy-canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
-    #overlay { position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+    /* MapLibre basemap: the ground layer, behind everything. Input is owned by
+       the Bevy canvas on top, so the basemap itself ignores pointer events. */
+    #basemap { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+    #basemap canvas { outline: none; }
+    /* The Bevy canvas sits on top, transparent, drawing only the sim layers. */
+    #bevy-canvas { position: absolute; inset: 0; z-index: 1; display: block;
+      width: 100%; height: 100%; outline: none; touch-action: none; background: transparent; }
+    #overlay { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; text-align: center;
       background: var(--page); padding: 28px; transition: opacity .6s ease; }
     #overlay .card { max-width: 38ch; }
     .compass { width: 64px; height: 64px; margin: 0 auto 18px; display: block; }
@@ -99,6 +110,7 @@
     </header>
 
     <div id="stage">
+      <div id="basemap"></div>
       <canvas id="bevy-canvas" tabindex="0"></canvas>
       <div id="overlay">
         <div class="card">
@@ -123,6 +135,64 @@
       <span class="prov">Streets © OpenStreetMap (ODbL) · fixed CCTV: Amnesty International <em>Decode Surveillance NYC</em> (CC&nbsp;BY-NC-ND&nbsp;4.0) + Dahir et&nbsp;al. 2025 (CC&nbsp;BY&nbsp;4.0), aggregated &amp; de-duplicated · ALPR plate readers: DeFlock via OSM (crowdsourced) · DOT traffic cams: NYC&nbsp;DOT (nyctmc.org) <em>locations only — images not used</em> · ACE: MTA&nbsp;GTFS + NY&nbsp;OpenData · diversity: US&nbsp;Census&nbsp;ACS · rideshare-camera density: NYC&nbsp;TLC Uber/Lyft trips. Smart glasses remain a <em>scenario</em>.</span>
     </footer>
   </div>
+
+  <!-- NYC Human Geography basemap (ArcGIS vector tiles) via MapLibre GL. Bevy
+       owns all input and drives this map's view each frame via ourspaceSetView;
+       the map is a passive ground layer (pointer-events disabled). Endpoint +
+       style-normalization reused from the CDspec project. -->
+  <script>
+    (function () {
+      const ARCGIS = 'https://tiles.arcgis.com/tiles/yG5s3afENB5iO9fj/arcgis/rest/services/NYC_Basemap_v3/VectorTileServer';
+      let map = null;
+      // Manhattan ENU origin (matches sim_core GeoOrigin::MANHATTAN) — the map's
+      // starting view until the Bevy camera takes over on the first frame.
+      const ORIGIN = { lon: -73.9712, lat: 40.7831 };
+
+      async function initBasemap() {
+        if (!window.maplibregl) return;
+        try {
+          const res = await fetch(`${ARCGIS}/resources/styles/root.json`, { mode: 'cors' });
+          if (!res.ok) throw new Error(`style ${res.status}`);
+          const style = await res.json();
+          // Normalize relative sprite/glyph/tile paths to absolute endpoints.
+          style.sprite = `${ARCGIS}/resources/sprites/sprite`;
+          style.glyphs = `${ARCGIS}/resources/fonts/{fontstack}/{range}.pbf`;
+          if (style.sources) {
+            for (const src of Object.values(style.sources)) {
+              if (src && src.type === 'vector') {
+                src.tiles = [`${ARCGIS}/tile/{z}/{y}/{x}.pbf`];
+                delete src.url;
+              }
+            }
+          }
+          map = new maplibregl.Map({
+            container: 'basemap',
+            style,
+            center: [ORIGIN.lon, ORIGIN.lat],
+            zoom: 13.5,
+            pitch: 0,          // top-down so the flat ENU sim layers align
+            bearing: 0,
+            interactive: false, // Bevy owns pan/zoom; we drive jumpTo()
+            attributionControl: { compact: true },
+            renderWorldCopies: false,
+            validate: false,
+          });
+        } catch (err) {
+          console.warn('Basemap failed to load; continuing without it.', err);
+        }
+      }
+
+      // Bevy (wasm) calls this every frame with the camera center + meters/CSS-px.
+      // Web-Mercator: metersPerPixel = 156543.03392 * cos(lat) / 2^zoom.
+      window.ourspaceSetView = function (lon, lat, metersPerPx) {
+        if (!map || !metersPerPx || metersPerPx <= 0) return;
+        const z = Math.log2(156543.03392804097 * Math.cos((lat * Math.PI) / 180) / metersPerPx);
+        map.jumpTo({ center: [lon, lat], zoom: z });
+      };
+
+      initBasemap();
+    })();
+  </script>
 
   <script type="module">
     const overlay = document.getElementById('overlay');

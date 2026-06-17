@@ -70,6 +70,11 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   static `web/dist/` bundle (wasm-bindgen + wasm-opt) with `web/index.html` doing
   WebGPU-support detection, a loading screen, and the "estimate, not a
   surveillance map" + route-stays-client-side framing.
+- ✅ **Basemap (web)**: the public build renders the **NYC Human Geography
+  basemap** (ArcGIS vector tiles via MapLibre GL) as the ground layer beneath a
+  **transparent** Bevy canvas. Bevy still owns all input; MapLibre is driven
+  passively from the camera each frame (top-down, synced center + zoom). Native
+  dev keeps the parchment background.
 - ✅ **Phase 5**: **animated ambient agents** — clay rideshare **dashcam vehicles**
   following real TLC trip-O-D routes and slate smart-glasses **pedestrians**
   wandering via graph random walks, on a fixed recycled entity pool (60 fps,

@@ -417,6 +417,29 @@ Prereqs (in-script): `rustup target add wasm32-unknown-unknown`, `cargo install 
 
 The site is served at **`https://pendulating.github.io/our-space/`** (a project page). Because the WASM build is slow and the baked assets need gigabytes of raw NYC data that can't be reproduced in CI, the pipeline ships the **prebuilt `web/dist/` committed to the repo**: the workflow only uploads and publishes it. On every push to `main` that touches `web/dist/**` (or via manual dispatch) it runs `configure-pages` → `upload-pages-artifact` (`path: web/dist`) → `deploy-pages@v4`, gated on a bundle-exists check; a `.nojekyll` marker makes Pages serve the bundle verbatim. The relative asset paths and Bevy's page-relative fetches work unchanged under the `/our-space/` subpath, so no base-path config is needed. The loop is: edit → `./web/build.sh` → commit `web/dist` → push → auto-deploy.
 
+### Basemap (web): MapLibre under a transparent canvas
+
+The public web build renders the **NYC Human Geography basemap** (a public,
+keyless, CORS-enabled ArcGIS vector tile service, `NYC_Basemap_v3`) as the ground
+layer, using the same endpoint + style-normalization as the CDspec project.
+MapLibre GL draws it into a `#basemap` DOM canvas *behind* the Bevy canvas; the
+Bevy canvas is made **transparent** on web (`Window.transparent` +
+`CompositeAlphaMode::PreMultiplied` + `ClearColor(Color::NONE)`; native keeps the
+opaque parchment) so the sim layers composite over the map.
+
+**Bevy stays the input owner** — the existing `camera_control`/`handle_click`
+model is unchanged and MapLibre is set `interactive: false` (its div is
+`pointer-events: none`). A web-only system (`basemap::sync_basemap`,
+`crates/app-interactive/src/basemap.rs`) drives the map passively each frame: it
+reads the `Camera2d` `Transform`, converts the translation to lon/lat via
+`EnuProjection::to_wgs84`, and calls a JS bridge `window.ourspaceSetView(lon,
+lat, metersPerPx)` with `Transform.scale.x` (which *is* meters-per-CSS-pixel —
+that's how `camera_control` turns a pixel drag into a world pan). The page
+computes the matching Web-Mercator zoom (`log2(156543.03·cos(lat)/metersPerPx)`)
+and `jumpTo`s. Top-down only (pitch 0, bearing 0) so the flat ENU meshes align.
+
 ### Privacy
 
 The route is computed entirely client-side. Once the wasm bundle + baked assets are fetched, all routing/exposure runs in the browser via `sim_core` — there is no server round-trip for a walk and nothing about A/B/the route is transmitted. The UI states this explicitly ("Your route stays on this machine.").
+
+One caveat introduced by the web basemap: MapLibre fetches map tiles from the ArcGIS service for the current viewport, so the **area you pan/zoom to** is observable to that tile host (as with any slippy map). The **route itself is never sent** — only the camera viewport drives tile requests, and A/B/the path stay in the browser. The basemap is also purely cosmetic, so a privacy-strict deployment could disable it without affecting any estimate.

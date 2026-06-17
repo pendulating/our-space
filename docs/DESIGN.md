@@ -92,7 +92,7 @@ A→C climb a warm earth ramp (moss → ochre → clay); D drops to cold slate, 
 
 ### Map layers
 
-Every Bevy layer (`main.rs`) is colored to land on one side of the warm/cold split, drawn over the parchment `ClearColor` `#e7dcc4`:
+Every Bevy layer (`main.rs`) is colored to land on one side of the warm/cold split. On **native** these draw over the parchment `ClearColor` `#e7dcc4`; on the **web** build the canvas is transparent and the layers composite over the live **NYC Human Geography basemap** (MapLibre, see `ARCHITECTURE.md`), so the parchment gives way to real geography while the warm/cold sim palette stays the same:
 
 | Layer | Color | Side | Source |
 |---|---|---|---|
