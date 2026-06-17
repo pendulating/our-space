@@ -931,18 +931,73 @@ fn sync_mode(
 }
 
 /// Re-evaluate the existing route when scenario sliders / hour change.
-fn recompute_on_change(params: Res<Params>, sim: Option<Res<Sim>>, mut route: ResMut<RouteState>) {
-    if !params.is_changed() {
-        return;
-    }
+/// Recompute the analytical route summary only when an input that actually
+/// affects it changes. We can't rely on `params.is_changed()`: `ui_panel` holds
+/// `ResMut<Params>` and egui widgets bind `&mut params.field` every frame, which
+/// trips change-detection unconditionally — so `is_changed()` is true *every*
+/// frame, and `summarize` (a full `simulate_full` over ~900 route ticks ×
+/// ~5,236 sensors) would run per frame, tanking FPS during a walk. Instead we
+/// snapshot the summary-affecting inputs and recompute only on a real delta.
+fn recompute_on_change(
+    params: Res<Params>,
+    sim: Option<Res<Sim>>,
+    mut route: ResMut<RouteState>,
+    mut last: Local<Option<SummarySig>>,
+) {
     let Some(sim) = sim else { return };
-    let Some(r) = route.route.clone() else { return };
+    let Some(r) = route.route.clone() else {
+        *last = None; // route cleared; next route forces a recompute
+        return;
+    };
+    let sig = SummarySig {
+        route_len_bits: r.total_m.to_bits(),
+        route_points: r.points.len(),
+        hour_bits: params.departure_hour.to_bits(),
+        ace_on: params.ace_on,
+        dashcam_on: params.dashcam_on,
+        glasses_on: params.glasses_on,
+        pen_bits: params.dashcam_penetration.to_bits(),
+        per1000_bits: params.glasses_per_1000.to_bits(),
+    };
+    if *last == Some(sig) {
+        return; // nothing summary-relevant changed since the last compute
+    }
+    *last = Some(sig);
+
+    // Cull fixed sensors to those whose range could ever touch the route (capture
+    // requires distance ≤ range_m, so this is exact — no undercount), via the
+    // R-tree over dense route samples. Turns the summarize cost from ~5,236 ×
+    // ticks into ~(few hundred) × ticks so a slider drag stays snappy.
+    let samples = r.sample_over_time(WALK_SPEED, 1.0);
+    let mut ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for (_, p) in &samples {
+        for c in sim.cam_index.locate_within_distance([p.x, p.y], sim.cam_query_r2) {
+            ids.insert(c.data);
+        }
+    }
+    let nearby: Vec<sim_core::SensorInstance> =
+        ids.iter().map(|&id| sim.sensors[id as usize]).collect();
+
     let mobile = build_mobile(&params, &sim);
     let summary = sim_core::summarize(
-        &r, &sim.sensors, &[], &mobile, sim_params(&sim), params.departure_hour as f64,
+        &r, &nearby, &[], &mobile, sim_params(&sim), params.departure_hour as f64,
         Some(&sim.dashcam_field),
     );
     route.summary = Some(summary);
+}
+
+/// Signature of the inputs that change the analytical route summary; recompute
+/// fires only when this differs (see [`recompute_on_change`]).
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct SummarySig {
+    route_len_bits: u64,
+    route_points: usize,
+    hour_bits: u32,
+    ace_on: bool,
+    dashcam_on: bool,
+    glasses_on: bool,
+    pen_bits: u32,
+    per1000_bits: u32,
 }
 
 fn spawn_marker(
