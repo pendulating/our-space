@@ -75,6 +75,10 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   **transparent** Bevy canvas. Bevy still owns all input; MapLibre is driven
   passively from the camera each frame (top-down, synced center + zoom). Native
   dev keeps the parchment background.
+- ✅ **Running ACE buses**: the ACE routes animate as **moving buses** along their
+  real GTFS route shapes, counts scaled by headway/time-of-day (schedule-simulated
+  from the GTFS *static* feed — fully offline; structured so a future GTFS-realtime
+  source could drive live positions). They feed the narrative live tally.
 - ✅ **Phase 5**: **animated ambient agents** — clay rideshare **dashcam vehicles**
   following real TLC trip-O-D routes and slate smart-glasses **pedestrians**
   wandering via graph random walks, on a fixed recycled entity pool (60 fps,

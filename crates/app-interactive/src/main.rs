@@ -111,6 +111,8 @@ pub struct Sim {
     pub dashcam_field: DashcamFieldLayer,
     /// Baked weighted pool of vehicle (rideshare) routes for the dashcam agents.
     pub vehicle_routes: Vec<sim_core::assets::VehicleRoute>,
+    /// ACE bus route shapes (ordered polylines) for the running-bus agents.
+    pub ace_routes_geom: Vec<Route>,
     /// R-tree over fixed-camera apex positions (data = sensor id) so the live
     /// walk tally tests only nearby cameras, not all ~5k every frame.
     pub cam_index: RTree<GeomWithData<[f64; 2], u64>>,
@@ -205,6 +207,8 @@ pub struct WalkLive {
     pub mobile_vehicle: u32,
     /// Narrative mode: stochastic smart-glasses encounters this pass.
     pub mobile_glasses: u32,
+    /// Narrative mode: stochastic ACE-bus encounters this pass.
+    pub mobile_bus: u32,
     pub last_progress: f64,
 }
 
@@ -429,6 +433,16 @@ fn build_world(
         .map(|s| [Enu::new(s[0][0], s[0][1]), Enu::new(s[1][0], s[1][1])])
         .collect();
     let ace_routes = a.0.routes.clone();
+    // ACE route shapes -> Route geometry for the running-bus agents.
+    let ace_routes_geom: Vec<Route> = a
+        .0
+        .polylines
+        .iter()
+        .filter(|p| p.points.len() >= 2)
+        .map(|p| {
+            Route::from_points(p.points.iter().map(|q| Enu::new(q[0] as f64, q[1] as f64)).collect())
+        })
+        .collect();
     let heatmap = Some(h.0.clone());
     let equity = Some(e.0.clone());
     let dashcam_field = df.0.clone();
@@ -568,7 +582,10 @@ fn build_world(
     // runtime weighted resampling on recycle.
     let vehicle_routes = vr.0.routes.clone();
     let glasses_icon = asset_server.load("icons/glasses.png");
-    let pool = agents::spawn_pool(&mut commands, &mut meshes, &mut materials, &vehicle_routes, glasses_icon);
+    let bus_icon = asset_server.load("icons/bus.png");
+    let pool = agents::spawn_pool(
+        &mut commands, &mut meshes, &mut materials, &vehicle_routes, glasses_icon, bus_icon,
+    );
     commands.insert_resource(pool);
 
     if std::env::var("OURSPACE_SMOKE").is_ok() {
@@ -595,6 +612,7 @@ fn build_world(
         equity_corr,
         dashcam_field,
         vehicle_routes,
+        ace_routes_geom,
         cam_index,
         cam_query_r2,
     });
@@ -861,6 +879,7 @@ fn walk_capture_events(
         walk_live.count = 0;
         walk_live.mobile_vehicle = 0;
         walk_live.mobile_glasses = 0;
+        walk_live.mobile_bus = 0;
     }
     walk_live.last_progress = walker.progress_m;
 

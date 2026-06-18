@@ -21,6 +21,7 @@ SLATE = (0x2a, 0x3a, 0x52, 255)   # CCTV (cold panopticon ink)
 STEEL = (0x41, 0x60, 0x7e, 255)   # ALPR / owl
 CYAN = (0x4d, 0x7a, 0x8c, 255)    # DOT cyan-slate
 GLASS = (0x34, 0x51, 0x69, 255)   # smart glasses (Tier D slate)
+ACE = (0x72, 0x87, 0xa4, 255)     # ACE bus corridor steel
 PAPER = (0xef, 0xe6, 0xd2, 255)   # parchment highlight (lens glints, eyes)
 TERRA = (0xa8, 0x54, 0x1f, 255)   # accent
 
@@ -113,8 +114,28 @@ def glasses():
     return img
 
 
+def bus():
+    """Side-view bus — the ACE camera-enforcement buses."""
+    img, d = canvas()
+    c = ACE
+    # body
+    d.rounded_rectangle([px(10), px(38), px(118), px(86)], radius=px(10), fill=c)
+    # windows (parchment band)
+    d.rounded_rectangle([px(18), px(46), px(110), px(64)], radius=px(4), fill=PAPER)
+    # window mullions
+    for x in (40, 62, 84):
+        d.rectangle([px(x), px(46), px(x + 3), px(64)], fill=c)
+    # wheels
+    d.ellipse([px(26), px(78), px(46), px(98)], fill=SLATE)
+    d.ellipse([px(82), px(78), px(102), px(98)], fill=SLATE)
+    # front ACE camera nub (terracotta tell)
+    d.ellipse([px(108), px(40), px(118), px(50)], fill=TERRA)
+    return img
+
+
 if __name__ == "__main__":
     save(cctv(), "cctv.png")
     save(owl(), "owl.png")
     save(dot(), "dot.png")
     save(glasses(), "glasses.png")
+    save(bus(), "bus.png")

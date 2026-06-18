@@ -23,13 +23,17 @@ use crate::{world, Mode, Params, RouteState, Sim, Walker, WalkLive, ExposureMode
 const MAX_VEHICLES: usize = 250;
 const MAX_PEDS: usize = 400;
 
+const MAX_BUSES: usize = 80;
+
 // Real speeds (m/s); the shared ANIM_SPEEDUP time-lapse applies on top.
 const VEHICLE_SPEED_MPS: f64 = 8.0; // ~29 km/h urban crawl
 const PED_SPEED_MPS: f64 = 1.34;
+const BUS_SPEED_MPS: f64 = 6.0;
 
 // Capture reach (m) for the narrative "passed you" test.
 const VEHICLE_CAPTURE_R: f64 = 22.0;
 const PED_CAPTURE_R: f64 = 6.0;
+const BUS_CAPTURE_R: f64 = 22.0;
 
 const PED_WALK_EDGES: usize = 16;
 const ACTIVATIONS_PER_FRAME: usize = 32;
@@ -37,11 +41,16 @@ const ACTIVATIONS_PER_FRAME: usize = 32;
 // z-order: streets 0.0, cameras 1.0, route 0.2, walker 4.0. Agents between.
 const Z_VEHICLE: f32 = 2.6;
 const Z_PED: f32 = 2.4;
+const Z_BUS: f32 = 2.7;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentClass {
     Vehicle,
     Pedestrian,
+    /// ACE camera-enforcement bus (Tier A) running a real GTFS route shape.
+    /// Schedule-simulated today; the agent is position-drivable, so a future
+    /// realtime (GTFS-rt) source could set bus transforms directly instead.
+    Bus,
 }
 
 #[derive(Component)]
@@ -75,11 +84,13 @@ impl MobileAgent {
 pub struct AgentPool {
     pub vehicles: Vec<Entity>,
     pub peds: Vec<Entity>,
+    pub buses: Vec<Entity>,
     /// Cumulative weights over `Sim.vehicle_routes` (ends at ~1.0) for O(log n) sampling.
     cumulative: Vec<f32>,
     rng: WyRand,
     target_vehicles: usize,
     target_peds: usize,
+    target_buses: usize,
 }
 
 impl AgentPool {
@@ -89,10 +100,12 @@ impl AgentPool {
         AgentPool {
             vehicles: Vec::new(),
             peds: Vec::new(),
+            buses: Vec::new(),
             cumulative: Vec::new(),
             rng: WyRand::new(0x9E37_79B9_7F4A_7C15),
             target_vehicles: 0,
             target_peds: 0,
+            target_buses: 0,
         }
     }
 }
@@ -109,15 +122,22 @@ pub fn spawn_pool(
     materials: &mut Assets<ColorMaterial>,
     vehicle_routes: &[VehicleRoute],
     glasses_icon: Handle<Image>,
+    bus_icon: Handle<Image>,
 ) -> AgentPool {
     // Dashcam vehicles stay clay triangles (they read as moving cars); glasses
-    // pedestrians get the eyeglasses icon as a small textured quad.
+    // pedestrians get the eyeglasses icon; ACE buses get the bus icon.
     let veh_mesh = meshes.add(RegularPolygon::new(7.0, 3));
     let veh_mat = materials.add(Color::srgb_u8(0xa8, 0x50, 0x1f)); // clay (Tier C)
     let ped_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 16.0));
     let ped_mat = materials.add(ColorMaterial {
         color: Color::WHITE,
         texture: Some(glasses_icon),
+        ..default()
+    });
+    let bus_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 30.0));
+    let bus_mat = materials.add(ColorMaterial {
+        color: Color::WHITE,
+        texture: Some(bus_icon),
         ..default()
     });
 
@@ -152,6 +172,22 @@ pub fn spawn_pool(
         );
     }
 
+    let mut buses = Vec::with_capacity(MAX_BUSES);
+    for _ in 0..MAX_BUSES {
+        buses.push(
+            commands
+                .spawn((
+                    Mesh2d(bus_mesh.clone()),
+                    MeshMaterial2d(bus_mat.clone()),
+                    Transform::from_xyz(0.0, 0.0, Z_BUS),
+                    Visibility::Hidden,
+                    MobileVis,
+                    MobileAgent::idle(AgentClass::Bus),
+                ))
+                .id(),
+        );
+    }
+
     // Cumulative weight table (baker normalized weights to sum 1.0).
     let mut cumulative = Vec::with_capacity(vehicle_routes.len());
     let mut acc = 0.0f32;
@@ -163,11 +199,13 @@ pub fn spawn_pool(
     AgentPool {
         vehicles,
         peds,
+        buses,
         cumulative,
         // Fixed seed: agent motion is cosmetic; reproducible run-to-run.
         rng: WyRand::new(0x9E37_79B9_7F4A_7C15),
         target_vehicles: 0,
         target_peds: 0,
+        target_buses: 0,
     }
 }
 
@@ -196,6 +234,23 @@ fn activate_ped(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand, start_node
     agent.speed_mps = PED_SPEED_MPS;
     agent.active = true;
     agent.counted = false;
+}
+
+fn activate_bus(agent: &mut MobileAgent, route: Route, rng: &mut WyRand) {
+    agent.progress_m = rng.next_f64() * route.total_m.max(1.0);
+    agent.route = route;
+    agent.speed_mps = BUS_SPEED_MPS;
+    agent.active = true;
+    agent.counted = false;
+}
+
+/// Clone a random ACE route shape (uniform over routes). `None` if none baked.
+fn pick_ace_route(rng: &mut WyRand, ace_routes: &[Route]) -> Option<Route> {
+    if ace_routes.is_empty() {
+        None
+    } else {
+        Some(ace_routes[rng.below(ace_routes.len())].clone())
+    }
 }
 
 /// Scale active agent counts by time-of-day and the two scenario sliders, so the
@@ -258,6 +313,30 @@ pub fn scale_agent_population(
         &mut |agent, rng| {
             let node = if node_count > 0 { (rng.below(node_count as usize)) as u32 } else { 0 };
             activate_ped(agent, &sim, rng, node);
+        },
+        &mut pool.rng,
+    );
+
+    // ACE buses: count ∝ 1/headway (more buses at rush). Schedule-simulated.
+    let bus_frac = (5.0 / sim_core::mobile::bus_headway_minutes(hour)).clamp(0.2, 1.0);
+    let want_bus = if params.ace_on && !sim.ace_routes_geom.is_empty() {
+        ((MAX_BUSES as f64) * bus_frac).round().clamp(0.0, MAX_BUSES as f64) as usize
+    } else {
+        0
+    };
+    pool.target_buses = want_bus;
+    let bus_entities = pool.buses.clone();
+    let active_bus = count_active(&bus_entities, &q);
+    reconcile(
+        &bus_entities,
+        active_bus,
+        want_bus,
+        &mut budget,
+        &mut q,
+        &mut |agent, rng| {
+            if let Some(route) = pick_ace_route(rng, &sim.ace_routes_geom) {
+                activate_bus(agent, route, rng);
+            }
         },
         &mut pool.rng,
     );
@@ -363,12 +442,25 @@ pub fn animate_agents(
                     agent.progress_m = 0.0;
                     agent.counted = false;
                 }
+                AgentClass::Bus => {
+                    // Schedule-sim recycle: pick another ACE route shape to run.
+                    if let Some(route) = pick_ace_route(&mut pool.rng, &sim.ace_routes_geom) {
+                        agent.route = route;
+                    }
+                    agent.progress_m = 0.0;
+                    agent.counted = false;
+                }
             }
         }
         let p = agent.route.position_at(agent.progress_m);
-        let z = if agent.class == AgentClass::Vehicle { Z_VEHICLE } else { Z_PED };
+        let z = match agent.class {
+            AgentClass::Vehicle => Z_VEHICLE,
+            AgentClass::Bus => Z_BUS,
+            AgentClass::Pedestrian => Z_PED,
+        };
         tf.translation = world::to_world(p, z);
-        // Orient vehicles along travel; pulse on a recent capture.
+        // Orient the (symmetric) dashcam triangle along travel; the bus + glasses
+        // icons stay upright (rotating a side-view icon reads wrong).
         if agent.class == AgentClass::Vehicle {
             let h = agent.route.heading_at(agent.progress_m);
             tf.rotation = Quat::from_rotation_z((h.y.atan2(h.x) - FRAC_PI_2) as f32);
@@ -403,6 +495,9 @@ pub fn mobile_capture_events(
     // are already expressed by the agent flux).
     let p_vehicle = (params.dashcam_penetration as f64 * 0.40).clamp(0.0, 1.0); // penetration × capture_prob
     let p_glasses = ((params.glasses_per_1000 as f64 / 1000.0) * 0.05 * 0.4).clamp(0.0, 1.0);
+    // ACE buses are Tier A: the camera is always present, so the only chance term
+    // is capture-given-pass (the bus's curb-side FOV catching you).
+    let p_bus = 0.7;
 
     for mut agent in &mut agents {
         if !agent.active {
@@ -412,6 +507,7 @@ pub fn mobile_capture_events(
         let (range, p) = match agent.class {
             AgentClass::Vehicle => (VEHICLE_CAPTURE_R, p_vehicle),
             AgentClass::Pedestrian => (PED_CAPTURE_R, p_glasses),
+            AgentClass::Bus => (BUS_CAPTURE_R, p_bus),
         };
         let near = apos.distance(wpos) <= range;
         if near && !agent.counted {
@@ -420,6 +516,7 @@ pub fn mobile_capture_events(
                 match agent.class {
                     AgentClass::Vehicle => walk_live.mobile_vehicle += 1,
                     AgentClass::Pedestrian => walk_live.mobile_glasses += 1,
+                    AgentClass::Bus => walk_live.mobile_bus += 1,
                 }
                 agent.flash = 1.0;
             }

@@ -184,7 +184,10 @@ pub fn ui_panel(
                         );
                     }
                     ExposureMode::Narrative => {
-                        let live = walk_live.count + walk_live.mobile_vehicle + walk_live.mobile_glasses;
+                        let live = walk_live.count
+                            + walk_live.mobile_vehicle
+                            + walk_live.mobile_glasses
+                            + walk_live.mobile_bus;
                         ui.heading(
                             egui::RichText::new(format!("~{live} devices saw you this walk"))
                                 .color(egui::Color32::from_rgb(0x9a, 0x4a, 0x17))
@@ -201,6 +204,9 @@ pub fn ui_panel(
                             ui.end_row();
                             ui.label("smart glasses");
                             ui.colored_label(slate, format!("{}", walk_live.mobile_glasses));
+                            ui.end_row();
+                            ui.label("ACE buses");
+                            ui.colored_label(egui::Color32::from_rgb(0x72, 0x87, 0xa4), format!("{}", walk_live.mobile_bus));
                             ui.end_row();
                         });
                         ui.add_space(4.0);
@@ -260,9 +266,9 @@ pub fn ui_panel(
                 );
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut params.show_agents, "Animate moving dashcams & glasses");
+            ui.checkbox(&mut params.show_agents, "Animate moving sensors (dashcams, glasses, ACE buses)");
             ui.label(
-                egui::RichText::new("clay = rideshare dashcams · slate = glasses wearers; density scales with hour + sliders")
+                egui::RichText::new("clay = rideshare dashcams · slate = glasses wearers · buses = ACE routes; density scales with hour + sliders")
                     .weak()
                     .size(11.0),
             );

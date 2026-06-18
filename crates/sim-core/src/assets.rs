@@ -88,14 +88,27 @@ impl FixedSensorLayer {
     }
 }
 
+/// One ACE route shape as an ordered ENU polyline — the path a bus drives. Used
+/// to animate running buses (the `segments` soup below stays for the analytical
+/// curb-distance exposure model). `f32` keeps the bundle small; decorative.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcePolyline {
+    /// Route short-name (e.g. "M15-SBS").
+    pub route: String,
+    pub points: Vec<[f32; 2]>,
+}
+
 /// Baked ACE bus-camera corridors: the line segments enforced buses traverse,
 /// in ENU meters. A walker within the configured curb reach of any segment can
 /// be captured by a passing bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AceCorridorLayer {
     pub origin: GeoOrigin,
-    /// `[[x0,y0],[x1,y1]]` ENU segments.
+    /// `[[x0,y0],[x1,y1]]` ENU segments (drives the analytical exposure model).
     pub segments: Vec<[[f64; 2]; 2]>,
+    /// Per-route ordered polylines (drives the animated running buses).
+    #[serde(default)]
+    pub polylines: Vec<AcePolyline>,
     /// ACE route short-names included (for provenance/UI).
     pub routes: Vec<String>,
     pub provenance: Provenance,

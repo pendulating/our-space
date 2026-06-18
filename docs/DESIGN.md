@@ -111,13 +111,15 @@ Every Bevy layer (`main.rs`) is colored to land on one side of the warm/cold spl
 | Walkshed in-shed camera ring | `rgba(0.16,0.30,0.50,0.85)` | cold | `ring_mat` |
 | Dashcam-vehicle agents (triangles, moving) | `#a8501f` clay | warm (Tier C) | `agents.rs` |
 | Glasses-pedestrian agents (glasses icon, moving) | `#345169` slate | cold (Tier D) | `icons/glasses.png` |
+| ACE-bus agents (bus icon, moving) | `#7287a4` steel | cold (Tier A) | `icons/bus.png` |
 
 #### Sensor icons
 
-The fixed sensor classes are drawn as **recognizable icons** rather than bare
+The sensor classes are drawn as **recognizable icons** rather than bare
 shapes, so the map reads at a glance: a **CCTV camera** (fixed CCTV), an **owl**
 (Flock/ALPR — echoing the DeFlock motif), a **traffic camera on a mast** (NYC
-DOT), and **eyeglasses** with a recording glint (smart-glasses agents). These are
+DOT), **eyeglasses** with a recording glint (smart-glasses agents), and a
+**side-view bus** (running ACE buses). These are
 **original silhouettes** in the cold palette (`tools/generate_icons.py` → 128px
 PNGs in `assets/icons/`), not third-party logos — same instant read, no trademark
 entanglement. They render as merged textured quads (see `ARCHITECTURE.md`) so

@@ -271,7 +271,7 @@ Counts are the real values produced by this build (from each module's summary).
 | `alpr.osalpr` | `.osalpr` | `FixedSensorLayer` (`Alpr`, `recall: None`) | DeFlock via OSM (ODbL) | 444 readers |
 | `dot_cameras.osdot` | `.osdot` | `FixedSensorLayer` (`DotLiveView`, `recall: None`) | NYC DOT TMC feed (locations only) | 370 Manhattan cams (online) |
 | `vehicle_routes.osroutes` | `.osroutes` | `VehicleRoutesLayer` | TLC HVFHV zone O-D routed over the walk graph (decorative) | 1,000 weighted routes (~159 KB) |
-| `ace_corridors.osace` | `.osace` | `AceCorridorLayer` | MTA GTFS + data.ny.gov `ki2b-sg5y` | 20 routes / 15,361 segments |
+| `ace_corridors.osace` | `.osace` | `AceCorridorLayer` (segments + per-route `polylines`) | MTA GTFS + data.ny.gov `ki2b-sg5y` | 20 routes / 15,361 segments + route polylines |
 | `dashcam_field.osfield` | `.osfield` | `DashcamFieldLayer` | NYC TLC HVFHV trips per taxi zone (DuckDB over remote Parquet) | 354 zone parts |
 | `equity.osequity` | `.osequity` | `EquityLayer` | Census TIGER geometry + Census Reporter ACS B03002 + Dahir detections | 1,299 block groups |
 | `heatmap.osheat` | `.osheat` | `HeatmapLayer` | `our-space` batch coverage aggregation (derived) | per-edge, per-class |
@@ -357,7 +357,9 @@ Flow: `start_loading` (Startup) spawns the camera and inserts `LoadingHandles` (
 
 ### Ambient moving agents & dual-mode exposure (`agents.rs`)
 
-The mobile sensing classes are also rendered as moving agents: clay **dashcam vehicles** (Tier C) replaying baked `VehicleRoute`s, and slate **glasses pedestrians** (Tier D) following on-device graph **random walks** (`StreetGraph::random_walk_route`). A fixed entity **pool** (`AgentPool`, `MAX_VEHICLES = 250` + `MAX_PEDS = 400`) is spawned once with one shared mesh+material per class; `scale_agent_population` activates/deactivates slots (≤32/frame) toward a target = `MAX × {traffic,pedestrian}_multiplier(hour) × (slider / default)`, so on-screen density tracks the hour and the dashcam/glasses sliders. `animate_agents` advances each active agent (`speed × ANIM_SPEEDUP × dt`, the same time-lapse clock as the walker), sets its `Transform` via `Route::position_at` (O(log n)), orients vehicles by `Route::heading_at`, and **recycles in place** on completion (vehicles re-sample the weighted pool; peds random-walk on from the nearest node) — no spawn/despawn churn. There is **no runtime A***: vehicle paths are baked offline, ped paths are O(1) random walks. Agents are hidden in heatmap mode / when `show_agents` is off, and inactive agents early-out of every system.
+The mobile sensing classes are also rendered as moving agents: clay **dashcam vehicles** (Tier C) replaying baked `VehicleRoute`s, slate **glasses pedestrians** (Tier D) following on-device graph **random walks** (`StreetGraph::random_walk_route`), and steel **ACE buses** (Tier A) running real GTFS route shapes (`AcePolyline` → `Route` in `Sim.ace_routes_geom`). A fixed entity **pool** (`AgentPool`, `MAX_VEHICLES = 250` + `MAX_PEDS = 400` + `MAX_BUSES = 80`) is spawned once with one shared mesh+material per class (dashcam = clay triangle; glasses + bus = textured icon quads); `scale_agent_population` activates/deactivates slots (≤32/frame) toward a target — vehicles/peds = `MAX × {traffic,pedestrian}_multiplier(hour) × (slider / default)`, buses = `MAX_BUSES × clamp(5 / bus_headway_minutes(hour), 0.2, 1)` — so on-screen density tracks the hour and the sliders. `animate_agents` advances each active agent (`speed × ANIM_SPEEDUP × dt`, the same time-lapse clock as the walker), sets its `Transform` via `Route::position_at` (O(log n)), orients the symmetric dashcam triangle by `Route::heading_at` (bus/glasses icons stay upright), and **recycles in place** on completion (vehicles re-sample the weighted pool; peds random-walk on; buses re-sample an ACE shape) — no spawn/despawn churn. There is **no runtime A***: vehicle/bus paths are baked offline, ped paths are O(1) random walks. Agents are hidden in heatmap mode / when `show_agents` is off, and inactive agents early-out of every system.
+
+**Buses are schedule-simulated, realtime-ready:** they run the baked GTFS *static* route shapes at modeled headways (fully offline — no key, no proxy, consistent with the static deploy). Because a bus is just a position-drivable `MobileAgent`, a future GTFS-**realtime** source could set bus transforms from live vehicle positions instead of the schedule sweep, without restructuring.
 
 `Params.exposure_mode` selects what the panel headlines:
 - **Analytical** (default, citable): the deterministic `summarize` Poisson estimate — unchanged.
@@ -378,6 +380,7 @@ Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit
 | Route line | `LineStrip` | `line_strip_mesh(&r.points, 2.0)` |
 | Walker / markers | `Circle` | — |
 | Dashcam-vehicle agents | `RegularPolygon::new(7.0, 3)` clay | — (oriented by `heading_at`; one shared mesh, batched) |
+| ACE-bus agents | textured quad | `icons/bus.png` (running GTFS route shapes; upright) |
 | Heatmap | one textured quad over the extent | `rebuild_heatmap` — RGBA field texture sampled on a grid |
 | Equity choropleth | `TriangleList` | `filled_polygon_mesh` (earcut-triangulated) |
 
