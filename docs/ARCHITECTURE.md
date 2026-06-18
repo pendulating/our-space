@@ -378,10 +378,12 @@ Everything is 2D `Mesh2d` + `ColorMaterial` under one `Camera2d`. **1 world unit
 | Route line | `LineStrip` | `line_strip_mesh(&r.points, 2.0)` |
 | Walker / markers | `Circle` | — |
 | Dashcam-vehicle agents | `RegularPolygon::new(7.0, 3)` clay | — (oriented by `heading_at`; one shared mesh, batched) |
-| Heatmap | `LineList` per bucket | `line_list_mesh` (6 intensity buckets) |
+| Heatmap | one textured quad over the extent | `rebuild_heatmap` — RGBA field texture sampled on a grid |
 | Equity choropleth | `TriangleList` | `filled_polygon_mesh` (earcut-triangulated) |
 
-`wedge_mesh` builds a triangle fan from an apex over `segments+1` rim points (compass-bearing math). `filled_polygon_mesh` triangulates the exterior ring with `earcutr::earcut` (handles concave block groups). `rebuild_heatmap` floors `norm·6` into 6 buckets and builds one `LineList` mesh per bucket; `rebuild_equity` lerps each block group between washed-clay and lichen by `entropy / MAX_ENTROPY` (`= ln 5 ≈ 1.609`). In heatmap mode, `sync_visibility` hides the base map so the overlay reads cleanly.
+`wedge_mesh` builds a triangle fan from an apex over `segments+1` rim points (compass-bearing math). `filled_polygon_mesh` triangulates the exterior ring with `earcutr::earcut` (handles concave block groups). `rebuild_equity` lerps each block group between washed-clay and lichen by `entropy / MAX_ENTROPY` (`= ln 5 ≈ 1.609`). In heatmap mode, `sync_visibility` hides the base map so the overlay reads cleanly.
+
+**Heatmap as a spatial field** (`rebuild_heatmap`): rather than coloring street edges (the `batch` per-edge `HeatmapLayer` is for offline analysis), the in-app heatmap samples `exposure_rates_per_minute` on a ~45 m grid over the graph's bounding box — fixed cameras via the `cam_index` R-tree, ACE via a densified-corridor R-tree built on demand, dashcam/glasses from their analytic fields — at the **current hour + slider settings**. The per-cell rate for the selected `HeatClass` is normalized to the grid max, mapped through `HEAT_COLORS` with an alpha ramp (empty space stays clear, exposure glows), packed into an `Rgba8UnormSrgb` `Image` (linear sampler), and drawn as a single translucent quad over the extent. It recomputes only when `HeatSig` (on/class/hour/sliders) changes — a one-shot grid sweep, never per frame.
 
 ### Interaction (`camera_control`)
 

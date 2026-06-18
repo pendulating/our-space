@@ -291,7 +291,13 @@ pub fn ui_panel(
                     }
                     ui.label("high");
                 });
-                ui.label(egui::RichText::new("expected devices/min of presence · baked @ 17:00").weak());
+                ui.label(
+                    egui::RichText::new(
+                        "expected devices/min of presence, as a field over space — live at the \
+                         chosen hour + slider settings",
+                    )
+                    .weak(),
+                );
             }
 
             ui.separator();

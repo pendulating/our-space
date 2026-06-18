@@ -1101,17 +1101,69 @@ const HEAT_COLORS: [Color; 6] = [
 
 /// Rebuild the colored heatmap meshes when the mode/class changes.
 #[allow(clippy::type_complexity)]
+/// Signature of the inputs that change the heatmap field; recompute fires only
+/// when this differs (heatmap evaluation is a one-shot grid sweep, not per-frame).
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct HeatSig {
+    on: bool,
+    class: u8,
+    hour_bits: u32,
+    pen_bits: u32,
+    per1000_bits: u32,
+    ace_on: bool,
+    dashcam_on: bool,
+    glasses_on: bool,
+}
+
+/// Map a normalized intensity (0..1) to an RGBA byte color along `HEAT_COLORS`,
+/// with an alpha ramp so empty space stays clear and exposure glows.
+fn heat_rgba(norm: f64) -> [u8; 4] {
+    if norm <= 1e-6 {
+        return [0, 0, 0, 0];
+    }
+    let t = norm.clamp(0.0, 1.0);
+    let pos = (t * 5.0) as f32;
+    let i = (pos.floor() as usize).min(4);
+    let f = pos - i as f32;
+    let a = HEAT_COLORS[i].to_srgba();
+    let b = HEAT_COLORS[i + 1].to_srgba();
+    let lerp = |x: f32, y: f32| x + (y - x) * f;
+    let alpha = (0.20 + 0.62 * t as f32).min(0.82);
+    [
+        (lerp(a.red, b.red) * 255.0) as u8,
+        (lerp(a.green, b.green) * 255.0) as u8,
+        (lerp(a.blue, b.blue) * 255.0) as u8,
+        (alpha * 255.0) as u8,
+    ]
+}
+
+/// Render the exposure heatmap as a continuous **spatial field**: sample
+/// `exposure_rates_per_minute` over a grid covering the Manhattan extent, map it
+/// through the heat gradient with alpha, and paint it as one translucent textured
+/// quad. Far more legible than per-street lines, and it reads as coverage over
+/// *space* (not just where streets happen to run). Recomputed only when the
+/// class / hour / sliders change (see `HeatSig`).
+#[allow(clippy::too_many_arguments)]
 fn rebuild_heatmap(
     params: Res<Params>,
     sim: Option<Res<Sim>>,
-    mut last: Local<Option<(bool, u8)>>,
+    mut last: Local<Option<HeatSig>>,
     existing: Query<Entity, With<HeatmapVis>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
-    let class_id = params.heatmap_class as u8;
-    let cur = (params.heatmap_on, class_id);
+    let cur = HeatSig {
+        on: params.heatmap_on,
+        class: params.heatmap_class as u8,
+        hour_bits: params.departure_hour.to_bits(),
+        pen_bits: params.dashcam_penetration.to_bits(),
+        per1000_bits: params.glasses_per_1000.to_bits(),
+        ace_on: params.ace_on,
+        dashcam_on: params.dashcam_on,
+        glasses_on: params.glasses_on,
+    };
     if *last == Some(cur) {
         return;
     }
@@ -1124,40 +1176,135 @@ fn rebuild_heatmap(
         return;
     }
     let Some(sim) = sim else { return };
-    let Some(hm) = &sim.heatmap else { return };
-    let edges = &sim.graph.asset().edges;
-    let n = hm.len().min(edges.len());
 
-    let value = |i: usize| match params.heatmap_class {
-        HeatClass::Total => hm.total(i),
-        HeatClass::Fixed => hm.fixed[i],
-        HeatClass::Ace => hm.ace[i],
-        HeatClass::Dashcam => hm.dashcam[i],
+    // Extent = graph node bounding box (the actual island), padded a touch.
+    let nodes = &sim.graph.asset().nodes;
+    if nodes.is_empty() {
+        return;
+    }
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for n in nodes {
+        min_x = min_x.min(n.x);
+        min_y = min_y.min(n.y);
+        max_x = max_x.max(n.x);
+        max_y = max_y.max(n.y);
+    }
+    let pad = 60.0;
+    min_x -= pad; min_y -= pad; max_x += pad; max_y += pad;
+    let (w_m, h_m) = (max_x - min_x, max_y - min_y);
+
+    // Grid sized to ~45 m cells, capped so a toggle is a brief one-shot sweep.
+    let cell = 45.0_f64;
+    let gw = ((w_m / cell).round() as usize).clamp(48, 280);
+    let gh = ((h_m / cell).round() as usize).clamp(48, 360);
+    let (dx, dy) = (w_m / gw as f64, h_m / gh as f64);
+
+    let mobile = build_mobile(&params, &sim);
+    let recall = 1.0 / sim.layer.recall.unwrap_or(1.0);
+    let need_ace = params.ace_on
+        && matches!(params.heatmap_class, HeatClass::Ace | HeatClass::Total)
+        && !sim.ace_segments.is_empty();
+
+    // Densified ACE point index (only when the ACE class contributes).
+    let ace_tree: Option<RTree<[f64; 2]>> = if need_ace {
+        let mut pts = Vec::new();
+        for [a, b] in &sim.ace_segments {
+            pts.push([a.x, a.y]);
+            pts.push([b.x, b.y]);
+            pts.push([(a.x + b.x) * 0.5, (a.y + b.y) * 0.5]);
+        }
+        Some(RTree::bulk_load(pts))
+    } else {
+        None
     };
-    let max_v = (0..n).map(value).fold(0.0_f64, f64::max).max(1e-9);
+    let ace_r2 = {
+        let reach = mobile.ace.as_ref().map_or(20.0, |a| a.capture_range_m);
+        (reach + dy.max(dx)).powi(2)
+    };
 
-    let mut buckets: [Vec<[f32; 3]>; 6] = std::array::from_fn(|_| Vec::new());
-    for (i, e) in edges.iter().take(n).enumerate() {
-        let norm = (value(i) / max_v).clamp(0.0, 1.0);
-        let b = ((norm * 6.0).floor() as usize).min(5);
-        for w in e.polyline.windows(2) {
-            buckets[b].push([w[0][0] as f32, w[0][1] as f32, 0.15]);
-            buckets[b].push([w[1][0] as f32, w[1][1] as f32, 0.15]);
+    // Sweep the grid (row 0 = north / max_y).
+    let mut values = vec![0.0_f64; gw * gh];
+    let mut scratch: Vec<sim_core::SensorInstance> = Vec::new();
+    let mut max_v = 1e-9_f64;
+    for row in 0..gh {
+        let y = max_y - (row as f64 + 0.5) * dy;
+        for col in 0..gw {
+            let x = min_x + (col as f64 + 0.5) * dx;
+            let p = Enu::new(x, y);
+
+            scratch.clear();
+            for c in sim.cam_index.locate_within_distance([x, y], sim.cam_query_r2) {
+                scratch.push(sim.sensors[c.data as usize]);
+            }
+            let near_ace = ace_tree
+                .as_ref()
+                .is_some_and(|t| t.locate_within_distance([x, y], ace_r2).next().is_some());
+
+            let r = sim_core::exposure_rates_per_minute(
+                p, params.departure_hour as f64, &scratch, &[], near_ace, &mobile, recall,
+                Some(&sim.dashcam_field),
+            );
+            let v = match params.heatmap_class {
+                HeatClass::Total => r.total(),
+                HeatClass::Fixed => r.fixed,
+                HeatClass::Ace => r.ace,
+                HeatClass::Dashcam => r.dashcam,
+            };
+            values[row * gw + col] = v;
+            if v > max_v {
+                max_v = v;
+            }
         }
     }
-    for (b, positions) in buckets.into_iter().enumerate() {
-        if positions.is_empty() {
-            continue;
-        }
-        let mesh = meshes.add(world::line_list_mesh(positions));
-        let mat = materials.add(HEAT_COLORS[b]);
-        commands.spawn((
-            Mesh2d(mesh),
-            MeshMaterial2d(mat),
-            Transform::from_xyz(0.0, 0.0, 0.15),
-            HeatmapVis,
-        ));
+
+    // Build the RGBA texture from the field.
+    let mut data = vec![0u8; gw * gh * 4];
+    for (i, &v) in values.iter().enumerate() {
+        let px = heat_rgba(v / max_v);
+        data[i * 4..i * 4 + 4].copy_from_slice(&px);
     }
+    let mut image = Image::new(
+        bevy::render::render_resource::Extent3d {
+            width: gw as u32,
+            height: gh as u32,
+            depth_or_array_layers: 1,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        data,
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD | bevy::asset::RenderAssetUsages::MAIN_WORLD,
+    );
+    image.sampler = bevy::image::ImageSampler::linear(); // smooth the field
+    let tex = images.add(image);
+
+    // One quad over the extent (north = max_y maps to v = 0 / top texel row).
+    let (x0, x1, y0, y1) = (min_x as f32, max_x as f32, min_y as f32, max_y as f32);
+    let mut mesh = Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD | bevy::asset::RenderAssetUsages::MAIN_WORLD,
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![[x0, y1, 0.0], [x1, y1, 0.0], [x1, y0, 0.0], [x0, y0, 0.0]],
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    );
+    mesh.insert_indices(bevy::mesh::Indices::U32(vec![0, 2, 1, 0, 3, 2]));
+    let mesh = meshes.add(mesh);
+    let mat = materials.add(ColorMaterial {
+        color: Color::WHITE,
+        texture: Some(tex),
+        ..default()
+    });
+    commands.spawn((
+        Mesh2d(mesh),
+        MeshMaterial2d(mat),
+        Transform::from_xyz(0.0, 0.0, 0.15),
+        HeatmapVis,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
