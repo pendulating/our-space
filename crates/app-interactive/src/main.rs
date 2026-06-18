@@ -1162,11 +1162,24 @@ fn heat_rgba(norm: f64) -> [u8; 4] {
 /// quad. Far more legible than per-street lines, and it reads as coverage over
 /// *space* (not just where streets happen to run). Recomputed only when the
 /// class / hour / sliders change (see `HeatSig`).
+/// Debounce state for the heatmap: don't rebuild on every changed frame — wait
+/// until the controls settle, so dragging a slider/hour coalesces into one grid
+/// sweep instead of a hitch per step.
+#[derive(Default)]
+struct HeatDebounce {
+    pending: Option<HeatSig>,
+    stable_frames: u32,
+    built: Option<HeatSig>,
+}
+
+/// Frames the inputs must hold steady before a (potentially expensive) rebuild.
+const HEAT_DEBOUNCE_FRAMES: u32 = 6;
+
 #[allow(clippy::too_many_arguments)]
 fn rebuild_heatmap(
     params: Res<Params>,
     sim: Option<Res<Sim>>,
-    mut last: Local<Option<HeatSig>>,
+    mut deb: Local<HeatDebounce>,
     existing: Query<Entity, With<HeatmapVis>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1183,10 +1196,21 @@ fn rebuild_heatmap(
         dashcam_on: params.dashcam_on,
         glasses_on: params.glasses_on,
     };
-    if *last == Some(cur) {
+    // Debounce: a new value restarts the settle counter; only once it has held
+    // steady (and differs from what we last built) do we rebuild.
+    if deb.pending != Some(cur) {
+        deb.pending = Some(cur);
+        deb.stable_frames = 0;
         return;
     }
-    *last = Some(cur);
+    if deb.built == Some(cur) {
+        return; // already built this exact field
+    }
+    deb.stable_frames += 1;
+    if deb.stable_frames < HEAT_DEBOUNCE_FRAMES {
+        return; // still settling
+    }
+    deb.built = Some(cur);
 
     for e in &existing {
         commands.entity(e).despawn();
@@ -1420,19 +1444,20 @@ fn smoke_exit(
         return; // wait until the world is built (async asset load)
     }
     *frames += 1;
-    // Exercise the heatmap + equity render paths before exiting.
+    // Exercise the heatmap + equity render paths before exiting. Hold each
+    // overlay on long enough to clear the heatmap debounce (HEAT_DEBOUNCE_FRAMES).
     if *frames == 3 {
         params.heatmap_on = true;
     }
-    if *frames == 5 {
+    if *frames == 14 {
         params.heatmap_on = false;
         params.equity_on = true;
     }
-    if *frames == 7 {
+    if *frames == 20 {
         params.equity_on = false;
         params.mode = Mode::Walkshed; // exercise mode switch + walkshed panel
     }
-    if *frames == 12 {
+    if *frames == 28 {
         let _ = std::fs::write("/tmp/ourspace_frames.txt", format!("frames_ok={}\n", *frames));
         exit.write(AppExit::Success);
     }
