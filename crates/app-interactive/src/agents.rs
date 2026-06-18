@@ -17,7 +17,7 @@ use sim_core::assets::VehicleRoute;
 use sim_core::rng::{RngLike, WyRand};
 use sim_core::{Route, Vec2};
 
-use crate::{world, Mode, Params, RouteState, Sim, Walker, WalkLive, ExposureMode, ANIM_SPEEDUP};
+use crate::{world, ExposureMode, Mode, Params, RouteState, Sim, Walker, WalkLive};
 
 // Fixed caps → provable worst-case per-frame cost on single-threaded WASM.
 const MAX_VEHICLES: usize = 250;
@@ -37,6 +37,12 @@ const BUS_CAPTURE_R: f64 = 22.0;
 
 const PED_WALK_EDGES: usize = 16;
 const ACTIVATIONS_PER_FRAME: usize = 32;
+
+/// Time-lapse multiplier for the **ambient** agents — deliberately gentler than
+/// the walker's `ANIM_SPEEDUP` (40×, a route playback you watch quickly). The
+/// surrounding traffic/pedestrians read as a calm, living, watched city rather
+/// than a frenetic arcade; the severity of the subject wants stillness, not zip.
+const AGENT_SPEEDUP: f64 = 10.0;
 
 // z-order: streets 0.0, cameras 1.0, route 0.2, walker 4.0. Agents between.
 const Z_VEHICLE: f32 = 2.6;
@@ -437,7 +443,7 @@ pub fn animate_agents(
     if params.heatmap_on || !params.show_agents {
         return; // hidden; skip the work entirely
     }
-    let dt = time.delta_secs_f64() * ANIM_SPEEDUP;
+    let dt = time.delta_secs_f64() * AGENT_SPEEDUP;
     // Local copy so per-agent recycling can borrow it while `pool.rng` is mutable.
     let cumulative = pool.cumulative.clone();
 
