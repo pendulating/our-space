@@ -83,7 +83,7 @@ pub fn ui_panel(
         .default_width(350.0)
         .show(ctx, |ui| {
             ui.heading("our-space");
-            ui.label(egui::RichText::new("NYC sensing exposure · Manhattan").italics());
+            ui.label(egui::RichText::new("How watched is a walk through Manhattan?").italics());
             ui.separator();
 
             // ---- mode ----
@@ -348,9 +348,9 @@ pub fn ui_panel(
                      (CC BY-NC-ND 4.0) + Dahir et al. 2025 detections (CC BY 4.0), \
                      aggregated & de-duplicated.",
                 );
-                ui.label("DOT traffic cams (triangles): NYC DOT (nyctmc.org) — locations only, images not used.");
-                ui.label("ACE corridors: MTA GTFS + data.ny.gov ACE route list.");
-                ui.label("ALPR readers (squares): DeFlock crowdsourced plate readers via OSM.");
+                ui.label("DOT traffic cams (traffic-camera icon): NYC DOT (nyctmc.org) — locations only, images not used.");
+                ui.label("ACE buses (bus icon) + corridors: MTA GTFS + data.ny.gov ACE route list.");
+                ui.label("ALPR readers (owl icon): DeFlock crowdsourced plate readers via OSM.");
                 ui.label("Rideshare cams: density from NYC TLC Uber/Lyft trips, by taxi zone.");
                 ui.add_space(4.0);
                 ui.label(
