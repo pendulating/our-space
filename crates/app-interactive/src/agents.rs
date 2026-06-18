@@ -91,6 +91,12 @@ pub struct AgentPool {
     target_vehicles: usize,
     target_peds: usize,
     target_buses: usize,
+    // Tracked active counts (updated only in `reconcile`, the sole place an
+    // agent's `active` flips) so `scale_agent_population` can early-out in steady
+    // state without cloning entity vectors or re-counting every frame.
+    active_vehicles: usize,
+    active_peds: usize,
+    active_buses: usize,
 }
 
 impl AgentPool {
@@ -106,6 +112,9 @@ impl AgentPool {
             target_vehicles: 0,
             target_peds: 0,
             target_buses: 0,
+            active_vehicles: 0,
+            active_peds: 0,
+            active_buses: 0,
         }
     }
 }
@@ -206,6 +215,9 @@ pub fn spawn_pool(
         target_vehicles: 0,
         target_peds: 0,
         target_buses: 0,
+        active_vehicles: 0,
+        active_peds: 0,
+        active_buses: 0,
     }
 }
 
@@ -276,20 +288,38 @@ pub fn scale_agent_population(
     } else {
         0
     };
+    // ACE buses: count ∝ 1/headway (more buses at rush). Schedule-simulated.
+    let bus_frac = (5.0 / sim_core::mobile::bus_headway_minutes(hour)).clamp(0.2, 1.0);
+    let want_bus = if params.ace_on && !sim.ace_routes_geom.is_empty() {
+        ((MAX_BUSES as f64) * bus_frac).round().clamp(0.0, MAX_BUSES as f64) as usize
+    } else {
+        0
+    };
     pool.target_vehicles = want_veh;
     pool.target_peds = want_ped;
+    pool.target_buses = want_bus;
+
+    // Steady-state fast path: once populations match their targets nothing needs
+    // to change, so skip the entity-vector clones and reconcile work entirely.
+    // Active counts are tracked in `reconcile`, so this is exact.
+    if pool.active_vehicles == want_veh
+        && pool.active_peds == want_ped
+        && pool.active_buses == want_bus
+    {
+        return;
+    }
 
     let mut budget = ACTIVATIONS_PER_FRAME;
 
-    // Vehicles: nudge active count toward target, ≤budget changes this frame.
-    // Clone the (small) cumulative table to a local so the activation closure
-    // doesn't borrow `pool` while `pool.rng` is borrowed mutably.
+    // Clone the (small) cumulative table + entity lists to locals so the
+    // activation closures don't borrow `pool` while `pool.rng` is borrowed mutably.
+    // Reconcile reads/writes the tracked active count in place.
     let cumulative = pool.cumulative.clone();
     let veh_entities = pool.vehicles.clone();
-    let active_veh = count_active(&veh_entities, &q);
+    let mut active_veh = pool.active_vehicles;
     reconcile(
         &veh_entities,
-        active_veh,
+        &mut active_veh,
         want_veh,
         &mut budget,
         &mut q,
@@ -300,13 +330,14 @@ pub fn scale_agent_population(
         },
         &mut pool.rng,
     );
+    pool.active_vehicles = active_veh;
 
     let ped_entities = pool.peds.clone();
-    let active_ped = count_active(&ped_entities, &q);
     let node_count = sim.graph.node_count() as u32;
+    let mut active_ped = pool.active_peds;
     reconcile(
         &ped_entities,
-        active_ped,
+        &mut active_ped,
         want_ped,
         &mut budget,
         &mut q,
@@ -316,20 +347,13 @@ pub fn scale_agent_population(
         },
         &mut pool.rng,
     );
+    pool.active_peds = active_ped;
 
-    // ACE buses: count ∝ 1/headway (more buses at rush). Schedule-simulated.
-    let bus_frac = (5.0 / sim_core::mobile::bus_headway_minutes(hour)).clamp(0.2, 1.0);
-    let want_bus = if params.ace_on && !sim.ace_routes_geom.is_empty() {
-        ((MAX_BUSES as f64) * bus_frac).round().clamp(0.0, MAX_BUSES as f64) as usize
-    } else {
-        0
-    };
-    pool.target_buses = want_bus;
     let bus_entities = pool.buses.clone();
-    let active_bus = count_active(&bus_entities, &q);
+    let mut active_bus = pool.active_buses;
     reconcile(
         &bus_entities,
-        active_bus,
+        &mut active_bus,
         want_bus,
         &mut budget,
         &mut q,
@@ -340,24 +364,23 @@ pub fn scale_agent_population(
         },
         &mut pool.rng,
     );
+    pool.active_buses = active_bus;
 }
 
-fn count_active(entities: &[Entity], q: &Query<(&mut MobileAgent, &mut Visibility)>) -> usize {
-    entities.iter().filter(|&&e| q.get(e).map(|(a, _)| a.active).unwrap_or(false)).count()
-}
-
+/// Nudge `*active` toward `target` by flipping ≤`budget` pooled agents this
+/// frame, keeping the tracked count in sync.
 #[allow(clippy::too_many_arguments)]
 fn reconcile(
     entities: &[Entity],
-    active: usize,
+    active: &mut usize,
     target: usize,
     budget: &mut usize,
     q: &mut Query<(&mut MobileAgent, &mut Visibility)>,
     activate: &mut dyn FnMut(&mut MobileAgent, &mut WyRand),
     rng: &mut WyRand,
 ) {
-    if active < target {
-        let mut to_add = (target - active).min(*budget);
+    if *active < target {
+        let mut to_add = (target - *active).min(*budget);
         for &e in entities {
             if to_add == 0 {
                 break;
@@ -366,13 +389,14 @@ fn reconcile(
                 if !agent.active {
                     activate(&mut agent, rng);
                     *vis = Visibility::Inherited;
+                    *active += 1;
                     to_add -= 1;
                     *budget -= 1;
                 }
             }
         }
-    } else if active > target {
-        let mut to_remove = (active - target).min(*budget);
+    } else if *active > target {
+        let mut to_remove = (*active - target).min(*budget);
         for &e in entities {
             if to_remove == 0 {
                 break;
@@ -381,6 +405,7 @@ fn reconcile(
                 if agent.active {
                     agent.active = false;
                     *vis = Visibility::Hidden;
+                    *active -= 1;
                     to_remove -= 1;
                     *budget -= 1;
                 }
