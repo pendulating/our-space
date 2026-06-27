@@ -162,5 +162,7 @@ if __name__ == "__main__":
     # in hue and value so the dense layers stay legible on the white ground.
     save(brand("CCTV", MAROON), "brand_cctv.png")
     save(brand("DOT", AMBER_700), "brand_dot.png")
-    save(brand("FLOCK", RED), "brand_flock.png")
+    # ALPR (Flock + agency plate readers): the on-map wordmark reads "ALPR", the
+    # category, not the "Flock" brand — matching the Operators-tower header.
+    save(brand("ALPR", RED), "brand_alpr.png")
     save(brand("ENF", ORANGE_600), "brand_enforce.png")

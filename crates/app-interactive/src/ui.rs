@@ -31,8 +31,127 @@ const LEGEND: [egui::Color32; 6] = [
     egui::Color32::from_rgb(0xea, 0x58, 0x0c),
 ];
 
-/// The headline / accent color for every "big number" in the UI: hazard yellow.
-const TERRACOTTA: egui::Color32 = pal::YELLOW;
+/// The headline / accent color for every "big number" in the UI. A deep terracotta
+/// (burnt orange) rather than the bright hazard-yellow accent: yellow on the white
+/// paper plate / hero card barely read (~1.3:1), so the headline stat + the
+/// "SIMULATED DAY" eyebrow now use this ~6:1-contrast clay instead. The yellow end of
+/// the warning ramp is kept for the confidence tiers + heat ramp where it sits on ink.
+const TERRACOTTA: egui::Color32 = egui::Color32::from_rgb(0xc2, 0x41, 0x0c);
+
+/// Right side-panel width (CSS px); the citywide nudge keeps clear of it.
+const PANEL_WIDTH_PX: f32 = 316.0;
+
+/// World (ENU metres) anchors for the Manhattan→citywide nudge — one out in each outer
+/// borough's empty space, ringing the island (Brooklyn SE, Queens E, the Bronx N, Staten
+/// Island SW). Each sits well off Manhattan, so they're all off-screen in the default
+/// island view; whichever one the visitor pans into frame is where the prompt appears,
+/// labelled with that borough. `(eyebrow, east, north)`.
+const CITYWIDE_NUDGE_ANCHORS: [(&str, f32, f32); 4] = [
+    ("BROOKLYN", 2600.0, -12800.0),
+    ("QUEENS", 4800.0, -4200.0),
+    ("THE BRONX", 3600.0, 6200.0),
+    ("STATEN ISLAND", -9500.0, -16500.0),
+];
+
+/// Navigate to the full five-borough build (`?city=nyc`). Web only — sets the query
+/// string (which reloads into the citywide asset set); a no-op on native.
+#[cfg(target_arch = "wasm32")]
+fn go_citywide() {
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().set_search("city=nyc");
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn go_citywide() {}
+
+/// The Manhattan→citywide nudge, **pinned to map locations in the outer boroughs** rather
+/// than the screen — it only surfaces once the visitor pans an outer borough into view,
+/// and that act of panning out into the empty space *is* the prompt to open the full-city
+/// build. A separate egui pass from `ui_panel` (no shared params); reads the camera to
+/// project each borough anchor to a screen position and draws the box at the first one
+/// that sits comfortably inside the visible map area (only one at a time, even when zoomed
+/// out far enough to see two). Hidden in the citywide build.
+pub fn citywide_nudge(
+    mut contexts: EguiContexts,
+    camera_q: bevy::prelude::Query<
+        (&bevy::prelude::Camera, &bevy::prelude::GlobalTransform),
+        bevy::prelude::With<bevy::prelude::Camera2d>,
+    >,
+    city: Option<bevy::prelude::Res<crate::CityScope>>,
+    theme_ready: bevy::prelude::Res<crate::ThemeReady>,
+) {
+    if !theme_ready.0 {
+        return;
+    }
+    if city.map(|c| c.citywide).unwrap_or(false) {
+        return; // the full-city build is already here — no nudge
+    }
+    let Ok((camera, cam_gt)) = camera_q.single() else { return };
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let r = ctx.screen_rect();
+    let map_w = r.width() - PANEL_WIDTH_PX;
+    for (borough, ax, ay) in CITYWIDE_NUDGE_ANCHORS {
+        let anchor = bevy::prelude::Vec3::new(ax, ay, 0.0);
+        let Ok(screen) = camera.world_to_viewport(cam_gt, anchor) else { continue };
+        // Only draw while the whole box fits inside the map area (left of the panel) with a
+        // margin — so it reads as pinned in the outer-borough space, never clipped at an edge.
+        if screen.x < 20.0
+            || screen.x > map_w - 252.0
+            || screen.y < 20.0
+            || screen.y > r.height() - 160.0
+        {
+            continue;
+        }
+        egui::Area::new(egui::Id::new("citywide_nudge"))
+            .fixed_pos(egui::pos2(screen.x, screen.y))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235))
+                    .stroke(egui::Stroke::new(1.0, pal::ZINC_300))
+                    .inner_margin(egui::Margin::symmetric(13, 11))
+                    .corner_radius(8)
+                    .show(ui, |ui| {
+                        ui.set_max_width(236.0);
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        ui.label(
+                            egui::RichText::new(borough)
+                                .font(theme::display(11.0))
+                                .color(TERRACOTTA),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "This view is Manhattan only — kept light for performance, so \
+                                 the outer boroughs are empty here.",
+                            )
+                            .size(12.5)
+                            .color(pal::ZINC_100),
+                        );
+                        let go = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Open the full five-borough map →")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(TERRACOTTA),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if go.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if go.clicked() {
+                            go_citywide();
+                        }
+                        ui.label(
+                            egui::RichText::new("a powerful computer is recommended")
+                                .size(10.5)
+                                .italics()
+                                .color(pal::ZINC_400),
+                        );
+                    });
+            });
+        break; // one nudge at a time — the first anchor in view wins
+    }
+}
 
 /// Short label + ink color for a confidence tier — a warning ramp from the bright,
 /// mapped certainty (yellow) down to the gray "machine" of pure speculation.
@@ -246,11 +365,14 @@ pub fn ui_panel(
                 });
         });
 
+    // (The Manhattan→citywide nudge is its own pass, `citywide_nudge`, pinned to a map
+    // location in the outer boroughs so it only surfaces when you pan out there.)
+
     egui::SidePanel::right("panel")
         // Fixed width: a resizable panel + an `available_width()`-sized child (the
         // address box) feed back into each other and the panel grows without bound.
         .resizable(false)
-        .exact_width(316.0)
+        .exact_width(PANEL_WIDTH_PX)
         .show(ctx, |ui| {
             // ---- masthead ----
             // The page's HTML <header> already carries the "our·space" wordmark, so the
@@ -270,21 +392,32 @@ pub fn ui_panel(
                 // Only when something is actually placed, so an idle re-click is a no-op.
                 let in_walkshed = params.mode == Mode::Walkshed;
                 let in_route = params.mode == Mode::Route;
+                let in_neigh = params.mode == Mode::Neighborhoods;
                 let area_present = walkshed.summary.is_some();
                 let route_present = route.a.is_some() || route.summary.is_some();
                 let mut r_walk = ui.selectable_value(&mut params.mode, Mode::Walkshed, "My area");
                 let mut r_route = ui.selectable_value(&mut params.mode, Mode::Route, "A walk A→B");
-                ui.selectable_value(&mut params.mode, Mode::Neighborhoods, "Neighborhoods");
+                let mut r_neigh =
+                    ui.selectable_value(&mut params.mode, Mode::Neighborhoods, "Neighborhoods");
                 if in_walkshed && area_present {
                     r_walk = r_walk.on_hover_text("Click again to clear your area");
                 }
                 if in_route && route_present {
                     r_route = r_route.on_hover_text("Click again to clear your A→B walk");
                 }
+                if in_neigh {
+                    r_neigh = r_neigh.on_hover_text("Click again to leave Neighborhoods");
+                }
                 if (in_walkshed && area_present && r_walk.clicked())
                     || (in_route && route_present && r_route.clicked())
                 {
                     reset.0 = true;
+                }
+                // Re-clicking the active Neighborhoods chip leaves the mode (back to the
+                // default "My area"). `selectable_value` re-asserts Neighborhoods on click,
+                // so flip it back when it was already active.
+                if in_neigh && r_neigh.clicked() {
+                    params.mode = Mode::Walkshed;
                 }
             });
             // The neighborhood-density view is a mode now (not an EXPLORE checkbox): keep the
@@ -828,7 +961,7 @@ fn result_walkshed(ui: &mut egui::Ui, route: &RouteState, walkshed: &WalkshedSta
         ui.label(
             egui::RichText::new(format!("~{} cameras", w.cameras_corrected.round() as u32))
                 .font(theme::display(30.0))
-                .color(pal::YELLOW),
+                .color(TERRACOTTA),
         );
         ui.label(egui::RichText::new("watch your area").size(15.0).color(pal::ZINC_300));
         ui.add_space(6.0);
@@ -969,7 +1102,7 @@ fn result_route(
             ui.label(
                 egui::RichText::new(format!("~{} devices", s.headline_devices))
                     .font(theme::display(30.0))
-                    .color(pal::YELLOW),
+                    .color(TERRACOTTA),
             );
             ui.label(egui::RichText::new("could have captured you").size(15.0).color(pal::ZINC_300));
             ui.add_space(6.0);
@@ -1009,7 +1142,7 @@ fn result_route(
             ui.label(
                 egui::RichText::new(format!("~{live} devices"))
                     .font(theme::display(30.0))
-                    .color(pal::YELLOW),
+                    .color(TERRACOTTA),
             );
             ui.label(egui::RichText::new("saw you this walk").size(15.0).color(pal::ZINC_300));
             ui.add_space(6.0);
@@ -1312,6 +1445,33 @@ pub fn storymap_ui(mut contexts: EguiContexts, mut story: ResMut<crate::storymap
         });
 }
 
+/// Shared modal section: when the clicked camera was merged with co-located cameras from
+/// *other* layers (so it counts once, not several times, in the headline), name those
+/// other sources. No-op for a single-source camera. `also` comes from the pin's
+/// `also_sources`, filled in `build_world` from the `group_sensors` clustering.
+fn cross_source_note(ui: &mut egui::Ui, also: &[&'static str]) {
+    if also.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("CROSS-SOURCE CONFIRMED")
+            .font(theme::display(11.0))
+            .color(TERRACOTTA),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "Also mapped here by {}. Multiple sources attest one physical camera — merged, \
+             so it's counted once in the headline.",
+            also.join(", ")
+        ))
+        .size(11.0)
+        .color(pal::ZINC_100),
+    );
+}
+
 /// Per-camera metadata modal for a clicked ALPR — DeFlock's crowdsourced maker/operator
 /// plus deep-links to OpenStreetMap and DeFlock. `SelectedAlpr` is set by
 /// `handle_click` (clicking on/near a reader); closing the window clears it.
@@ -1348,6 +1508,7 @@ pub fn alpr_modal(
                 .size(12.0)
                 .color(pal::ZINC_400),
             );
+            cross_source_note(ui, &pin.also_sources);
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(2.0);
@@ -1425,6 +1586,7 @@ pub fn cctv_modal(
                         .color(pal::ZINC_400),
                 );
             }
+            cross_source_note(ui, &pin.also_sources);
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(2.0);

@@ -260,11 +260,16 @@ const LANDMARK_HEIGHT: f32 = 0.5;
 /// peds, and cameras that are screen-behind it. Stays below the A/B markers (3.0),
 /// walker (4.0), and labels (5.0) so the user's own route stays readable.
 pub(crate) const LANDMARK_MASSING_Z: f32 = 2.8;
-/// Painter z for the bridges, now rendered as quiet flat footprints (not 3D massing):
-/// just above the coastline outline (0.15) so the deck reads as a continuous crossing
-/// over the white water and the street grid, but well below the camera icons (1.0) and
-/// the mobile agents (≤ 2.7) so vehicles/peds drive *over* the deck — no occlusion.
-const BRIDGE_FLAT_Z: f32 = 0.16;
+/// Painter z for the bridges, rendered as quiet flat footprints (not 3D massing). It
+/// must sit ABOVE the coastline outline so the boundary stroke never shows atop a span
+/// crossing the water. NOTE the outline's *effective* z is 0.30, not 0.15: its mesh
+/// (`stroke_ring_mesh`) bakes z=0.15 into the verts AND its transform adds another 0.15.
+/// The ACE ribbons likewise double to ~0.4. So this is set well above both (0.5) — the
+/// earlier 0.16/0.185 were below the outline's true 0.30 and the boundary line cut
+/// through. Still below the camera icons (1.0) and mobile agents (≤ 2.7) so they draw
+/// over the deck (no occlusion). Iconic bridges carry no ACE bus-lane corridors, so
+/// sitting above the ACE ribbons is harmless.
+const BRIDGE_FLAT_Z: f32 = 0.5;
 /// Light direction for the landmark Lambert shading: from the upper south-east
 /// (east+, south−, up+), so roofs read bright, south/east faces lit, west faces dark.
 const LANDMARK_LIGHT: Vec3 = Vec3::new(0.38, -0.48, 0.79);
@@ -582,6 +587,10 @@ pub(crate) struct AlprPin {
     pub heading_deg: Option<f64>,
     pub lat: f64,
     pub lon: f64,
+    /// Other fixed-camera sources that map this same physical camera (co-located, merged
+    /// into one group by `group_sensors`). Empty = single-source. Drives the modal's
+    /// "cross-source confirmed" note. See [`group_attestations`].
+    pub also_sources: Vec<&'static str>,
 }
 /// All Manhattan ALPR readers + metadata, for click-picking + the modal.
 #[derive(Resource, Default)]
@@ -613,6 +622,10 @@ pub(crate) struct CctvPin {
     pub heading_deg: Option<f64>,
     pub lat: f64,
     pub lon: f64,
+    /// Other fixed-camera sources that map this same physical camera (co-located, merged
+    /// into one group by `group_sensors`). Empty = single-source. Drives the modal's
+    /// "cross-source confirmed" note. See [`group_attestations`].
+    pub also_sources: Vec<&'static str>,
 }
 /// All Manhattan CCTV cameras + provenance, for click-picking + the modal.
 #[derive(Resource, Default)]
@@ -620,6 +633,20 @@ pub(crate) struct CctvDirectory(pub Vec<CctvPin>);
 /// The CCTV the user clicked (index into `CctvDirectory`); `Some` shows the modal.
 #[derive(Resource, Default)]
 pub(crate) struct SelectedCctv(pub Option<usize>);
+
+/// Short human label for a fixed-camera source, used to name the *other* layers that
+/// attest a merged camera in the click modal. Returns `None` for the mobile/speculative
+/// kinds, which are never part of a fixed-camera group.
+pub(crate) fn fixed_source_label(kind: sim_core::SourceKind) -> Option<&'static str> {
+    use sim_core::SourceKind::*;
+    Some(match kind {
+        FixedCctv => "CCTV census",
+        Alpr => "DeFlock ALPR",
+        DotLiveView => "NYC DOT camera",
+        EnforcementCamera => "DOT enforcement",
+        _ => return None,
+    })
+}
 
 /// Mobile sensors currently inside one neighborhood, by class — sampled live from
 /// the moving agents as the day clock runs.
@@ -887,7 +914,7 @@ fn main() {
             (ui::setup_theme, apply_reset, smoke_exit),
         ),
     )
-    .add_systems(EguiPrimaryContextPass, (ui::ui_panel, ui::storymap_ui, ui::alpr_modal, ui::cctv_modal));
+    .add_systems(EguiPrimaryContextPass, (ui::ui_panel, ui::citywide_nudge, ui::storymap_ui, ui::alpr_modal, ui::cctv_modal));
     // Web: keep the MapLibre basemap synced to the Bevy camera each frame.
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Update, basemap::sync_basemap);
@@ -1316,9 +1343,12 @@ fn build_world(
     // cameras, re-indexing ids to the combined-vector position (used as the
     // distinct-device key + dot index). DOT cams use monitoring defaults
     // (omnidirectional, wider reach, low frame rate).
-    // Trim every fixed-camera source to the Manhattan boundary (the borough-outline
-    // ring we already load) so none floats off-island in open water.
-    let man = &boro.0.rings;
+    // Trim every fixed-camera source to the boundary. The data is NOT Manhattan-only —
+    // the DeFlock ALPR census (and some DOT/CCTV) carry outer-borough cameras — so the
+    // Manhattan build clips to Manhattan's main landmass alone (`rings[0]`), keeping the
+    // outer boroughs empty of sensing layers; the citywide build keeps all five boroughs'
+    // rings so the census un-clips across the city.
+    let man: &[Vec<[f64; 2]>] = if citywide { &boro.0.rings } else { &boro.0.rings[..1] };
     let keep = |s: &sim_core::SensorInstance| in_manhattan(s.wedge.apex, man);
     let mut sensors: Vec<_> = sim_core::sensors_from_layer(&layer, FixedCameraDefaults::default())
         .into_iter().filter(&keep).collect();
@@ -1347,7 +1377,7 @@ fn build_world(
     // ALPR click-modal directory: Manhattan readers + DeFlock/OSM metadata, hit-tested
     // in `handle_click`. lat/lon precomputed for the DeFlock deep-link.
     let alpr_proj = EnuProjection::default();
-    let alpr_pins: Vec<AlprPin> = al
+    let mut alpr_pins: Vec<AlprPin> = al
         .0
         .readers
         .iter()
@@ -1362,10 +1392,10 @@ fn build_world(
                 heading_deg: r.heading_deg,
                 lat,
                 lon,
+                also_sources: Vec::new(), // filled below, after `group_sensors`
             }
         })
         .collect();
-    commands.insert_resource(AlprDirectory(alpr_pins));
     // Per-reader maker (parallel to the Manhattan ALPR sensors, same filter+order) →
     // both the tower banding (item: stratify by maker) and the panel legend.
     let alpr_makers_seq: Vec<operators::Maker> = al
@@ -1392,7 +1422,7 @@ fn build_world(
         commands.insert_resource(AlprMakerBreakdown(breakdown));
     }
     // CCTV click-modal directory: Manhattan cameras + Amnesty/Dahir provenance.
-    let cctv_pins: Vec<CctvPin> = c
+    let mut cctv_pins: Vec<CctvPin> = c
         .0
         .cameras
         .iter()
@@ -1408,10 +1438,10 @@ fn build_world(
                 heading_deg: cam.heading_deg,
                 lat,
                 lon,
+                also_sources: Vec::new(), // filled below, after `group_sensors`
             }
         })
         .collect();
-    commands.insert_resource(CctvDirectory(cctv_pins));
     // Group co-located fixed cameras across sources into one physical node, so a
     // camera attested by several layers (CCTV census + DOT + ALPR + enforcement)
     // counts once in the headline (multiply-attested, not multiply-counted).
@@ -1423,6 +1453,51 @@ fn build_world(
         n_nodes,
         n_fixed - n_nodes
     );
+    // Cross-source attestation for the click modals: a camera merged into a group with
+    // members from other layers (e.g. a DeFlock ALPR co-located with a NYC DOT cam) lists
+    // those *other* sources, so the popup can say "also mapped here by …". `group_sensors`
+    // already set each sensor's `group`; we read it back per pin by position (the pin's
+    // `pos` is the same `Vec2` as its sensor's `apex`, so a 0.5 m grid key matches exactly).
+    {
+        use std::collections::{HashMap, HashSet};
+        // `apex` is `sim_core::Vec2`, the pins' `pos` is `bevy::Vec2` — distinct types,
+        // same f32 `.x`/`.y`. Key the grid on the raw components so both match.
+        let mut group_kinds: HashMap<u32, HashSet<sim_core::SourceKind>> = HashMap::new();
+        let mut pos_group: HashMap<(i64, i64), u32> = HashMap::new();
+        let cell = |x: f64, y: f64| ((x * 2.0).round() as i64, (y * 2.0).round() as i64);
+        for s in &sensors {
+            group_kinds.entry(s.group).or_default().insert(s.kind);
+            pos_group.insert(cell(s.wedge.apex.x, s.wedge.apex.y), s.group);
+        }
+        let others_for = |x: f64, y: f64, self_kind: sim_core::SourceKind| -> Vec<&'static str> {
+            let Some(g) = pos_group.get(&cell(x, y)) else { return Vec::new() };
+            let Some(kinds) = group_kinds.get(g) else { return Vec::new() };
+            let mut v: Vec<&'static str> = kinds
+                .iter()
+                .filter(|&&k| k != self_kind)
+                .filter_map(|&k| fixed_source_label(k))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        for p in &mut alpr_pins {
+            p.also_sources =
+                others_for(p.pos.x as f64, p.pos.y as f64, sim_core::SourceKind::Alpr);
+        }
+        for p in &mut cctv_pins {
+            p.also_sources =
+                others_for(p.pos.x as f64, p.pos.y as f64, sim_core::SourceKind::FixedCctv);
+        }
+        let alpr_x = alpr_pins.iter().filter(|p| !p.also_sources.is_empty()).count();
+        let cctv_x = cctv_pins.iter().filter(|p| !p.also_sources.is_empty()).count();
+        info!(
+            "cross-source attestations: {} ALPR + {} CCTV clickable pins multiply-attested",
+            alpr_x, cctv_x
+        );
+    }
+    commands.insert_resource(AlprDirectory(alpr_pins));
+    commands.insert_resource(CctvDirectory(cctv_pins));
     let ace_segments: Vec<[Enu; 2]> = a
         .0
         .segments
@@ -1467,8 +1542,28 @@ fn build_world(
     // Pedestrian plazas — paved public spaces carved from the roadway. A warm
     // concrete fill (above the footprints, below the streets) with a 45° hatch
     // clipped to each polygon (`world::hatch_lines_mesh`) reading as paving/tiling.
-    if !plazas.0.polygons.is_empty() {
-        let fill = meshes.add(world::merged_footprints_mesh(&plazas.0.polygons));
+    // The asset is citywide; the Manhattan-only build clips it to the island so no
+    // plaza floats off in Brooklyn/Queens (a polygon is kept if any vertex is in
+    // Manhattan's main landmass).
+    let plaza_polys_owned;
+    let plaza_polys: &[Vec<[f32; 2]>] = if citywide {
+        &plazas.0.polygons
+    } else {
+        let man0 = &boro.0.rings[0];
+        plaza_polys_owned = plazas
+            .0
+            .polygons
+            .iter()
+            .filter(|poly| {
+                poly.iter()
+                    .any(|v| point_in_ring(Enu::new(v[0] as f64, v[1] as f64), man0))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &plaza_polys_owned
+    };
+    if !plaza_polys.is_empty() {
+        let fill = meshes.add(world::merged_footprints_mesh(plaza_polys));
         let fill_mat = materials.add(theme::map::ca(0xd7, 0xd1, 0xc6, 0.95)); // warm concrete
         commands.spawn((
             Mesh2d(fill),
@@ -1476,7 +1571,7 @@ fn build_world(
             Transform::from_xyz(0.0, 0.0, PLAZA_FILL_Z),
             PlazasVis,
         ));
-        let hatch = meshes.add(world::hatch_lines_mesh(&plazas.0.polygons, 6.0, 0.35, PLAZA_HATCH_Z));
+        let hatch = meshes.add(world::hatch_lines_mesh(plaza_polys, 6.0, 0.35, PLAZA_HATCH_Z));
         let hatch_mat = materials.add(theme::map::ca(0x8f, 0x88, 0x7b, 0.55)); // darker warm-gray paving lines
         commands.spawn((
             Mesh2d(hatch),
@@ -1601,11 +1696,37 @@ fn build_world(
     // same light zinc as the building footprints and drawn low (`BRIDGE_FLAT_Z`), so a
     // span reads as context that connects the street grids — not a bold 3D structure
     // that occludes the traffic crossing it. Follows `landmarks_on`.
-    if !brg.0.landmarks.is_empty() {
-        let mesh = meshes.add(world::landmark_flat_mesh(&brg.0.landmarks));
+    // The bridges asset carries all nine NYC spans; the Manhattan-only build keeps just
+    // the ones that touch the island (a bridge is in if any surface vertex falls in
+    // Manhattan's main landmass) so Verrazzano / Throgs Neck / Whitestone don't float
+    // off in the far boroughs. The citywide build renders them all.
+    let bridges_owned;
+    let bridges: &[sim_core::assets::Landmark] = if citywide {
+        &brg.0.landmarks
+    } else {
+        let man0 = &boro.0.rings[0];
+        bridges_owned = brg
+            .0
+            .landmarks
+            .iter()
+            .filter(|lm| {
+                lm.surfaces.iter().any(|s| {
+                    s.verts
+                        .iter()
+                        .any(|v| point_in_ring(Enu::new(v[0] as f64, v[1] as f64), man0))
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &bridges_owned
+    };
+    if !bridges.is_empty() {
+        let mesh = meshes.add(world::landmark_flat_mesh(bridges));
         // One notch up from the footprint fabric (ZINC_800) so the deck stays legible
         // over the white water + green parkland where no buildings frame it — still
-        // quiet, flat, and recessive.
+        // quiet, flat, and recessive. Sits at `BRIDGE_FLAT_Z`, clearly above the
+        // coastline outline (z 0.15) so a span crossing the water reads continuously
+        // rather than being nicked by the boundary stroke where it leaves the shore.
         let mat = materials.add(theme::map::ZINC_700);
         commands.spawn((
             Mesh2d(mesh),
@@ -1663,11 +1784,47 @@ fn build_world(
     let mut dot_pts: Vec<Enu> = Vec::new();
     let mut enf_pts: Vec<Enu> = Vec::new();
     let wedge_mat = materials.add(theme::map::ca(0xdc, 0x26, 0x26, 0.14)); // what the camera sees: surveillance-red cone
-    for s in &sensors {
+    // One marker (+ one FOV cone) per *physical* camera. A co-located group attested by
+    // several layers used to stack a wordmark per source; now each group draws a single
+    // primary marker. Priority prefers a source the click modal can open — ALPR, then CCTV
+    // — matching `handle_click`'s ALPR-before-CCTV hit-test, so the visible icon is the one
+    // whose popup opens; DOT/enforcement only win when no clickable member shares the group.
+    let group_primary_idx: std::collections::HashMap<u32, usize> = {
+        let prio = |k: sim_core::SourceKind| match k {
+            sim_core::SourceKind::Alpr => 0u8,
+            sim_core::SourceKind::FixedCctv => 1,
+            sim_core::SourceKind::DotLiveView => 2,
+            sim_core::SourceKind::EnforcementCamera => 3,
+            _ => 4,
+        };
+        let mut m: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (i, s) in sensors.iter().enumerate() {
+            let e = m.entry(s.group).or_insert(i);
+            if prio(s.kind) < prio(sensors[*e].kind) {
+                *e = i;
+            }
+        }
+        m
+    };
+    let mut alpr_ord = 0usize;
+    for (i, s) in sensors.iter().enumerate() {
+        // ALPR maker is parallel to the ALPR *sensors* (same filter+order as the readers);
+        // advance the ordinal for every ALPR even when its marker is a skipped duplicate.
+        let alpr_idx = if matches!(s.kind, sim_core::SourceKind::Alpr) {
+            let o = alpr_ord;
+            alpr_ord += 1;
+            o
+        } else {
+            usize::MAX
+        };
+        // Only the group's primary member draws; co-located duplicates are the same camera
+        // (and are named in that primary's "cross-source confirmed" modal note).
+        if group_primary_idx.get(&s.group) != Some(&i) {
+            continue;
+        }
         match s.kind {
             sim_core::SourceKind::Alpr => {
-                // Maker is parallel to the ALPR sensors (same filter+order as readers).
-                alpr_makers.push(alpr_makers_seq.get(alpr_pts.len()).copied().unwrap_or(operators::Maker::Other));
+                alpr_makers.push(alpr_makers_seq.get(alpr_idx).copied().unwrap_or(operators::Maker::Other));
                 alpr_pts.push(s.wedge.apex);
             }
             sim_core::SourceKind::DotLiveView => dot_pts.push(s.wedge.apex),
@@ -1691,6 +1848,15 @@ fn build_world(
             ));
         }
     }
+    info!(
+        "camera markers (one per physical camera): {} CCTV + {} ALPR + {} DOT + {} enforcement = {} (from {} attestations)",
+        cctv_pts.len(),
+        alpr_pts.len(),
+        dot_pts.len(),
+        enf_pts.len(),
+        cctv_pts.len() + alpr_pts.len() + dot_pts.len() + enf_pts.len(),
+        n_fixed,
+    );
     // Stratify the ALPR column by reader maker: sort chips so same-maker chips are
     // contiguous (the tower fills bottom-row-first, so they form stacked bands), and
     // precompute per-vertex maker tints (4 per chip). The mesh ships white so the map
@@ -1707,7 +1873,7 @@ fn build_world(
 
     for (pts, size, icon, col, vcolors) in [
         (&cctv_pts, 26.0_f32, "icons/brand_cctv.png", OperatorCol::Cctv, None),
-        (&alpr_pts, 28.0, "icons/brand_flock.png", OperatorCol::Flock, Some(&alpr_vertex_colors)),
+        (&alpr_pts, 28.0, "icons/brand_alpr.png", OperatorCol::Flock, Some(&alpr_vertex_colors)),
         (&dot_pts, 28.0, "icons/brand_dot.png", OperatorCol::Dot, None),
         (&enf_pts, 26.0, "icons/brand_enforce.png", OperatorCol::Enforcement, None),
     ] {
@@ -2077,7 +2243,13 @@ fn offshore_label_anchors(
             let shore = world::nearest_on_ring(obj, ring);
             let dir = (shore - obj).normalize_or_zero();
             let dir = if dir == Vec2::ZERO { Vec2::NEG_X } else { dir };
-            OffshoreLabel { obj, pos: shore + dir * offshore_m, left: dir.x < 0.0 }
+            // East-shore labels point across the *narrow* East River toward Brooklyn /
+            // Queens, so the full offshore reach lands their names on the far borough.
+            // Float them a shorter distance to sit in the channel (over the water),
+            // out of the Brooklyn/Queens fabric; west-shore labels keep the full reach
+            // out into the wide Hudson.
+            let reach = if dir.x > 0.0 { offshore_m * 0.5 } else { offshore_m };
+            OffshoreLabel { obj, pos: shore + dir * reach, left: dir.x < 0.0 }
         })
         .collect();
     // De-collide within each shore: sort along y, push later ones up to keep the gap.
