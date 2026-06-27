@@ -163,8 +163,11 @@ fn run() -> anyhow::Result<()> {
             // [borough] selects one borough by the Parks `borough` code (M/B/Q/X/R);
             // "all"/omitted keeps every borough (citywide).
             let borough = args.get(4).map(String::as_str).filter(|s| *s != "all");
+            // [boundary] optional shoreline GeoJSON: clip parks to land so none spills
+            // into open water (e.g. Randall's/Ward's Island overshoot).
+            let boundary = args.get(5).map(String::as_str);
             ensure_parent(out)?;
-            parks::bake(geojson, out, borough)?;
+            parks::bake(geojson, out, borough, boundary)?;
             Ok(())
         }
         Some("bake-plazas") => {

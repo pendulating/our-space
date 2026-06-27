@@ -111,8 +111,11 @@ if [ ! -f "$PARKS_GEOJSON" ]; then
   curl -sS --compressed -o "$PARKS_GEOJSON" \
     "https://data.cityofnewyork.us/resource/enfh-gkve.geojson?\$select=multipolygon,signname,typecategory,borough,acres&\$limit=10000"
 fi
-"$BIN" bake-parks "$PARKS_GEOJSON" "$OUT/parks.ospark" M
-"$BIN" bake-parks "$PARKS_GEOJSON" "$OUT/parks_nyc.ospark" all
+# Clip parks to the shoreline (the borough-boundary land) so none spills into open
+# water (e.g. Randall's/Ward's Island park extents overshoot the bank).
+PARKS_BOUNDARY="$SNAP/boroughs/borough_boundaries.geojson"
+"$BIN" bake-parks "$PARKS_GEOJSON" "$OUT/parks.ospark" M "$PARKS_BOUNDARY"
+"$BIN" bake-parks "$PARKS_GEOJSON" "$OUT/parks_nyc.ospark" all "$PARKS_BOUNDARY"
 
 echo "==> pedestrian plazas (concrete + hatch) — one asset, both builds"
 # NYC DOT Pedestrian Plazas (k5k6-6jex); geometry column `the_geom`. Only ~93
