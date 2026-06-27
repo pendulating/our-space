@@ -339,6 +339,91 @@ impl Route {
     }
 }
 
+/// A turn-aware, speed-limit-capped pace for replaying a routed trip. Instead of
+/// gliding the whole origin→destination route at one constant speed, a vehicle
+/// **decelerates into turns and cruises on straights** (cruise capped at the posted
+/// limit) while still completing the trip in its real duration. `time_frac[i]` is
+/// the fraction of total trip time elapsed when the vehicle reaches route point `i`
+/// — so mapping the trip's elapsed-time fraction through it yields a piecewise pace.
+///
+/// Honesty about the limit: the profile shapes the trip relative to a limit-paced
+/// reference. When the trip's average speed is at/below the limit (the overwhelming
+/// majority of Manhattan trips, which crawl in traffic), every instantaneous speed
+/// stays at/below the limit. A trip whose data is *faster* than even a limit-paced
+/// traversal is replayed faithfully (the record itself implies speeding).
+#[derive(Debug, Clone)]
+pub struct PaceProfile {
+    /// Cumulative fraction of total trip time at each route point (monotonic,
+    /// `[0]==0`, `last==1`); same length as the route's points.
+    pub time_frac: Vec<f64>,
+}
+
+impl PaceProfile {
+    /// Build the pace for `route`: `limit_mps` caps cruise speed; a vertex whose turn
+    /// is sharp is taken at down to `turn_min_frac` of the limit (decelerate through
+    /// corners). Degenerate routes fall back to a constant pace (linear time↔arc).
+    pub fn for_route(route: &Route, limit_mps: f64, turn_min_frac: f64) -> Self {
+        let n = route.points.len();
+        if n < 2 || route.total_m <= 0.0 {
+            return PaceProfile { time_frac: vec![0.0; n.max(1)] };
+        }
+        // Per-vertex speed factor in [turn_min_frac, 1]: straight = 1, hairpin → min.
+        // Endpoints cruise. Interior vertices use the angle between the incoming and
+        // outgoing directions (dot of unit dirs = cos θ; 1 straight, -1 reversal).
+        let speed_factor = |i: usize| -> f64 {
+            if i == 0 || i + 1 >= n {
+                return 1.0;
+            }
+            let din = route.points[i].sub(route.points[i - 1]).normalize();
+            let dout = route.points[i + 1].sub(route.points[i]).normalize();
+            let straightness = ((din.dot(dout) + 1.0) * 0.5).clamp(0.0, 1.0); // 0..1
+            turn_min_frac + (1.0 - turn_min_frac) * straightness
+        };
+        let limit = limit_mps.max(0.1);
+        // Travel time of each segment i→i+1 at the slower of its two endpoints' speeds
+        // (so a vehicle is already slow approaching a corner and accelerating away).
+        let mut dt = Vec::with_capacity(n - 1);
+        let mut total_t = 0.0;
+        for i in 0..n - 1 {
+            let seg_len = route.cumulative_m[i + 1] - route.cumulative_m[i];
+            let v = limit * speed_factor(i).min(speed_factor(i + 1));
+            let d = seg_len / v.max(1e-6);
+            dt.push(d);
+            total_t += d;
+        }
+        let mut time_frac = Vec::with_capacity(n);
+        time_frac.push(0.0);
+        let mut acc = 0.0;
+        for d in &dt {
+            acc += d;
+            time_frac.push(if total_t > 0.0 { acc / total_t } else { 0.0 });
+        }
+        if let Some(last) = time_frac.last_mut() {
+            *last = 1.0; // guard against rounding
+        }
+        PaceProfile { time_frac }
+    }
+
+    /// Arc length (m) reached at trip-time fraction `frac` (0..1 of elapsed/duration),
+    /// inverting the pace. `route` supplies the arc lengths the `time_frac` align to.
+    pub fn arc_at(&self, route: &Route, frac: f64) -> f64 {
+        let frac = frac.clamp(0.0, 1.0);
+        let tf = &self.time_frac;
+        if tf.len() < 2 || route.total_m <= 0.0 {
+            return frac * route.total_m;
+        }
+        // First index whose cumulative time fraction is >= frac.
+        let j = match tf.binary_search_by(|c| c.partial_cmp(&frac).unwrap_or(std::cmp::Ordering::Equal)) {
+            Ok(i) => i.max(1),
+            Err(i) => i.clamp(1, tf.len() - 1),
+        };
+        let (t0, t1) = (tf[j - 1], tf[j]);
+        let local = if t1 > t0 { (frac - t0) / (t1 - t0) } else { 0.0 };
+        let (a0, a1) = (route.cumulative_m[j - 1], route.cumulative_m[j]);
+        a0 + (a1 - a0) * local
+    }
+}
+
 /// A walkshed (isochrone): the street network reachable within a time budget on
 /// foot from a start node.
 #[derive(Debug, Clone)]
@@ -488,5 +573,55 @@ mod tests {
         asset.nodes.push(NodePoint { x: 100.0, y: 100.0 });
         let g = StreetGraph::from_asset(asset);
         assert_eq!(g.route(0, 4), Err(RouteError::NoPath));
+    }
+
+    #[test]
+    fn pace_profile_endpoints_and_monotonic() {
+        // An L-shaped route with a 90° turn at the corner.
+        let r = Route::from_points(vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(100.0, 0.0),
+            Vec2::new(100.0, 100.0),
+        ]);
+        let p = PaceProfile::for_route(&r, 11.176, 0.3);
+        // time_frac is monotonic, spans 0..1, one per point.
+        assert_eq!(p.time_frac.len(), r.points.len());
+        assert_eq!(p.time_frac[0], 0.0);
+        assert!((p.time_frac.last().unwrap() - 1.0).abs() < 1e-9);
+        assert!(p.time_frac.windows(2).all(|w| w[1] >= w[0]));
+        // Arc maps endpoints exactly.
+        assert!(p.arc_at(&r, 0.0).abs() < 1e-9);
+        assert!((p.arc_at(&r, 1.0) - r.total_m).abs() < 1e-6);
+        // Monotonic arc in between.
+        assert!(p.arc_at(&r, 0.25) < p.arc_at(&r, 0.75));
+    }
+
+    #[test]
+    fn pace_profile_slows_through_turns() {
+        // A pure straight covers exactly half its arc at the half-time mark.
+        let straight = Route::from_points(vec![Vec2::new(0.0, 0.0), Vec2::new(200.0, 0.0)]);
+        let ps = PaceProfile::for_route(&straight, 11.176, 0.3);
+        assert!((ps.arc_at(&straight, 0.5) - 100.0).abs() < 1e-6);
+
+        // A route that runs straight, then turns: A→B→C straight, C→D a 90° turn. The
+        // vehicle banks distance early cruising the straight, then brakes for the turn,
+        // so by the time-midpoint it has covered MORE than half the arc (≠ constant).
+        let route = Route::from_points(vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(100.0, 0.0),
+            Vec2::new(200.0, 0.0),
+            Vec2::new(200.0, 200.0),
+        ]);
+        let p = PaceProfile::for_route(&route, 11.176, 0.3);
+        let half_arc = route.total_m * 0.5;
+        let mid = p.arc_at(&route, 0.5);
+        assert!(mid > half_arc + 1.0, "turn-aware pace should bank the straight early: {mid} vs {half_arc}");
+    }
+
+    #[test]
+    fn pace_profile_degenerate_is_linear() {
+        let r = Route::from_points(vec![Vec2::new(0.0, 0.0)]);
+        let p = PaceProfile::for_route(&r, 11.176, 0.3);
+        assert_eq!(p.arc_at(&r, 0.5), 0.0); // total_m == 0 → constant fallback
     }
 }

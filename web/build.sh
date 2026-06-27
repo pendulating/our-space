@@ -36,6 +36,13 @@ cp -r crates/app-interactive/assets "$OUT/assets"
 # Serve the bundle verbatim on GitHub Pages (no Jekyll processing).
 touch "$OUT/.nojekyll"
 
+echo "==> further-reading cards (web/content/reading/*.md -> reading.json)"
+if command -v python3 >/dev/null 2>&1; then
+  python3 tools/build_reading.py
+else
+  echo "   (python3 not found — skipping reading.json; the panel hides gracefully)"
+fi
+
 echo "==> done: $(du -sh "$OUT" | cut -f1) in $OUT"
 ls -lah "$OUT"/*.wasm
 echo "Serve:  python3 -m http.server -d $OUT 8080   (then open http://localhost:8080)"

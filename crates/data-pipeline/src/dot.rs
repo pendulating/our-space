@@ -18,6 +18,8 @@ use sim_core::assets::{FixedSensorData, FixedSensorLayer, Provenance};
 use sim_core::exposure::SourceKind;
 use sim_core::projection::{EnuProjection, GeoOrigin};
 
+use crate::extent::Extent;
+
 #[derive(Deserialize)]
 struct Cam {
     id: String,
@@ -31,13 +33,7 @@ struct Cam {
     // location, never the image or its URL.
 }
 
-/// Loose Manhattan bounding box (matches the Dahir/CCTV baker), as a second
-/// guard alongside the feed's `area` field.
-fn in_manhattan_bbox(lat: f64, lon: f64) -> bool {
-    (40.698..=40.882).contains(&lat) && (-74.022..=-73.906).contains(&lon)
-}
-
-pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
+pub fn bake(json_path: &str, out_path: &str, extent: Extent) -> Result<usize> {
     let proj = EnuProjection::default();
     let bytes = std::fs::read(json_path).with_context(|| format!("reading {json_path}"))?;
     let cams: Vec<Cam> = serde_json::from_slice(&bytes).context("parsing DOT cameras JSON")?;
@@ -47,7 +43,7 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
     let mut sensors = Vec::new();
     let mut offline = 0usize;
     for c in cams {
-        if c.area != "Manhattan" || !in_manhattan_bbox(c.latitude, c.longitude) {
+        if !extent.accepts_borough(&c.area) || !extent.contains_latlon(c.latitude, c.longitude) {
             continue;
         }
         // An offline camera isn't capturing; skip it (status fluctuates, so this
@@ -68,7 +64,11 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
             kind: SourceKind::DotLiveView,
         });
     }
-    anyhow::ensure!(!sensors.is_empty(), "no Manhattan DOT cameras parsed");
+    anyhow::ensure!(
+        !sensors.is_empty(),
+        "no DOT cameras parsed for extent {}",
+        extent.label()
+    );
 
     let layer = FixedSensorLayer {
         origin: GeoOrigin::MANHATTAN,
@@ -89,7 +89,8 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
     let n = layer.sensors.len();
     std::fs::write(out_path, layer.to_bytes()?).with_context(|| format!("writing {out_path}"))?;
     eprintln!(
-        "DOT cameras: {total} citywide, {n} Manhattan online baked ({offline} offline skipped) -> {out_path}"
+        "DOT cameras: {total} citywide, {n} online baked for {} ({offline} offline skipped) -> {out_path}",
+        extent.label()
     );
     Ok(n)
 }

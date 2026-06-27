@@ -27,7 +27,7 @@ use crate::dashcam::parse_zones;
 const DECIMATE_TOL_M: f64 = 5.0;
 
 /// Area-weighted centroid of a zone's largest ring (snapping handles the rest).
-fn zone_centroid(rings: &[Vec<[f64; 2]>]) -> Option<Vec2> {
+pub(crate) fn zone_centroid(rings: &[Vec<[f64; 2]>]) -> Option<Vec2> {
     let ring = rings.iter().max_by(|a, b| {
         ring_area(a).partial_cmp(&ring_area(b)).unwrap_or(std::cmp::Ordering::Equal)
     })?;
@@ -68,7 +68,7 @@ fn ring_area(ring: &[[f64; 2]]) -> f64 {
 }
 
 /// Douglas–Peucker polyline simplification on ENU points.
-fn decimate(points: &[Vec2], tol: f64) -> Vec<Vec2> {
+pub(crate) fn decimate(points: &[Vec2], tol: f64) -> Vec<Vec2> {
     if points.len() <= 2 {
         return points.to_vec();
     }

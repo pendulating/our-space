@@ -1,0 +1,17 @@
+{
+  "name": "our-space-inspect",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless-Chrome inspector for the WebGPU/WASM our-space web build (localhost:8080).",
+  "bin": {
+    "inspect": "./inspect.mjs"
+  },
+  "scripts": {
+    "shot": "node inspect.mjs",
+    "serve": "python3 -m http.server -d ../../web/dist 8080"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

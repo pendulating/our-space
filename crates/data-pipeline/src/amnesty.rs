@@ -22,19 +22,15 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use sim_core::assets::{FixedSensorData, FixedSensorLayer, Provenance};
-use sim_core::exposure::SourceKind;
+use sim_core::assets::{CctvCamera, CctvCameraLayer, CctvSource, Provenance};
 use sim_core::projection::{EnuProjection, GeoOrigin};
+
+use crate::extent::Extent;
 
 /// A Dahir camera within this distance of an Amnesty intersection that already
 /// reports ≥1 camera is treated as the same corner's cameras and dropped.
 /// Intersection-scale: Manhattan corners are ~80–200 m apart.
 const DEDUP_RADIUS_M: f64 = 50.0;
-
-/// Loose Manhattan bounding box (matches the other fixed-camera bakers).
-fn in_manhattan_bbox(lat: f64, lon: f64) -> bool {
-    (40.698..=40.882).contains(&lat) && (-74.022..=-73.906).contains(&lon)
-}
 
 /// One row of Amnesty `counts_per_intersections.csv` (only the fields we use;
 /// the CSV's other columns are ignored by the deserializer).
@@ -58,16 +54,18 @@ struct DahirRow {
     lat: f64,
     lon: f64,
     city: String,
+    year: Option<u16>,
+    month: Option<u8>,
     camera_count: i32,
 }
 
-pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str) -> Result<usize> {
+pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str, extent: Extent) -> Result<usize> {
     let proj = EnuProjection::default();
 
-    // --- 1. Amnesty: Manhattan intersections reporting ≥1 camera. Each becomes
+    // --- 1. Amnesty: in-extent intersections reporting ≥1 camera. Each becomes
     // `n` omnidirectional cameras at the panorama point (the aggregate has no
     // per-camera bearing). Track the intersection points for de-duplication. ---
-    let mut sensors = Vec::new();
+    let mut cameras = Vec::new();
     let mut amnesty_points: Vec<(f64, f64)> = Vec::new(); // ENU
     let mut amnesty_cams = 0usize;
     let mut rdr = csv::Reader::from_path(amnesty_csv)
@@ -75,7 +73,7 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str) -> Result<usize>
     for rec in rdr.deserialize::<AmnestyRow>() {
         let row = rec.context("parsing counts_per_intersections.csv row")?;
         let (Some(lat), Some(lon)) = (row.lat, row.lon) else { continue };
-        if row.boro != "Manhattan" || !in_manhattan_bbox(lat, lon) {
+        if !extent.accepts_borough(&row.boro) || !extent.contains_latlon(lat, lon) {
             continue;
         }
         let n = row.n_cameras_median.unwrap_or(0.0).round() as i64;
@@ -85,16 +83,23 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str) -> Result<usize>
         let p = proj.to_enu(lat, lon);
         amnesty_points.push((p.x, p.y));
         for _ in 0..n {
-            sensors.push(FixedSensorData {
+            cameras.push(CctvCamera {
                 x: p.x,
                 y: p.y,
                 heading_deg: None, // intersection-aggregated: omnidirectional
-                kind: SourceKind::FixedCctv,
+                source: CctvSource::Amnesty,
+                panoid: None,
+                year: None,
+                month: None,
             });
             amnesty_cams += 1;
         }
     }
-    anyhow::ensure!(!amnesty_points.is_empty(), "no Manhattan Amnesty intersections parsed");
+    anyhow::ensure!(
+        !amnesty_points.is_empty(),
+        "no Amnesty intersections parsed for extent {}",
+        extent.label()
+    );
 
     // --- 2. Dahir: keep only detections that don't duplicate an Amnesty corner. ---
     let r2 = DEDUP_RADIUS_M * DEDUP_RADIUS_M;
@@ -107,7 +112,7 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str) -> Result<usize>
         if row.city != "New York" || row.camera_count < 1 {
             continue;
         }
-        if !in_manhattan_bbox(row.lat, row.lon) || !seen.insert(row.panoid.clone()) {
+        if !extent.contains_latlon(row.lat, row.lon) || !seen.insert(row.panoid.clone()) {
             continue;
         }
         dahir_total += 1;
@@ -119,17 +124,20 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str) -> Result<usize>
             continue;
         }
         dahir_kept += 1;
-        sensors.push(FixedSensorData {
+        cameras.push(CctvCamera {
             x: p.x,
             y: p.y,
             heading_deg: Some(row.heading), // Dahir carries a GSV capture bearing
-            kind: SourceKind::FixedCctv,
+            source: CctvSource::Dahir,
+            panoid: Some(row.panoid),
+            year: row.year,
+            month: row.month,
         });
     }
 
-    let layer = FixedSensorLayer {
+    let layer = CctvCameraLayer {
         origin: GeoOrigin::MANHATTAN,
-        sensors,
+        cameras,
         // Merged census dominated by Amnesty's direct counts — the Dahir ML
         // detector recall (~0.63) does not apply to the set, so no correction.
         recall: None,
@@ -146,11 +154,12 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str) -> Result<usize>
         },
     };
 
-    let n = layer.sensors.len();
+    let n = layer.cameras.len();
     std::fs::write(out_path, layer.to_bytes()?).with_context(|| format!("writing {out_path}"))?;
     eprintln!(
-        "Fixed CCTV (merged): {amnesty_cams} Amnesty + {dahir_kept}/{dahir_total} Dahir-unique \
-         = {n} cameras -> {out_path}"
+        "Fixed CCTV (merged, {}): {amnesty_cams} Amnesty + {dahir_kept}/{dahir_total} Dahir-unique \
+         = {n} cameras -> {out_path}",
+        extent.label()
     );
     Ok(n)
 }

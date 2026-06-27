@@ -67,7 +67,7 @@ pub(crate) fn parse_zones(
     Ok(out)
 }
 
-fn shoelace_area(ring: &[[f64; 2]]) -> f64 {
+pub(crate) fn shoelace_area(ring: &[[f64; 2]]) -> f64 {
     let n = ring.len();
     if n < 3 {
         return 0.0;
@@ -81,7 +81,7 @@ fn shoelace_area(ring: &[[f64; 2]]) -> f64 {
     (s * 0.5).abs()
 }
 
-fn bbox(ring: &[[f64; 2]]) -> [f64; 4] {
+pub(crate) fn bbox(ring: &[[f64; 2]]) -> [f64; 4] {
     let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
     for p in ring {
         b[0] = b[0].min(p[0]);

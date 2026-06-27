@@ -13,8 +13,12 @@ bevy_prototype_lyon = { workspace = true }
 rstar = { workspace = true }
 earcutr = { workspace = true }
 serde = { workspace = true }
+serde_json = "1"
 postcard = { workspace = true }
 anyhow = { workspace = true }
+# Cross-platform non-blocking HTTP (native threads / browser fetch) for the NYC
+# GeoSearch address geocoder — works on both the native dev build and the WASM build.
+ehttp = "0.5"
 
 # Base Bevy feature set, shared by native + web. Declared in [dependencies] (not
 # only in target tables) so Bevy's derive macros resolve crate paths correctly.
@@ -33,6 +37,11 @@ features = [
     "bevy_asset",
     "bevy_log",
     "async_executor",
+    # World-space column headers (Operators view) use Text2d. Pin these explicitly
+    # rather than relying on bevy_prototype_lyon transitively pulling the bevy
+    # umbrella's defaults — a future dep bump could otherwise drop them.
+    "bevy_text",
+    "default_font",
 ]
 
 # Native extras (desktop windowing + parallelism). x11/wayland are Linux-only and
@@ -45,3 +54,5 @@ bevy = { version = "0.18", features = ["x11", "wayland", "multi_threaded"] }
 bevy = { version = "0.18", features = ["webgpu", "web"] }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
+# Read `?story=…` for deep-linkable StoryMaps.
+web-sys = { version = "0.3", features = ["Window", "Location"] }

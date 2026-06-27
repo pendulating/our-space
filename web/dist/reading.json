@@ -1,0 +1,47 @@
+[
+  {
+    "title": "Privacy of Groups in Dense Street Imagery",
+    "source": "Franchi, Sandhaus, Choksi, Engelmann, Ju & Nissenbaum · ACM FAccT 2025",
+    "kind": "paper",
+    "url": "https://dl.acm.org/doi/full/10.1145/3715275.3732185",
+    "order": "1",
+    "blurb": "When the sidewalk is photographed at scale, it isn't only individuals who are captured but whole groups — and group privacy is exactly what conventional, person-by-person protections miss.",
+    "image": "reading-img/01-privacy-of-groups.jpg"
+  },
+  {
+    "title": "Detecting disparities in police deployments using dashcam data",
+    "source": "Franchi, Zamfirescu-Pereira, Ju & Pierson · ACM FAccT 2023",
+    "kind": "paper",
+    "url": "https://dl.acm.org/doi/10.1145/3593013.3594020",
+    "order": "2",
+    "blurb": "A fleet of rideshare dashcams becomes a city-scale sensing network — here, to measure where police are deployed across New York and surface the disparities in who gets watched.",
+    "image": "reading-img/02-police-deployment-dashcams.jpg"
+  },
+  {
+    "title": "Nexar dashcam video database hacked",
+    "source": "Pieter Arntz · Malwarebytes Labs · Sept 2025",
+    "kind": "article",
+    "url": "https://www.malwarebytes.com/blog/news/2025/09/nexar-dashcam-video-database-hacked",
+    "order": "3",
+    "blurb": "A breach exposed 130+ TB of dashcam footage from Nexar's cloud — a concrete reminder that the dashcam layer in this map is a real, breachable archive of faces and places.",
+    "image": "reading-img/03-nexar-dashcam-breach.jpg"
+  },
+  {
+    "title": "Bill requiring smart glasses to show a recording indicator",
+    "source": "Rep. Joe Ciresi (H.B. 2603) · PA House · June 2026",
+    "kind": "policy",
+    "url": "https://www.pahouse.com/InTheNews/NewsRelease/?id=143905",
+    "order": "4",
+    "blurb": "Pennsylvania moves to mandate a visible light whenever smart glasses record — a direct policy response to the covert-capture problem the \"In 5 years…\" glasses layer imagines.",
+    "image": "reading-img/04-smart-glasses-recording-indicator.jpg"
+  },
+  {
+    "title": "Meta's Ray-Ban glasses users film and harass massage-parlor workers",
+    "source": "Emanuel Maiberg · 404 Media · Oct 2025",
+    "kind": "article",
+    "url": "https://www.404media.co/metas-ray-ban-glasses-users-film-and-harass-massage-parlor-workers/",
+    "order": "5",
+    "blurb": "Instagram accounts with huge followings repost covert Ray-Ban-glasses footage of people at massage parlors — the smart-glasses layer's harm, already here, not five years out.",
+    "image": "reading-img/05-rayban-glasses-harassment.jpg"
+  }
+]

@@ -6,12 +6,15 @@
 //! [`Route`]; here we sample position(t) at constant speed and, at each tick,
 //! test the walker against every sensor's capture geometry.
 
-use crate::assets::DashcamFieldLayer;
+use crate::assets::{DashcamFieldLayer, RobotabilityField, TeslaField};
 use crate::exposure::{ExposureTally, SourceKind};
 use crate::geometry::{captures, FrustumWedge, OccluderEdge};
 use crate::graph::Route;
 use crate::math::{point_segment_distance, Vec2};
-use crate::mobile::{bus_headway_minutes, pedestrian_multiplier, traffic_multiplier, MobileScenario};
+use crate::mobile::{
+    bus_headway_minutes, pedestrian_multiplier, robot_activity_multiplier, traffic_multiplier,
+    MobileScenario, RealDayRates,
+};
 
 /// A placed fixed sensor ready for capture testing.
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +25,14 @@ pub struct SensorInstance {
     /// Stable id for distinct-device counting.
     pub id: u64,
     pub kind: SourceKind,
+    /// Physical-camera group id (co-located sensors across sources share one), so
+    /// the headline counts a camera attested by multiple sources only once. Set by
+    /// [`crate::scenario::group_sensors`]; defaults to a per-sensor unique group.
+    pub group: u32,
+    /// Whether this group is confirmed by a *surveyed* source (DOT/ALPR/enforcement)
+    /// — confirmed groups count at face value; street-view-CCTV-only groups keep the
+    /// recall inflation.
+    pub confirmed: bool,
 }
 
 /// Parameters for a simulation run.
@@ -54,7 +65,9 @@ pub fn simulate_fixed(
     occluders: &[OccluderEdge],
     params: SimParams,
 ) -> ExposureTally {
-    simulate_full(route, sensors, occluders, &MobileScenario::default(), params, 12.0, None)
+    simulate_full(
+        route, sensors, occluders, &MobileScenario::default(), params, 12.0, None, None, None, None,
+    )
 }
 
 /// Full exposure simulation: fixed cameras + the enabled mobile/ambient classes,
@@ -73,6 +86,9 @@ pub fn simulate_full(
     params: SimParams,
     departure_hour: f64,
     dashcam_field: Option<&DashcamFieldLayer>,
+    robot_field: Option<&RobotabilityField>,
+    tesla_field: Option<&TeslaField>,
+    real: Option<&RealDayRates>,
 ) -> ExposureTally {
     let mut tally = ExposureTally::new();
     tally.recall_factor = params.recall_factor;
@@ -94,7 +110,7 @@ pub fn simulate_full(
         let mut covered_here = false;
         for s in fixed {
             if captures(&s.wedge, *pos, occluders) {
-                tally.record_fixed_capture(s.kind, s.id, s.frame_rate, tick_dt);
+                tally.record_fixed_capture(s.kind, s.id, s.group, s.confirmed, s.frame_rate, tick_dt);
                 covered_here = true;
             }
         }
@@ -107,7 +123,9 @@ pub fn simulate_full(
                 .map(|[a, b]| point_segment_distance(*pos, *a, *b))
                 .fold(f64::INFINITY, f64::min);
             if nearest <= ace.capture_range_m {
-                let headway_s = (bus_headway_minutes(hour) * 60.0 * ace.headway_scale).max(1.0);
+                // Real timetable headway for this minute when available, else synthetic.
+                let headway_min = real.map_or_else(|| bus_headway_minutes(hour), |r| r.ace_headway_at(hour));
+                let headway_s = (headway_min * 60.0 * ace.headway_scale).max(1.0);
                 let encounters = (ace.directions / headway_s) * tick_dt;
                 tally.record_mobile(SourceKind::AceBus, encounters, encounters * ace.frames_per_pass);
             }
@@ -117,7 +135,9 @@ pub fn simulate_full(
         //     (real TLC trip field) × diurnal traffic ---
         if let Some(d) = &mobile.dashcam {
             let zone = dashcam_field.map_or(1.0, |f| f.intensity_at(*pos));
-            let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour) * zone;
+            // Real per-minute rideshare volume for this minute when available, else synthetic.
+            let traffic = real.map_or_else(|| traffic_multiplier(hour), |r| r.taxi_mult_at(hour));
+            let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic * zone;
             let encounters = veh_per_s * d.penetration * d.capture_prob * tick_dt;
             tally.record_mobile(SourceKind::Dashcam, encounters, encounters * d.frames_per_pass);
         }
@@ -128,6 +148,26 @@ pub fn simulate_full(
             let encounters =
                 peds_per_s * (g.per_1000_pedestrians / 1000.0) * g.p_recording * g.capture_prob * tick_dt;
             tally.record_mobile(SourceKind::SmartGlasses, encounters, encounters * g.frames_per_pass);
+        }
+
+        // --- sidewalk delivery robots (speculative): always-on nav cameras whose
+        //     local density follows the Robotability Score field × a delivery
+        //     operating-hours curve ---
+        if let Some(rb) = &mobile.robots {
+            let score = robot_field.map_or(0.3, |f| f.score_at(*pos, 0.1) as f64);
+            let robots_per_s = (rb.robots_per_min_peak / 60.0) * robot_activity_multiplier(hour) * score;
+            let encounters = robots_per_s * rb.capture_prob * tick_dt;
+            tally.record_mobile(SourceKind::DeliveryRobot, encounters, encounters * rb.frames_per_pass);
+        }
+
+        // --- Tesla cameras: always-on (Sentry parked + Autopilot driving); local
+        //     density follows private Tesla registrations (the Tesla field). No
+        //     diurnal term — Sentry records 24/7. ---
+        if let Some(ts) = &mobile.tesla {
+            let dens = tesla_field.map_or(1.0, |f| f.intensity_at(*pos, 0.1));
+            let teslas_per_s = (ts.teslas_per_min_peak / 60.0) * dens;
+            let encounters = teslas_per_s * ts.capture_prob * tick_dt;
+            tally.record_mobile(SourceKind::TeslaCamera, encounters, encounters * ts.frames_per_pass);
         }
 
         if let Some(p) = prev {
@@ -148,11 +188,13 @@ pub struct ExposureRates {
     pub ace: f64,
     pub dashcam: f64,
     pub glasses: f64,
+    pub robots: f64,
+    pub tesla: f64,
 }
 
 impl ExposureRates {
     pub fn total(&self) -> f64 {
-        self.fixed + self.ace + self.dashcam + self.glasses
+        self.fixed + self.ace + self.dashcam + self.glasses + self.robots + self.tesla
     }
 }
 
@@ -173,29 +215,49 @@ pub fn exposure_rates_per_minute(
     mobile: &MobileScenario,
     recall_factor: f64,
     dashcam_field: Option<&DashcamFieldLayer>,
+    robot_field: Option<&RobotabilityField>,
+    tesla_field: Option<&TeslaField>,
+    real: Option<&RealDayRates>,
 ) -> ExposureRates {
     let mut r = ExposureRates::default();
 
-    r.fixed = nearby_fixed
-        .iter()
-        .filter(|s| captures(&s.wedge, point, occluders))
-        .count() as f64
-        * recall_factor;
+    // Distinct physical cameras covering the point (co-located cross-source cameras
+    // once), recall-inflating only CCTV-census-only (unconfirmed) groups.
+    let mut groups: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+    for s in nearby_fixed {
+        if captures(&s.wedge, point, occluders) {
+            let e = groups.entry(s.group).or_insert(false);
+            *e = *e || s.confirmed;
+        }
+    }
+    r.fixed = groups.values().map(|&c| if c { 1.0 } else { recall_factor }).sum();
 
     if near_ace {
         if let Some(ace) = &mobile.ace {
-            let headway_s = (bus_headway_minutes(hour) * 60.0 * ace.headway_scale).max(1.0);
+            let headway_min = real.map_or_else(|| bus_headway_minutes(hour), |r| r.ace_headway_at(hour));
+            let headway_s = (headway_min * 60.0 * ace.headway_scale).max(1.0);
             r.ace = (ace.directions / headway_s) * 60.0;
         }
     }
     if let Some(d) = &mobile.dashcam {
         let zone = dashcam_field.map_or(1.0, |f| f.intensity_at(point));
-        let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic_multiplier(hour) * zone;
+        let traffic = real.map_or_else(|| traffic_multiplier(hour), |rr| rr.taxi_mult_at(hour));
+        let veh_per_s = (d.vehicles_per_min_peak / 60.0) * traffic * zone;
         r.dashcam = veh_per_s * d.penetration * d.capture_prob * 60.0;
     }
     if let Some(g) = &mobile.glasses {
         let peds_per_s = (g.peds_per_min_peak / 60.0) * pedestrian_multiplier(hour);
         r.glasses = peds_per_s * (g.per_1000_pedestrians / 1000.0) * g.p_recording * g.capture_prob * 60.0;
+    }
+    if let Some(rb) = &mobile.robots {
+        let score = robot_field.map_or(0.3, |f| f.score_at(point, 0.1) as f64);
+        let robots_per_s = (rb.robots_per_min_peak / 60.0) * robot_activity_multiplier(hour) * score;
+        r.robots = robots_per_s * rb.capture_prob * 60.0;
+    }
+    if let Some(ts) = &mobile.tesla {
+        let dens = tesla_field.map_or(1.0, |f| f.intensity_at(point, 0.1));
+        let teslas_per_s = (ts.teslas_per_min_peak / 60.0) * dens;
+        r.tesla = teslas_per_s * ts.capture_prob * 60.0;
     }
     r
 }
@@ -206,7 +268,7 @@ mod tests {
     use crate::exposure::DAHIR_RECALL;
     use crate::geometry::OccluderEdge;
     use crate::graph::Route;
-    use crate::mobile::{AceConfig, DashcamConfig, MobileScenario};
+    use crate::mobile::{AceConfig, DashcamConfig, MobileScenario, RobotConfig, TeslaConfig};
 
     fn straight_route() -> Route {
         // 0..20 m along +x.
@@ -219,6 +281,8 @@ mod tests {
             frame_rate: 15.0,
             id: 1,
             kind: SourceKind::FixedCctv,
+            group: 1,
+            confirmed: false,
         }
     }
 
@@ -257,8 +321,8 @@ mod tests {
         let route = straight_route();
         // Two cameras covering the route from opposite sides.
         let cams = [
-            SensorInstance { id: 1, ..cam_at(7.0, 5.0, 180.0) },
-            SensorInstance { id: 2, ..cam_at(13.0, -5.0, 0.0) },
+            SensorInstance { id: 1, group: 1, ..cam_at(7.0, 5.0, 180.0) },
+            SensorInstance { id: 2, group: 2, ..cam_at(13.0, -5.0, 0.0) },
         ];
         let params = SimParams { recall_factor: 1.0 / DAHIR_RECALL, ..SimParams::default() };
         let t = simulate_fixed(&route, &cams, &[], params);
@@ -272,9 +336,9 @@ mod tests {
         let route = straight_route();
         // Corridor coincident with the walked route.
         let ace = AceConfig::new(vec![[Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0)]]);
-        let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None };
+        let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None, robots: None, tesla: None };
         let dev = |hour| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None)
+            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, None)
                 .source(SourceKind::AceBus)
                 .devices
         };
@@ -289,8 +353,8 @@ mod tests {
         let route = straight_route();
         // Corridor 100 m away — beyond the 20 m capture range.
         let ace = AceConfig::new(vec![[Vec2::new(0.0, 100.0), Vec2::new(20.0, 100.0)]]);
-        let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None };
-        let t = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.0, None);
+        let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None, robots: None, tesla: None };
+        let t = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.0, None, None, None, None);
         assert_eq!(t.source(SourceKind::AceBus).devices, 0.0);
     }
 
@@ -301,11 +365,13 @@ mod tests {
             ace: None,
             dashcam: Some(DashcamConfig::default()),
             glasses: None,
+            robots: None,
+            tesla: None,
         };
-        let peak = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.5, None)
+        let peak = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.5, None, None, None, None)
             .source(SourceKind::Dashcam)
             .devices;
-        let night = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 3.0, None)
+        let night = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 3.0, None, None, None, None)
             .source(SourceKind::Dashcam)
             .devices;
         assert!(night > 0.0);
@@ -317,7 +383,7 @@ mod tests {
         // Camera at (0,5) looking south covers the origin (5 m away, in range).
         let cam = cam_at(0.0, 5.0, 180.0);
         let fixed_only =
-            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &[], false, &MobileScenario::default(), 1.0, None);
+            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &[], false, &MobileScenario::default(), 1.0, None, None, None, None);
         assert!((fixed_only.fixed - 1.0).abs() < 1e-9, "one covering camera, got {}", fixed_only.fixed);
         assert_eq!(fixed_only.ace, 0.0);
 
@@ -325,10 +391,88 @@ mod tests {
             ace: Some(AceConfig::new(vec![])),
             dashcam: Some(DashcamConfig::default()),
             glasses: None,
+            robots: None,
+            tesla: None,
         };
         let with_mobile =
-            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &[], true, &mobile, 1.0, None);
+            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &[], true, &mobile, 1.0, None, None, None, None);
         assert!(with_mobile.ace > 0.0 && with_mobile.dashcam > 0.0);
         assert!(with_mobile.total() > fixed_only.total());
+    }
+
+    #[test]
+    fn real_day_headway_drives_ace_over_synthetic() {
+        let route = straight_route();
+        let ace = AceConfig::new(vec![[Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0)]]);
+        let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None, robots: None, tesla: None };
+        // Real schedule: frequent service at 08:00 (2 min headway), sparse at 03:00.
+        let mut ace_headway_min = vec![10.0; 1440];
+        ace_headway_min[8 * 60] = 2.0;
+        ace_headway_min[3 * 60] = 40.0;
+        let real = RealDayRates { ace_headway_min, taxi_traffic_mult: Vec::new() };
+        let dev = |hour: f64| {
+            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, Some(&real))
+                .source(SourceKind::AceBus)
+                .devices
+        };
+        // The real per-minute headway, not the synthetic curve, sets the rate.
+        assert!(dev(8.0) > dev(3.0), "real headway should drive ACE: 8h={} 3h={}", dev(8.0), dev(3.0));
+    }
+
+    #[test]
+    fn robots_scale_with_activity_curve() {
+        let route = straight_route();
+        let mobile = MobileScenario {
+            ace: None,
+            dashcam: None,
+            glasses: None,
+            robots: Some(RobotConfig::default()),
+            tesla: None,
+        };
+        let dev = |hour: f64| {
+            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, None)
+                .source(SourceKind::DeliveryRobot)
+                .devices
+        };
+        // Speculative robots peak at meal times; near-zero overnight.
+        assert!(dev(12.0) > 0.0);
+        assert!(dev(12.0) > dev(3.0), "lunch {} should exceed 3am {}", dev(12.0), dev(3.0));
+    }
+
+    #[test]
+    fn tesla_always_on_no_diurnal() {
+        let route = straight_route();
+        let mobile = MobileScenario {
+            ace: None,
+            dashcam: None,
+            glasses: None,
+            robots: None,
+            tesla: Some(TeslaConfig::default()),
+        };
+        let dev = |hour: f64| {
+            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, None)
+                .source(SourceKind::TeslaCamera)
+                .devices
+        };
+        // Sentry/Autopilot record 24/7: positive exposure, flat across the day.
+        assert!(dev(3.0) > 0.0);
+        assert!((dev(3.0) - dev(14.0)).abs() < 1e-9, "Teslas should be always-on (no diurnal term)");
+    }
+
+    #[test]
+    fn real_day_taxi_volume_drives_dashcam_over_synthetic() {
+        let route = straight_route();
+        let mobile = MobileScenario { ace: None, dashcam: Some(DashcamConfig::default()), glasses: None, robots: None, tesla: None };
+        // Real volume: peak at 09:00, trough at 04:00.
+        let mut taxi_traffic_mult = vec![0.1; 1440];
+        taxi_traffic_mult[9 * 60] = 1.0;
+        taxi_traffic_mult[4 * 60] = 0.05;
+        let real = RealDayRates { ace_headway_min: Vec::new(), taxi_traffic_mult };
+        let dev = |hour: f64| {
+            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, Some(&real))
+                .source(SourceKind::Dashcam)
+                .devices
+        };
+        assert!(dev(9.0) > dev(4.0), "real volume should drive dashcam: 9h={} 4h={}", dev(9.0), dev(4.0));
     }
 }

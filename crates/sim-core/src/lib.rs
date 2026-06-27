@@ -30,14 +30,14 @@ pub mod ecs;
 // Convenience re-exports.
 pub use exposure::{ConfidenceTier, ExposureTally, SourceKind, DAHIR_RECALL};
 pub use geometry::{captures, FrustumWedge, OccluderEdge};
-pub use graph::{Route, RouteError, StreetGraph, Walkshed, DEFAULT_WALK_SPEED_MPS};
+pub use graph::{PaceProfile, Route, RouteError, StreetGraph, Walkshed, DEFAULT_WALK_SPEED_MPS};
 pub use math::Vec2;
-pub use mobile::{AceConfig, DashcamConfig, GlassesConfig, MobileScenario};
+pub use mobile::{AceConfig, DashcamConfig, GlassesConfig, MobileScenario, RobotConfig, TeslaConfig};
 pub use projection::{EnuProjection, GeoOrigin};
 pub use rng::{RngLike, WyRand};
 pub use scenario::{
-    run_route, sensors_from_layer, summarize, walkshed_exposure, FixedCameraDefaults, RouteSummary,
-    SourceBreakdown, WalkshedSummary,
+    group_sensors, run_route, sensors_from_layer, summarize, walkshed_exposure, FixedCameraDefaults,
+    RouteSummary, SourceBreakdown, WalkshedSummary,
 };
 pub use simulation::{
     exposure_rates_per_minute, simulate_fixed, simulate_full, ExposureRates, SensorInstance,

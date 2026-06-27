@@ -58,6 +58,32 @@ fn is_kept_highway(hw: &str) -> bool {
     )
 }
 
+/// Highway types kept for the **drive** network (vehicle/taxi routing): the walk
+/// keep-set minus `pedestrian` (plazas like Broadway at Union Square are
+/// `highway=pedestrian` — legal to walk, not to drive). `living_street` stays (a
+/// shared zone vehicles may use at walking pace). `service`/`motorway` aren't in the
+/// walk-network OSM dump, so the set is otherwise identical.
+fn is_drivable_highway(hw: &str) -> bool {
+    is_kept_highway(hw) && hw != "pedestrian"
+}
+
+/// Whether motor vehicles are legally allowed on a way, from its access tags —
+/// catches pedestrian zones tagged on a drivable street type (e.g. `motor_vehicle=no`).
+fn drive_allowed(tags: &HashMap<String, String>) -> bool {
+    let restricted = |v: Option<&String>| matches!(v.map(String::as_str), Some("no") | Some("private"));
+    if restricted(tags.get("motor_vehicle")) || restricted(tags.get("vehicle")) {
+        return false;
+    }
+    // `access=no/private` blocks unless `motor_vehicle` explicitly re-permits it.
+    if restricted(tags.get("access")) {
+        let mv = tags.get("motor_vehicle").map(String::as_str);
+        if !matches!(mv, Some("yes") | Some("permissive") | Some("destination") | Some("designated")) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Intern an OSM node id into a compact graph-node index, recording its ENU
 /// position the first time it is seen.
 fn intern(
@@ -110,12 +136,25 @@ impl UnionFind {
     }
 }
 
-pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
+pub fn bake(
+    json_path: &str,
+    out_path: &str,
+    boundary_geojson: Option<&str>,
+    drive: bool,
+) -> anyhow::Result<(usize, usize)> {
     let data = std::fs::read(json_path).with_context(|| format!("reading {json_path}"))?;
     let resp: OverpassResponse =
         serde_json::from_slice(&data).context("parsing Overpass JSON")?;
 
     let proj = EnuProjection::default();
+
+    // Optional Manhattan clip: an Overpass bbox query pulls in Bronx streets that,
+    // joined to the island by bridges, survive the largest-component step. Drop any
+    // edge with an endpoint outside the borough so the kept network — and every
+    // graph-bound agent that walks it — stays on Manhattan.
+    let boundary = boundary_geojson
+        .map(crate::boundary::ManhattanBoundary::load)
+        .transpose()?;
 
     // 1. Node coords (projected) + ways, filtered to the street-centerline
     //    keep-set (drops separately-mapped sidewalks/footways/steps/etc.).
@@ -131,11 +170,13 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
             }
             "way" if el.nodes.len() >= 2 => {
                 total_ways += 1;
-                // Keep a way if it carries a kept highway tag. Untagged ways
-                // (geometry-only dumps) are kept so a tagless export still works.
+                // Keep a way if it carries a kept highway tag. For the drive network,
+                // exclude pedestrian plazas + access-restricted ways. Untagged ways
+                // (geometry-only dumps) are kept only for the walk network.
                 let keep = match el.tags.get("highway") {
+                    Some(hw) if drive => is_drivable_highway(hw) && drive_allowed(&el.tags),
                     Some(hw) => is_kept_highway(hw),
-                    None => el.tags.is_empty(),
+                    None => !drive && el.tags.is_empty(),
                 };
                 if keep {
                     kept_ways += 1;
@@ -145,7 +186,10 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
             _ => {}
         }
     }
-    eprintln!("OSM ways: {kept_ways}/{total_ways} kept (street centerlines)");
+    eprintln!(
+        "OSM ways: {kept_ways}/{total_ways} kept ({})",
+        if drive { "drivable centerlines" } else { "walk centerlines" }
+    );
 
     // 2. Usage counts -> which nodes are graph (split) nodes.
     let mut usage: HashMap<i64, u32> = HashMap::new();
@@ -186,10 +230,21 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
                                 prev = Some(*p);
                             }
                         }
+                        // Manhattan clip: keep the edge only if both endpoints are
+                        // inside the borough (drops Bronx streets + the bridge spans
+                        // that connect them, which otherwise ride the largest
+                        // component). No clip → keep everything (legacy behavior).
+                        let in_bounds = match &boundary {
+                            Some(b) => {
+                                poly.first().is_some_and(|&p| b.contains(p))
+                                    && poly.last().is_some_and(|&p| b.contains(p))
+                            }
+                            None => true,
+                        };
                         let a = intern(ns[start], &coords, &mut id_to_index, &mut points);
                         let b = intern(ns[pos], &coords, &mut id_to_index, &mut points);
                         if let (Some(a), Some(b)) = (a, b) {
-                            if a != b && len > 0.0 {
+                            if a != b && len > 0.0 && in_bounds {
                                 edges.push(EdgeData {
                                     from: a,
                                     to: b,
@@ -208,23 +263,61 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
 
     anyhow::ensure!(!points.is_empty(), "no graph nodes parsed from Overpass dump");
 
-    // 4. Largest connected component.
+    // 4. Keep the largest connected component (so A* always succeeds within it).
+    let (new_nodes, new_edges) = largest_component(points, edges);
+    let (n, m) = (new_nodes.len(), new_edges.len());
+    let asset = GraphAsset {
+        origin: GeoOrigin::MANHATTAN,
+        nodes: new_nodes,
+        edges: new_edges,
+        provenance: Provenance {
+            source: format!(
+                "OpenStreetMap via Overpass API ({} network)",
+                if drive { "drive" } else { "walk" }
+            ),
+            url: "https://overpass-api.de/".into(),
+            license: "ODbL 1.0".into(),
+            as_of: "2026-06-14".into(),
+            notes: format!(
+                "Manhattan {}-usable highways; largest connected component; \
+                 street-centerline (not sidewalk-accurate){}.",
+                if drive { "motor-vehicle" } else { "pedestrian" },
+                if boundary.is_some() {
+                    "; clipped to the Manhattan borough boundary"
+                } else {
+                    ""
+                }
+            ),
+        },
+    };
+    std::fs::write(out_path, asset.to_bytes()?).with_context(|| format!("writing {out_path}"))?;
+    eprintln!(
+        "OSM {} graph: {n} nodes, {m} edges (largest component) -> {out_path}",
+        if drive { "drive" } else { "walk" }
+    );
+    Ok((n, m))
+}
+
+/// Keep only the largest connected component and remap its nodes to compact indices.
+/// Shared by the Overpass and CSCL bakes so A* always succeeds within the kept graph.
+fn largest_component(
+    points: Vec<NodePoint>,
+    edges: Vec<EdgeData>,
+) -> (Vec<NodePoint>, Vec<EdgeData>) {
+    if points.is_empty() {
+        return (points, edges);
+    }
     let mut uf = UnionFind::new(points.len());
     for e in &edges {
         uf.union(e.from, e.to);
     }
     let mut comp_size: HashMap<u32, u32> = HashMap::new();
     for i in 0..points.len() as u32 {
-        let r = uf.find(i);
-        *comp_size.entry(r).or_default() += 1;
+        *comp_size.entry(uf.find(i)).or_default() += 1;
     }
-    let largest_root = comp_size
-        .iter()
-        .max_by_key(|(_, &s)| s)
-        .map(|(&r, _)| r)
-        .context("no components")?;
-
-    // 5. Remap kept nodes to compact indices.
+    let Some(largest_root) = comp_size.iter().max_by_key(|(_, &s)| s).map(|(&r, _)| r) else {
+        return (Vec::new(), Vec::new());
+    };
     let mut old_to_new: HashMap<u32, u32> = HashMap::new();
     let mut new_nodes: Vec<NodePoint> = Vec::new();
     for i in 0..points.len() as u32 {
@@ -239,23 +332,137 @@ pub fn bake(json_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
             new_edges.push(EdgeData { from, to, ..e });
         }
     }
+    (new_nodes, new_edges)
+}
 
-    let (n, m) = (new_nodes.len(), new_edges.len());
+// ---- CSCL (NYC Street Centerline) bake --------------------------------------
+//
+// The OSM/Overpass path is the most accurate for Manhattan, but a citywide Overpass
+// query overwhelms the public instances. NYC's own LION/CSCL centerline (Socrata
+// `inkn-q76z`) is the authoritative five-borough street network — already split at
+// intersections and clean of out-of-city spillover — so the citywide graph is built
+// from it instead. Each segment is one edge; shared intersection endpoints snap to a
+// common node, then we keep the largest connected component (bridges + tunnels span
+// the boroughs, so all five land in one component — incl. Staten Island via the
+// Verrazzano, which the walk network would strand).
+
+#[derive(Deserialize)]
+struct CsclFc {
+    features: Vec<CsclFeature>,
+}
+#[derive(Deserialize)]
+struct CsclFeature {
+    geometry: Option<CsclGeom>,
+    properties: CsclProps,
+}
+#[derive(Deserialize)]
+struct CsclGeom {
+    coordinates: Vec<Vec<[f64; 2]>>, // MultiLineString: parts of [lon, lat] vertices
+}
+#[derive(Deserialize)]
+struct CsclProps {
+    rw_type: Option<String>,
+}
+
+/// CSCL `rw_type` codes kept as the citywide street network: 1 Street, 2 Highway,
+/// 3 Bridge, 4 Tunnel, 10 Alley. Dropped: 6 Path/Trail, 9 non-physical/paper streets,
+/// 14 Ferry route, 12 Railroad, 5 Boardwalk, 7 Step street, 8 Driveway, 13 U-turn.
+const CSCL_KEEP_RW: &[&str] = &["1", "2", "3", "4", "10"];
+
+/// Intern a point into a node index, snapping to a 1 m grid so segments meeting at a
+/// shared intersection collapse onto one node (CSCL endpoints coincide to <0.1 m).
+fn intern_snapped(
+    p: Vec2,
+    keys: &mut HashMap<(i64, i64), u32>,
+    points: &mut Vec<NodePoint>,
+) -> u32 {
+    let key = (p.x.round() as i64, p.y.round() as i64);
+    if let Some(&i) = keys.get(&key) {
+        return i;
+    }
+    let i = points.len() as u32;
+    points.push(NodePoint { x: p.x, y: p.y });
+    keys.insert(key, i);
+    i
+}
+
+/// Build the citywide street graph from the NYC CSCL centerline GeoJSON.
+pub fn bake_cscl(geojson_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
+    let data = std::fs::read(geojson_path).with_context(|| format!("reading {geojson_path}"))?;
+    let fc: CsclFc = serde_json::from_slice(&data).context("parsing CSCL GeoJSON")?;
+    let proj = EnuProjection::default();
+
+    let mut keys: HashMap<(i64, i64), u32> = HashMap::new();
+    let mut points: Vec<NodePoint> = Vec::new();
+    let mut edges: Vec<EdgeData> = Vec::new();
+    let (mut total, mut kept) = (0usize, 0usize);
+
+    for f in &fc.features {
+        total += 1;
+        let Some(geom) = &f.geometry else { continue };
+        let rw = f.properties.rw_type.as_deref().unwrap_or("");
+        if !CSCL_KEEP_RW.contains(&rw) {
+            continue;
+        }
+        kept += 1;
+        for part in &geom.coordinates {
+            if part.len() < 2 {
+                continue;
+            }
+            let verts: Vec<Vec2> = part.iter().map(|c| proj.to_enu(c[1], c[0])).collect(); // [lon, lat]
+            let a = intern_snapped(verts[0], &mut keys, &mut points);
+            let b = intern_snapped(*verts.last().unwrap(), &mut keys, &mut points);
+            if a == b {
+                continue; // a closed loop / sub-metre stub
+            }
+            let len: f64 = verts.windows(2).map(|w| w[0].distance(w[1])).sum();
+            if len <= 0.0 {
+                continue;
+            }
+            edges.push(EdgeData {
+                from: a,
+                to: b,
+                length_m: len,
+                polyline: verts.iter().map(|p| [p.x, p.y]).collect(),
+                segment_id: None,
+            });
+        }
+    }
+    anyhow::ensure!(!points.is_empty(), "no street segments parsed from CSCL");
+    eprintln!("CSCL segments: {kept}/{total} kept (rw_type {CSCL_KEEP_RW:?})");
+
+    let (nodes, edges) = largest_component(points, edges);
+    let (n, m) = (nodes.len(), edges.len());
+    // Sanity: the ENU node bbox should span the whole city (~40.49–40.92 N,
+    // −74.26–−73.70 W) if all five boroughs landed in one connected component.
+    {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for nd in &nodes {
+            x0 = x0.min(nd.x);
+            y0 = y0.min(nd.y);
+            x1 = x1.max(nd.x);
+            y1 = y1.max(nd.y);
+        }
+        let (lat0, lon0) = proj.to_wgs84(Vec2::new(x0, y0));
+        let (lat1, lon1) = proj.to_wgs84(Vec2::new(x1, y1));
+        eprintln!("CSCL graph bbox: lat {lat0:.3}..{lat1:.3}, lon {lon0:.3}..{lon1:.3}");
+    }
     let asset = GraphAsset {
         origin: GeoOrigin::MANHATTAN,
-        nodes: new_nodes,
-        edges: new_edges,
+        nodes,
+        edges,
         provenance: Provenance {
-            source: "OpenStreetMap via Overpass API (walk network)".into(),
-            url: "https://overpass-api.de/".into(),
-            license: "ODbL 1.0".into(),
-            as_of: "2026-06-14".into(),
-            notes: "Manhattan pedestrian-usable highways; largest connected component; \
-                    street-centerline (not sidewalk-accurate)."
+            source: "NYC Street Centerline (CSCL), NYC DCP / DoITT".into(),
+            url: "https://data.cityofnewyork.us/City-Government/NYC-Street-Centerline-CSCL-/inkn-q76z"
+                .into(),
+            license: "NYC Open Data — public domain".into(),
+            as_of: "2026".into(),
+            notes: "Five-borough street centerline (rw_type street/highway/bridge/tunnel/alley); \
+                    intersections snapped at 1 m; largest connected component."
                 .into(),
         },
     };
     std::fs::write(out_path, asset.to_bytes()?).with_context(|| format!("writing {out_path}"))?;
-    eprintln!("OSM walk graph: {n} nodes, {m} edges (largest component) -> {out_path}");
+    eprintln!("CSCL graph: {n} nodes, {m} edges (largest component) -> {out_path}");
     Ok((n, m))
 }
