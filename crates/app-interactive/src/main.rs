@@ -822,7 +822,7 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            title: "our-space — Manhattan sensing exposure".into(),
+            title: "our-space · Manhattan sensing exposure".into(),
             // Web: bind to the page's canvas and fill its parent. Ignored natively.
             canvas: Some("#bevy-canvas".into()),
             fit_canvas_to_parent: true,
@@ -3267,7 +3267,7 @@ fn seed_example_walkshed(
     let enu = EnuProjection::new(GeoOrigin::MANHATTAN).to_enu(40.7233, -74.0030);
     place_walkshed(enu, &sim, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
     walkshed_state.status =
-        Some("Example: a 10-minute walk from SoHo — click anywhere to recenter.".into());
+        Some("Example: a 10-minute walk from SoHo. Click anywhere to recenter.".into());
 }
 
 /// Animated walk: pulse each camera as the looping walker enters its view, and

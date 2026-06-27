@@ -120,8 +120,8 @@ pub fn citywide_nudge(
                         );
                         ui.label(
                             egui::RichText::new(
-                                "This view is Manhattan only — kept light for performance, so \
-                                 the outer boroughs are empty here.",
+                                "This view is Manhattan only, kept light for speed. The outer \
+                                 boroughs are empty here.",
                             )
                             .size(12.5)
                             .color(pal::ZINC_100),
@@ -427,11 +427,11 @@ pub fn ui_panel(
             ui.label(
                 egui::RichText::new(match params.mode {
                     Mode::Walkshed => {
-                        "Search an address, or click the map — every camera within a 10-minute walk."
+                        "Search an address or click the map. Every camera within a 10-minute walk."
                     }
                     Mode::Route => "Search a start and destination, or click the map to set A then B.",
                     Mode::Neighborhoods => {
-                        "Camera density across Manhattan's neighborhoods — hover a region for its breakdown."
+                        "Camera density by neighborhood. Hover a region for its breakdown."
                     }
                 })
                 .weak()
@@ -520,7 +520,7 @@ pub fn ui_panel(
                     );
                     for &c in &COLS {
                         ui.label(
-                            egui::RichText::new(format!("{} — {}", c.label(), c.gloss()))
+                            egui::RichText::new(format!("{}: {}", c.label(), c.gloss()))
                                 .weak()
                                 .small(),
                         );
@@ -585,8 +585,8 @@ pub fn ui_panel(
             if ui
                 .add(btn)
                 .on_hover_text(
-                    "Speculative near-future surveillance — AI smart glasses on pedestrians + \
-                     sidewalk delivery-robot cameras. Neither is widely deployed in NYC yet. \
+                    "Speculative near-future surveillance: smart glasses on pedestrians and \
+                     sidewalk delivery-robot cameras. Neither is common in NYC yet. \
                      Off by default.",
                 )
                 .clicked()
@@ -665,8 +665,8 @@ pub fn ui_panel(
                     });
                     ui.label(
                         egui::RichText::new(
-                            "expected devices/min of presence, as a field over space — live at the \
-                             chosen hour + slider settings",
+                            "Expected devices per minute, as a field over space. Updates with the \
+                             chosen hour and slider settings.",
                         )
                         .weak()
                         .size(11.0),
@@ -694,8 +694,8 @@ pub fn ui_panel(
                     }
                     ui.label(
                         egui::RichText::new(
-                            "Dahir et al. (2025): cameras are most prevalent in racially diverse \
-                             neighborhoods — diversity predicts cameras more than crime does. A \
+                            "Dahir et al. (2025): cameras are most common in racially diverse \
+                             neighborhoods. Diversity predicts cameras more than crime does. A \
                              published correlation, not causation for any one block.",
                         )
                         .weak()
@@ -719,13 +719,13 @@ pub fn ui_panel(
                     .on_hover_text("Notable buildings (Empire State, One WTC, the Cloisters…) as 2.5D massing for orientation");
                 ui.checkbox(&mut params.linknyc_on, "LinkNYC kiosks")
                     .on_hover_text(
-                        "1,225 LinkNYC Wi-Fi/phone kiosks (sky-blue). Not cameras — but each \
-                         becomes a surveillance node the moment you connect to its free Wi-Fi \
+                        "1,225 LinkNYC Wi-Fi/phone kiosks (sky-blue). Not cameras, but each \
+                         becomes a surveillance node once you connect to its free Wi-Fi \
                          (device MAC, session data, location).",
                     );
                 ui.checkbox(&mut params.show_ace, "Show ACE bus-lane corridors (blue)")
                     .on_hover_text(
-                        "Trace the ACE bus-lane routes as blue ribbons. Off by default — the \
+                        "Trace the ACE bus-lane routes as blue ribbons. Off by default. The \
                          moving ACE buses still run without them.",
                     );
                 if params.show_ace {
@@ -747,8 +747,8 @@ pub fn ui_panel(
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Manhattan's bus lanes — these ACE corridors — have logged \
-                                     {} bus-lane violations and {} in fines.",
+                                    "Manhattan's ACE bus lanes have logged \
+                                     {} violations and {} in fines.",
                                     crate::group_thousands(crate::ACE_BUS_LANE_VIOLATIONS),
                                     crate::compact_usd(crate::ACE_BUS_LANE_FINES_USD),
                                 ))
@@ -781,8 +781,8 @@ pub fn ui_panel(
                 section(ui, "SENSING CLASSES");
                 ui.label(
                     egui::RichText::new(
-                        "Which moving + fixed sensors the estimate counts, and the per-device \
-                         assumptions behind each. Defaults are sensible — tune only if curious.",
+                        "Which moving and fixed sensors the estimate counts, and the per-device \
+                         assumptions behind each. Defaults are sensible. Tune only if curious.",
                     )
                     .weak()
                     .size(11.0),
@@ -822,10 +822,10 @@ pub fn ui_panel(
                 });
                 ui.label(
                     egui::RichText::new(if fut {
-                        "G + D · speculative — not yet in NYC; robot density follows the \
+                        "G + D · speculative. Not yet in NYC; robot density follows the \
                          Robotability Score (IRL-CT)"
                     } else {
-                        "G + D · speculative — enable with the “In 5 years…” button"
+                        "G + D · speculative. Enable with the “In 5 years…” button"
                     })
                     .weak()
                     .size(11.0),
@@ -886,7 +886,7 @@ pub fn ui_panel(
                 ui.label(egui::RichText::new(&date.label).strong());
                 ui.label(
                     egui::RichText::new(
-                        "The clock replays this real day's actual trips — MTA ACE buses (real GTFS \
+                        "The clock replays this real day's actual trips: MTA ACE buses (real GTFS \
                          timetable) and rideshare (real NYC TLC records). Baked into the build; \
                          changing it means re-baking with another date.",
                     )
@@ -1174,7 +1174,7 @@ fn result_route(
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "a single stochastic walk — a Monte-Carlo sample of the model. \
+                    "A single stochastic walk, one Monte-Carlo sample of the model. \
                      Switch to Research estimate for the reproducible figure.",
                 )
                 .weak()
@@ -1204,7 +1204,7 @@ fn about_data(ui: &mut egui::Ui) {
     src(
         ui,
         "DOT traffic cams",
-        "NYC DOT (nyctmc.org) — locations only; the camera images themselves are not used.",
+        "NYC DOT (nyctmc.org). Locations only; the camera images themselves are not used.",
     );
     src(
         ui,
@@ -1231,8 +1231,8 @@ fn about_data(ui: &mut egui::Ui) {
     section(ui, "HOW SOURCES ARE COMBINED");
     ui.label(
         egui::RichText::new(
-            "Fixed cameras within ~15 m across sources are merged into one physical node — a \
-             camera the CCTV census, DOT, and an enforcement sign all record counts once in the \
+            "Fixed cameras within ~15 m across sources merge into one physical node. A camera \
+             the CCTV census, DOT, and an enforcement sign all record counts once in the \
              headline. The per-source rows still show each source's overlapping attestations.",
         )
         .size(11.5)
@@ -1243,8 +1243,8 @@ fn about_data(ui: &mut egui::Ui) {
     section(ui, "WHAT'S REAL, WHAT'S MODELED");
     ui.label(
         egui::RichText::new(
-            "Real: how the estimate varies through the day — the ACE term follows the day's actual \
-             MTA timetable, the rideshare term its real per-minute TLC trip volume.",
+            "Real: how the estimate varies through the day. The ACE term follows the day's actual \
+             MTA timetable; the rideshare term its real per-minute TLC trip volume.",
         )
         .size(11.5)
         .color(pal::ZINC_400),
@@ -1252,7 +1252,7 @@ fn about_data(ui: &mut egui::Ui) {
     ui.add_space(3.0);
     ui.label(
         egui::RichText::new(
-            "Modeled: per-device rates (cameras-per-vehicle, bus-camera reach) are assumptions — \
+            "Modeled: per-device rates (cameras-per-vehicle, bus-camera reach) are assumptions; \
              adjust the sliders. Smart glasses (D) are fully speculative. Fixed-camera points are \
              street-view detections, not surveyed devices.",
         )
@@ -1463,8 +1463,7 @@ fn cross_source_note(ui: &mut egui::Ui, also: &[&'static str]) {
     );
     ui.label(
         egui::RichText::new(format!(
-            "Also mapped here by {}. Multiple sources attest one physical camera — merged, \
-             so it's counted once in the headline.",
+            "Also mapped here by {}. One physical camera, counted once in the headline.",
             also.join(", ")
         ))
         .size(11.0)

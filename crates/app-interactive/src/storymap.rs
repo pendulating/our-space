@@ -135,7 +135,7 @@ pub fn tutorial() -> Vec<StoryStep> {
     use StepAction::*;
     vec![
         StoryStep {
-            caption: "Welcome to Our Space — a living map of who is watching Manhattan.",
+            caption: "Welcome to Our Space, a living map of who is watching Manhattan.",
             secs: 5.5,
             action: Overview,
         },
@@ -146,7 +146,7 @@ pub fn tutorial() -> Vec<StoryStep> {
             action: FlyTo { lat: 40.7549, lon: -73.9840, zoom: 1.6 },
         },
         StoryStep {
-            caption: "Plan a walk — drop a start and a destination, and the sim counts \
+            caption: "Plan a walk. Drop a start and a destination, and the sim counts \
                       every camera that could capture you along the way.",
             secs: 7.5,
             action: Route { a: (40.7580, -73.9855), b: (40.7527, -73.9772) },
@@ -158,8 +158,8 @@ pub fn tutorial() -> Vec<StoryStep> {
             action: Walkshed { lat: 40.7233, lon: -74.0030 },
         },
         StoryStep {
-            caption: "Meet the operators — the same sensors, regrouped by who runs them. \
-                      The towers show just how lopsided the watching is.",
+            caption: "Meet the operators: the same sensors, regrouped by who runs them. \
+                      The towers show how lopsided the watching is.",
             secs: 7.0,
             action: Operators,
         },
@@ -170,7 +170,7 @@ pub fn tutorial() -> Vec<StoryStep> {
             action: Future,
         },
         StoryStep {
-            caption: "Zoom out to the citywide density field — the darker the block, the \
+            caption: "Zoom out to the citywide density field. The darker the block, the \
                       more cameras can see it.",
             secs: 6.5,
             action: Heatmap,
@@ -193,7 +193,7 @@ pub fn longitudinal() -> Vec<StoryStep> {
     let midtown = |z: f32| Some((40.7549, -73.9840, z));
     vec![
         StoryStep {
-            caption: "Rewind ten years. In 2015 the city's eye was real but sparse — NYPD \
+            caption: "Rewind ten years. In 2015 the city's eye was real but sparse: NYPD \
                       domes, DOT traffic cams. No plate-readers on the avenues, no Wi-Fi \
                       kiosks logging your phone.",
             secs: 8.0,
@@ -207,8 +207,8 @@ pub fn longitudinal() -> Vec<StoryStep> {
         },
         StoryStep {
             caption: "By today, the lens is everywhere. Thousands of fixed cameras, \
-                      license-plate readers, and a LinkNYC kiosk on every other block — \
-                      watch the kiosks switch on as we reach the present.",
+                      license-plate readers, and a LinkNYC kiosk on every other block. \
+                      Watch the kiosks switch on as we reach the present.",
             secs: 8.0,
             action: Scene {
                 at: midtown(1.6),
@@ -231,7 +231,7 @@ pub fn longitudinal() -> Vec<StoryStep> {
             },
         },
         StoryStep {
-            caption: "And the watching is concentrated — a handful of operators run the \
+            caption: "And the watching is concentrated: a handful of operators run the \
                       overwhelming majority of the city's cameras.",
             secs: 7.0,
             action: Scene {
@@ -244,8 +244,8 @@ pub fn longitudinal() -> Vec<StoryStep> {
         },
         StoryStep {
             caption: "Five years on: AI smart glasses on commuters and sidewalk delivery \
-                      robots add cameras that move with the crowd — the 'In 5 years…' layer. \
-                      Same streets, watched more every year.",
+                      robots add cameras that move with the crowd. That's the 'In 5 years…' \
+                      layer. Same streets, watched more every year.",
             secs: 8.5,
             action: Scene {
                 at: midtown(1.8),

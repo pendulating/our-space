@@ -5,4 +5,4 @@ kind: paper
 url: https://dl.acm.org/doi/full/10.1145/3715275.3732185
 order: 1
 ---
-When the sidewalk is photographed at scale, it isn't only individuals who are captured but whole groups — and group privacy is exactly what conventional, person-by-person protections miss.
+When the sidewalk is photographed at scale, it isn't only individuals who are captured but whole groups. Group privacy is exactly what conventional, person-by-person protections miss.
