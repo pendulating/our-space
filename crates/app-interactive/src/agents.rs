@@ -9,45 +9,79 @@
 //! mesh+material per class (draw-call batching), O(log n) `position_at` per agent
 //! per frame, no runtime A* (vehicles replay baked polylines; peds random-walk).
 
-use bevy::math::primitives::RegularPolygon;
+use bevy::math::primitives::{Rectangle, RegularPolygon};
 use bevy::prelude::*;
 use std::f64::consts::FRAC_PI_2;
 
-use sim_core::assets::VehicleRoute;
+use sim_core::assets::{BusTrip, TaxiTrip};
+use sim_core::math::point_segment_distance;
 use sim_core::rng::{RngLike, WyRand};
 use sim_core::{Route, Vec2};
 
-use crate::{world, ExposureMode, Mode, Params, RouteState, Sim, Walker, WalkLive};
+use crate::operators::{OperatorSlot, OperatorsView};
+use crate::{world, ExposureMode, Mode, Params, RouteState, Sim, SimClock, Walker, WalkLive};
 
 // Fixed caps → provable worst-case per-frame cost on single-threaded WASM.
-const MAX_VEHICLES: usize = 250;
+// Raised for real-day replay: a real Manhattan weekday has thousands of trips
+// concurrently active at peak; these caps bound the on-screen sample (the active
+// set beyond the cap is deterministically subsampled in `replay_agents`).
+// 4000 covers the dataset's true peak concurrency (3,823 rideshare trips at 18:20),
+// so the taxi subsample never triggers — effectively uncapped for this day.
+const MAX_VEHICLES: usize = 4000;
 const MAX_PEDS: usize = 400;
 
-const MAX_BUSES: usize = 80;
+const MAX_BUSES: usize = 300;
+/// Speculative sidewalk delivery robots; modest on-screen cap (rare even at peak).
+const MAX_ROBOTS: usize = 200;
+/// Teslas on-screen cap (NYC has ~29k private Teslas; this bounds the sample).
+const MAX_TESLAS: usize = 400;
 
-// Real speeds (m/s); the shared ANIM_SPEEDUP time-lapse applies on top.
-const VEHICLE_SPEED_MPS: f64 = 8.0; // ~29 km/h urban crawl
+// Pedestrian walk speed (m/s); the master `SimClock.rate` time-lapse applies on
+// top. Vehicles + buses no longer use a fixed speed — they replay real schedules.
 const PED_SPEED_MPS: f64 = 1.34;
-const BUS_SPEED_MPS: f64 = 6.0;
+/// Sidewalk robots crawl (~1.8 m/s ≈ 4 mph, the Serve/Starship class limit).
+const ROBOT_SPEED_MPS: f64 = 1.8;
+/// Teslas move at the replay taxis' effective Manhattan pace (median ~3.3 m/s, mean
+/// ~3.6 over the day's real trips) so the two car classes flow together rather than
+/// the Teslas zipping past traffic. (Fixed speed: Teslas are synthetic agents, not
+/// real timed trips.)
+const TESLA_SPEED_MPS: f64 = 3.5;
+
+// Bus stop-and-go: each inter-stop segment ends with a **dwell** (the bus holds at
+// the upcoming stop until its scheduled departure), so buses visibly pause. The dwell
+// is `BUS_DWELL_MIN` minutes, capped at `BUS_DWELL_FRAC` of the segment so it never
+// eats a whole short hop; the travel before it is smoothstep-eased (decelerate into /
+// accelerate out of stops). Tunable.
+const BUS_DWELL_MIN: f32 = 0.25; // minutes (~15 s of schedule time)
+const BUS_DWELL_FRAC: f32 = 0.4; // ≤ 40% of any one inter-stop segment
 
 // Capture reach (m) for the narrative "passed you" test.
 const VEHICLE_CAPTURE_R: f64 = 22.0;
 const PED_CAPTURE_R: f64 = 6.0;
 const BUS_CAPTURE_R: f64 = 22.0;
+/// Robot nav cameras are low + close-range: a short curb-side reach.
+const ROBOT_CAPTURE_R: f64 = 8.0;
+/// Tesla 360° cameras (Sentry/Autopilot) reach across the street.
+const TESLA_CAPTURE_R: f64 = 20.0;
+/// Max plausible single-frame travel for the swept capture test. A step longer than
+/// this is a slot reassignment / mode-switch teleport (stale `prev_pos`), not real
+/// motion, so we fall back to a point test rather than sweep across the map.
+const MAX_SWEEP_M: f64 = 600.0;
 
 const PED_WALK_EDGES: usize = 16;
 const ACTIVATIONS_PER_FRAME: usize = 32;
 
-/// Time-lapse multiplier for the **ambient** agents — deliberately gentler than
-/// the walker's `ANIM_SPEEDUP` (40×, a route playback you watch quickly). The
-/// surrounding traffic/pedestrians read as a calm, living, watched city rather
-/// than a frenetic arcade; the severity of the subject wants stillness, not zip.
-const AGENT_SPEEDUP: f64 = 10.0;
+// The ambient agents now move on the master `SimClock.rate` (sim-seconds per
+// real-second) so the day and the traffic stay congruent; the rate is tweakable
+// from the time panel and pausing the clock freezes them too.
 
-// z-order: streets 0.0, cameras 1.0, route 0.2, walker 4.0. Agents between.
+// z-order: streets 0.0, cameras 1.0, route line 2.0, agents 2.4–2.7, landmark massing
+// 2.8 (occludes agents/cameras behind it), A/B markers 3.0, walker 4.0, labels 5.0.
 const Z_VEHICLE: f32 = 2.6;
 const Z_PED: f32 = 2.4;
 const Z_BUS: f32 = 2.7;
+const Z_ROBOT: f32 = 2.5;
+const Z_TESLA: f32 = 2.55;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentClass {
@@ -57,6 +91,12 @@ pub enum AgentClass {
     /// Schedule-simulated today; the agent is position-drivable, so a future
     /// realtime (GTFS-rt) source could set bus transforms directly instead.
     Bus,
+    /// Speculative sidewalk delivery robot (Tier D): walks the sidewalk graph,
+    /// spawned weighted by the Robotability Score field.
+    DeliveryRobot,
+    /// Tesla (Tier C): always-on Sentry/Autopilot cameras, spawned weighted by
+    /// private-registration density (the Tesla field).
+    Tesla,
 }
 
 #[derive(Component)]
@@ -69,6 +109,9 @@ pub struct MobileAgent {
     pub flash: f32,
     /// Debounce: already counted the walker this pass (narrative mode).
     pub counted: bool,
+    /// World position one capture-frame ago, for the swept closest-approach test
+    /// (so a fast agent can't tunnel past the capture radius between frames).
+    pub prev_pos: Vec2,
 }
 
 impl MobileAgent {
@@ -81,6 +124,7 @@ impl MobileAgent {
             active: false,
             flash: 0.0,
             counted: false,
+            prev_pos: Vec2::ZERO,
         }
     }
 }
@@ -91,18 +135,24 @@ pub struct AgentPool {
     pub vehicles: Vec<Entity>,
     pub peds: Vec<Entity>,
     pub buses: Vec<Entity>,
-    /// Cumulative weights over `Sim.vehicle_routes` (ends at ~1.0) for O(log n) sampling.
-    cumulative: Vec<f32>,
+    pub robots: Vec<Entity>,
+    pub teslas: Vec<Entity>,
     rng: WyRand,
-    target_vehicles: usize,
     target_peds: usize,
-    target_buses: usize,
-    // Tracked active counts (updated only in `reconcile`, the sole place an
-    // agent's `active` flips) so `scale_agent_population` can early-out in steady
-    // state without cloning entity vectors or re-counting every frame.
-    active_vehicles: usize,
+    target_robots: usize,
+    target_teslas: usize,
+    // Tracked active counts for the count-scaled classes (peds + robots + teslas;
+    // vehicles + buses are schedule-driven by `replay_agents`). Set in `reconcile`.
     active_peds: usize,
-    active_buses: usize,
+    active_robots: usize,
+    active_teslas: usize,
+    // Shared per-class materials + icon textures, exposed so the Operators view can
+    // swap the pedestrian/bus chips to a solid operator fill in the tower (and
+    // restore the icon on the map). Vehicles are already a solid clay = RIDESHARE.
+    pub ped_mat: Handle<ColorMaterial>,
+    pub bus_mat: Handle<ColorMaterial>,
+    pub glasses_icon: Handle<Image>,
+    pub bus_icon: Handle<Image>,
 }
 
 impl AgentPool {
@@ -113,14 +163,43 @@ impl AgentPool {
             vehicles: Vec::new(),
             peds: Vec::new(),
             buses: Vec::new(),
-            cumulative: Vec::new(),
+            robots: Vec::new(),
+            teslas: Vec::new(),
             rng: WyRand::new(0x9E37_79B9_7F4A_7C15),
-            target_vehicles: 0,
             target_peds: 0,
-            target_buses: 0,
-            active_vehicles: 0,
+            target_robots: 0,
+            target_teslas: 0,
             active_peds: 0,
-            active_buses: 0,
+            active_robots: 0,
+            active_teslas: 0,
+            ped_mat: Handle::default(),
+            bus_mat: Handle::default(),
+            glasses_icon: Handle::default(),
+            bus_icon: Handle::default(),
+        }
+    }
+}
+
+/// Schedule-driven replay bookkeeping: which baked trip occupies each pooled entity
+/// slot. Taxis use a forward cursor over the start-sorted trip list (rebuilt on a
+/// clock wrap/scrub); buses are few enough to full-scan each frame.
+#[derive(Resource, Default)]
+pub struct ReplayState {
+    veh_slot_trip: Vec<i32>, // vehicle slot -> taxi trip idx (-1 = free)
+    veh_cursor: usize,       // next taxi trip (start-sorted) to consider
+    veh_last_now: f32,       // last frame's minute-of-day (wrap/scrub detection)
+    bus_slot_trip: Vec<i32>, // bus slot -> bus trip idx (-1 = free)
+    bus_mapped: Vec<bool>,   // bus trip -> currently occupies a slot
+}
+
+impl ReplayState {
+    pub fn new(_n_taxi: usize, n_bus: usize) -> Self {
+        ReplayState {
+            veh_slot_trip: vec![-1; MAX_VEHICLES],
+            veh_cursor: 0,
+            veh_last_now: -1.0,
+            bus_slot_trip: vec![-1; MAX_BUSES],
+            bus_mapped: vec![false; n_bus],
         }
     }
 }
@@ -135,26 +214,31 @@ pub fn spawn_pool(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ColorMaterial>,
-    vehicle_routes: &[VehicleRoute],
     glasses_icon: Handle<Image>,
     bus_icon: Handle<Image>,
 ) -> AgentPool {
     // Dashcam vehicles stay clay triangles (they read as moving cars); glasses
     // pedestrians get the eyeglasses icon; ACE buses get the bus icon.
     let veh_mesh = meshes.add(RegularPolygon::new(7.0, 3));
-    let veh_mat = materials.add(Color::srgb_u8(0xa8, 0x50, 0x1f)); // clay (Tier C)
+    let veh_mat = materials.add(crate::theme::map::AMBER); // rideshare dashcam (amber warning)
     let ped_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 16.0));
     let ped_mat = materials.add(ColorMaterial {
         color: Color::WHITE,
-        texture: Some(glasses_icon),
+        texture: Some(glasses_icon.clone()),
         ..default()
     });
     let bus_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 30.0));
     let bus_mat = materials.add(ColorMaterial {
         color: Color::WHITE,
-        texture: Some(bus_icon),
+        texture: Some(bus_icon.clone()),
         ..default()
     });
+    // Delivery robots: a small cool-violet box — visually distinct from clay cars,
+    // icon peds, and bus icons (no texture needed).
+    let robot_mesh = meshes.add(Rectangle::new(10.0, 8.0));
+    let robot_mat = materials.add(crate::theme::map::ROBOT_VIOLET); // speculative outlier
+    // Teslas: a triangle in caution orange (deeper warning than the rideshare amber).
+    let tesla_mat = materials.add(crate::theme::map::ORANGE);
 
     let mut vehicles = Vec::with_capacity(MAX_VEHICLES);
     for _ in 0..MAX_VEHICLES {
@@ -167,6 +251,7 @@ pub fn spawn_pool(
                     Visibility::Hidden,
                     MobileVis,
                     MobileAgent::idle(AgentClass::Vehicle),
+                    OperatorSlot::default(),
                 ))
                 .id(),
         );
@@ -182,6 +267,7 @@ pub fn spawn_pool(
                     Visibility::Hidden,
                     MobileVis,
                     MobileAgent::idle(AgentClass::Pedestrian),
+                    OperatorSlot::default(),
                 ))
                 .id(),
         );
@@ -198,51 +284,65 @@ pub fn spawn_pool(
                     Visibility::Hidden,
                     MobileVis,
                     MobileAgent::idle(AgentClass::Bus),
+                    OperatorSlot::default(),
                 ))
                 .id(),
         );
     }
 
-    // Cumulative weight table (baker normalized weights to sum 1.0).
-    let mut cumulative = Vec::with_capacity(vehicle_routes.len());
-    let mut acc = 0.0f32;
-    for r in vehicle_routes {
-        acc += r.weight.max(0.0);
-        cumulative.push(acc);
+    let mut robots = Vec::with_capacity(MAX_ROBOTS);
+    for _ in 0..MAX_ROBOTS {
+        robots.push(
+            commands
+                .spawn((
+                    Mesh2d(robot_mesh.clone()),
+                    MeshMaterial2d(robot_mat.clone()),
+                    Transform::from_xyz(0.0, 0.0, Z_ROBOT),
+                    Visibility::Hidden,
+                    MobileVis,
+                    MobileAgent::idle(AgentClass::DeliveryRobot),
+                    OperatorSlot::default(),
+                ))
+                .id(),
+        );
+    }
+
+    let mut teslas = Vec::with_capacity(MAX_TESLAS);
+    for _ in 0..MAX_TESLAS {
+        teslas.push(
+            commands
+                .spawn((
+                    Mesh2d(veh_mesh.clone()),
+                    MeshMaterial2d(tesla_mat.clone()),
+                    Transform::from_xyz(0.0, 0.0, Z_TESLA),
+                    Visibility::Hidden,
+                    MobileVis,
+                    MobileAgent::idle(AgentClass::Tesla),
+                    OperatorSlot::default(),
+                ))
+                .id(),
+        );
     }
 
     AgentPool {
         vehicles,
         peds,
         buses,
-        cumulative,
-        // Fixed seed: agent motion is cosmetic; reproducible run-to-run.
+        robots,
+        teslas,
+        // Fixed seed: pedestrian motion is cosmetic; reproducible run-to-run.
         rng: WyRand::new(0x9E37_79B9_7F4A_7C15),
-        target_vehicles: 0,
         target_peds: 0,
-        target_buses: 0,
-        active_vehicles: 0,
+        target_robots: 0,
+        target_teslas: 0,
         active_peds: 0,
-        active_buses: 0,
+        active_robots: 0,
+        active_teslas: 0,
+        ped_mat,
+        bus_mat,
+        glasses_icon,
+        bus_icon,
     }
-}
-
-fn route_from(vr: &VehicleRoute) -> Route {
-    Route::from_points(
-        vr.polyline
-            .iter()
-            .map(|p| Vec2::new(p[0] as f64, p[1] as f64))
-            .collect(),
-    )
-}
-
-fn activate_vehicle(agent: &mut MobileAgent, route: Route, rng: &mut WyRand) {
-    let total = route.total_m;
-    agent.route = route;
-    agent.progress_m = rng.next_f64() * total.max(1.0);
-    agent.speed_mps = VEHICLE_SPEED_MPS;
-    agent.active = true;
-    agent.counted = false;
 }
 
 fn activate_ped(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand, start_node: u32) {
@@ -254,21 +354,41 @@ fn activate_ped(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand, start_node
     agent.counted = false;
 }
 
-fn activate_bus(agent: &mut MobileAgent, route: Route, rng: &mut WyRand) {
+/// Sample a graph node from a cumulative weight table (so agents cluster where the
+/// weight is high). Uniform fallback if the table is missing/empty.
+fn weighted_node(cum: &[f32], n: usize, rng: &mut WyRand) -> u32 {
+    if cum.len() != n || n == 0 {
+        return if n > 0 { rng.below(n) as u32 } else { 0 };
+    }
+    let total = *cum.last().unwrap();
+    if total <= 0.0 {
+        return rng.below(n) as u32;
+    }
+    let r = rng.next_f64() as f32 * total;
+    cum.partition_point(|&c| c < r).min(n - 1) as u32
+}
+
+/// Activate a delivery robot: spawn at a robotability-weighted node and wander the
+/// sidewalk graph (same walk model as pedestrians, slower).
+fn activate_robot(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand) {
+    let start = weighted_node(&sim.robot_node_cumulative, sim.graph.node_count(), rng);
+    let route = sim.graph.random_walk_route(start, PED_WALK_EDGES, rng);
     agent.progress_m = rng.next_f64() * route.total_m.max(1.0);
     agent.route = route;
-    agent.speed_mps = BUS_SPEED_MPS;
+    agent.speed_mps = ROBOT_SPEED_MPS;
     agent.active = true;
     agent.counted = false;
 }
 
-/// Clone a random ACE route shape (uniform over routes). `None` if none baked.
-fn pick_ace_route(rng: &mut WyRand, ace_routes: &[Route]) -> Option<Route> {
-    if ace_routes.is_empty() {
-        None
-    } else {
-        Some(ace_routes[rng.below(ace_routes.len())].clone())
-    }
+/// Activate a Tesla: spawn at a registration-density-weighted node + drive the graph.
+fn activate_tesla(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand) {
+    let start = weighted_node(&sim.tesla_node_cumulative, sim.graph.node_count(), rng);
+    let route = sim.graph.random_walk_route(start, PED_WALK_EDGES, rng);
+    agent.progress_m = rng.next_f64() * route.total_m.max(1.0);
+    agent.route = route;
+    agent.speed_mps = TESLA_SPEED_MPS;
+    agent.active = true;
+    agent.counted = false;
 }
 
 /// Scale active agent counts by time-of-day and the two scenario sliders, so the
@@ -276,68 +396,51 @@ fn pick_ace_route(rng: &mut WyRand, ace_routes: &[Route]) -> Option<Route> {
 pub fn scale_agent_population(
     params: Res<Params>,
     sim: Option<Res<Sim>>,
+    ov: Res<OperatorsView>,
+    clock: Res<SimClock>,
     mut pool: ResMut<AgentPool>,
     mut q: Query<(&mut MobileAgent, &mut Visibility)>,
 ) {
     let Some(sim) = sim else { return };
-    let hour = params.departure_hour as f64;
-
-    let veh_scale = sim_core::mobile::traffic_multiplier(hour) * (params.dashcam_penetration as f64 / 0.40);
-    let ped_scale = sim_core::mobile::pedestrian_multiplier(hour) * (params.glasses_per_1000 as f64 / 10.0);
-    let want_veh = if params.dashcam_on {
-        ((MAX_VEHICLES as f64) * veh_scale).round().clamp(0.0, MAX_VEHICLES as f64) as usize
-    } else {
-        0
-    };
+    if ov.active || ov.t > 0.0 {
+        return; // freeze the active set while the Operators view holds the snapshot
+    }
+    let hour = clock.time_of_day; // live time-of-day → ped density tracks the clock
+    let ped_scale =
+        sim_core::mobile::pedestrian_multiplier(hour) * (params.glasses_per_1000 as f64 / 10.0);
     let want_ped = if params.glasses_on {
         ((MAX_PEDS as f64) * ped_scale).round().clamp(0.0, MAX_PEDS as f64) as usize
     } else {
         0
     };
-    // ACE buses: count ∝ 1/headway (more buses at rush). Schedule-simulated.
-    let bus_frac = (5.0 / sim_core::mobile::bus_headway_minutes(hour)).clamp(0.2, 1.0);
-    let want_bus = if params.ace_on && !sim.ace_routes_geom.is_empty() {
-        ((MAX_BUSES as f64) * bus_frac).round().clamp(0.0, MAX_BUSES as f64) as usize
+    // Delivery robots: count-scaled by their activity curve × the density slider.
+    let robot_scale =
+        sim_core::mobile::robot_activity_multiplier(hour) * (params.robots_density as f64 / 2.0);
+    let want_robot = if params.robots_on {
+        ((MAX_ROBOTS as f64) * robot_scale).round().clamp(0.0, MAX_ROBOTS as f64) as usize
     } else {
         0
     };
-    pool.target_vehicles = want_veh;
+    // Teslas: moving agents follow traffic, but with a high floor — Sentry keeps
+    // parked Teslas recording 24/7, so they're never really "off the street".
+    let tesla_scale =
+        (0.4 + 0.6 * sim_core::mobile::traffic_multiplier(hour)) * (params.tesla_density as f64 / 4.0);
+    let want_tesla = if params.tesla_on {
+        ((MAX_TESLAS as f64) * tesla_scale).round().clamp(0.0, MAX_TESLAS as f64) as usize
+    } else {
+        0
+    };
     pool.target_peds = want_ped;
-    pool.target_buses = want_bus;
-
-    // Steady-state fast path: once populations match their targets nothing needs
-    // to change, so skip the entity-vector clones and reconcile work entirely.
-    // Active counts are tracked in `reconcile`, so this is exact.
-    if pool.active_vehicles == want_veh
-        && pool.active_peds == want_ped
-        && pool.active_buses == want_bus
+    pool.target_robots = want_robot;
+    pool.target_teslas = want_tesla;
+    if pool.active_peds == want_ped
+        && pool.active_robots == want_robot
+        && pool.active_teslas == want_tesla
     {
-        return;
+        return; // steady state
     }
 
     let mut budget = ACTIVATIONS_PER_FRAME;
-
-    // Clone the (small) cumulative table + entity lists to locals so the
-    // activation closures don't borrow `pool` while `pool.rng` is borrowed mutably.
-    // Reconcile reads/writes the tracked active count in place.
-    let cumulative = pool.cumulative.clone();
-    let veh_entities = pool.vehicles.clone();
-    let mut active_veh = pool.active_vehicles;
-    reconcile(
-        &veh_entities,
-        &mut active_veh,
-        want_veh,
-        &mut budget,
-        &mut q,
-        &mut |agent, rng| {
-            if let Some(vr) = pick_route_owned(rng, &cumulative, &sim.vehicle_routes) {
-                activate_vehicle(agent, route_from(&vr), rng);
-            }
-        },
-        &mut pool.rng,
-    );
-    pool.active_vehicles = active_veh;
-
     let ped_entities = pool.peds.clone();
     let node_count = sim.graph.node_count() as u32;
     let mut active_ped = pool.active_peds;
@@ -355,22 +458,31 @@ pub fn scale_agent_population(
     );
     pool.active_peds = active_ped;
 
-    let bus_entities = pool.buses.clone();
-    let mut active_bus = pool.active_buses;
+    let robot_entities = pool.robots.clone();
+    let mut active_robot = pool.active_robots;
     reconcile(
-        &bus_entities,
-        &mut active_bus,
-        want_bus,
+        &robot_entities,
+        &mut active_robot,
+        want_robot,
         &mut budget,
         &mut q,
-        &mut |agent, rng| {
-            if let Some(route) = pick_ace_route(rng, &sim.ace_routes_geom) {
-                activate_bus(agent, route, rng);
-            }
-        },
+        &mut |agent, rng| activate_robot(agent, &sim, rng),
         &mut pool.rng,
     );
-    pool.active_buses = active_bus;
+    pool.active_robots = active_robot;
+
+    let tesla_entities = pool.teslas.clone();
+    let mut active_tesla = pool.active_teslas;
+    reconcile(
+        &tesla_entities,
+        &mut active_tesla,
+        want_tesla,
+        &mut budget,
+        &mut q,
+        &mut |agent, rng| activate_tesla(agent, &sim, rng),
+        &mut pool.rng,
+    );
+    pool.active_teslas = active_tesla;
 }
 
 /// Nudge `*active` toward `target` by flipping ≤`budget` pooled agents this
@@ -420,67 +532,51 @@ fn reconcile(
     }
 }
 
-// Owned-route pick to sidestep borrow conflicts inside the closure.
-fn pick_route_owned(rng: &mut WyRand, cumulative: &[f32], routes: &[VehicleRoute]) -> Option<VehicleRoute> {
-    if routes.is_empty() || cumulative.is_empty() {
-        return None;
-    }
-    let total = *cumulative.last().unwrap();
-    let r = rng.next_f64() as f32 * total;
-    let idx = cumulative.partition_point(|&c| c < r).min(routes.len() - 1);
-    routes.get(idx).cloned()
-}
-
 /// Advance every active agent along its route; recycle in place on completion.
 pub fn animate_agents(
     time: Res<Time>,
     params: Res<Params>,
     sim: Option<Res<Sim>>,
+    ov: Res<OperatorsView>,
+    clock: Res<SimClock>,
     mut pool: ResMut<AgentPool>,
     mut q: Query<(&mut MobileAgent, &mut Transform)>,
 ) {
     let Some(sim) = sim else { return };
+    if ov.active || ov.t > 0.0 {
+        return; // the Operators view drives the agents (operators_animate_mobile)
+    }
     if params.heatmap_on || !params.show_agents {
         return; // hidden; skip the work entirely
     }
-    let dt = time.delta_secs_f64() * AGENT_SPEEDUP;
-    // Local copy so per-agent recycling can borrow it while `pool.rng` is mutable.
-    let cumulative = pool.cumulative.clone();
-
+    let dt = time.delta_secs_f64() * clock.rate;
     for (mut agent, mut tf) in &mut q {
         if !agent.active {
             continue;
         }
-        agent.progress_m += agent.speed_mps * dt;
-        if agent.progress_m > agent.route.total_m {
-            // Recycle in place — no despawn.
-            match agent.class {
-                AgentClass::Vehicle => {
-                    if let Some(vr) = pick_route_owned(&mut pool.rng, &cumulative, &sim.vehicle_routes) {
-                        let route = route_from(&vr);
-                        agent.route = route;
-                        agent.progress_m = 0.0;
-                        agent.counted = false;
-                    } else {
-                        agent.progress_m = 0.0;
-                    }
-                }
-                AgentClass::Pedestrian => {
-                    let end = agent.route.position_at(agent.route.total_m);
-                    let node = sim.graph.snap_nearest(end).unwrap_or(0);
-                    let route = sim.graph.random_walk_route(node, PED_WALK_EDGES, &mut pool.rng);
-                    agent.route = route;
-                    agent.progress_m = 0.0;
-                    agent.counted = false;
-                }
-                AgentClass::Bus => {
-                    // Schedule-sim recycle: pick another ACE route shape to run.
-                    if let Some(route) = pick_ace_route(&mut pool.rng, &sim.ace_routes_geom) {
-                        agent.route = route;
-                    }
-                    agent.progress_m = 0.0;
-                    agent.counted = false;
-                }
+        // Pedestrians + delivery robots wander on the diurnal model (advance +
+        // recycle), but only when playing; vehicles + buses are driven by
+        // `replay_agents` (progress set from the real schedule), so here they are
+        // only positioned. Positioning runs even when paused (scrub-and-pause).
+        if clock.playing
+            && matches!(
+                agent.class,
+                AgentClass::Pedestrian | AgentClass::DeliveryRobot | AgentClass::Tesla
+            )
+        {
+            agent.progress_m += agent.speed_mps * dt;
+            if agent.progress_m > agent.route.total_m {
+                // Continue the walk from the current endpoint instead of re-seeding
+                // at a fresh weighted node. Re-seeding on every completion teleported
+                // the agent across the map — and because a 16-edge walk completes in
+                // only a few real seconds at time-lapse rates, the faster classes
+                // (Teslas especially) appeared to "zip" around. The robotability /
+                // registration-density weighting still shapes the initial spawn.
+                let end = agent.route.position_at(agent.route.total_m);
+                let node = sim.graph.snap_nearest(end).unwrap_or(0);
+                agent.route = sim.graph.random_walk_route(node, PED_WALK_EDGES, &mut pool.rng);
+                agent.progress_m = 0.0;
+                agent.counted = false;
             }
         }
         let p = agent.route.position_at(agent.progress_m);
@@ -488,11 +584,13 @@ pub fn animate_agents(
             AgentClass::Vehicle => Z_VEHICLE,
             AgentClass::Bus => Z_BUS,
             AgentClass::Pedestrian => Z_PED,
+            AgentClass::DeliveryRobot => Z_ROBOT,
+            AgentClass::Tesla => Z_TESLA,
         };
         tf.translation = world::to_world(p, z);
-        // Orient the (symmetric) dashcam triangle along travel; the bus + glasses
-        // icons stay upright (rotating a side-view icon reads wrong).
-        if agent.class == AgentClass::Vehicle {
+        // Orient the (symmetric) car triangles (dashcam + Tesla) along travel; bus +
+        // glasses + robot boxes stay upright.
+        if matches!(agent.class, AgentClass::Vehicle | AgentClass::Tesla) {
             let h = agent.route.heading_at(agent.progress_m);
             tf.rotation = Quat::from_rotation_z((h.y.atan2(h.x) - FRAC_PI_2) as f32);
         }
@@ -503,9 +601,12 @@ pub fn animate_agents(
     }
 }
 
-/// Narrative mode: agents passing the walker increment a live stochastic tally,
-/// with the device∧capture probability folded into a Bernoulli roll so the
-/// expectation tracks the analytical dashcam/glasses rates.
+/// Narrative mode: agents passing the walker increment a live tally. Dashcam
+/// vehicles count *every* in-range pass (deterministic — the live walk is meant to
+/// show each device that physically drives by, decoupled from the analytical
+/// headline estimate); the other mobile classes keep a capture-given-pass Bernoulli
+/// roll. Detection uses a swept closest-approach test so fast agents (high clock
+/// rates) can't tunnel past the capture radius between sampled frames.
 pub fn mobile_capture_events(
     params: Res<Params>,
     route: Res<RouteState>,
@@ -524,23 +625,45 @@ pub fn mobile_capture_events(
     // Per-encounter probability that a passing agent is a recording device that
     // captures you (mirrors the analytical product, sans the rate terms which
     // are already expressed by the agent flux).
-    let p_vehicle = (params.dashcam_penetration as f64 * 0.40).clamp(0.0, 1.0); // penetration × capture_prob
+    //
+    // Dashcams are deterministic (p = 1.0): every rideshare vehicle that drives
+    // within range registers + flashes, so the live walk renders each pass you can
+    // see on the map. This intentionally runs hotter than the analytical estimate
+    // (which discounts by fleet penetration × capture_prob); the headline still
+    // reports the calibrated expectation.
+    let p_vehicle = 1.0_f64;
     let p_glasses = ((params.glasses_per_1000 as f64 / 1000.0) * 0.05 * 0.4).clamp(0.0, 1.0);
     // ACE buses are Tier A: the camera is always present, so the only chance term
     // is capture-given-pass (the bus's curb-side FOV catching you).
     let p_bus = 0.7;
+    // Robots always carry nav cameras; the chance term is capture-given-pass.
+    let p_robot = 0.5;
+    // Teslas always carry Sentry/Autopilot cameras; chance term is capture-given-pass.
+    let p_tesla = 0.3;
 
     for mut agent in &mut agents {
         if !agent.active {
             continue;
         }
-        let apos = agent.route.position_at(agent.progress_m);
+        let cur = agent.route.position_at(agent.progress_m);
         let (range, p) = match agent.class {
             AgentClass::Vehicle => (VEHICLE_CAPTURE_R, p_vehicle),
             AgentClass::Pedestrian => (PED_CAPTURE_R, p_glasses),
             AgentClass::Bus => (BUS_CAPTURE_R, p_bus),
+            AgentClass::DeliveryRobot => (ROBOT_CAPTURE_R, p_robot),
+            AgentClass::Tesla => (TESLA_CAPTURE_R, p_tesla),
         };
-        let near = apos.distance(wpos) <= range;
+        // Closest approach of the agent's swept segment (last frame → this frame) to
+        // the walker, so a fast agent can't skip the radius between samples. A
+        // teleport-sized step (slot reassignment / stale `prev_pos`) degrades to a
+        // point test.
+        let from = if agent.prev_pos.distance(cur) > MAX_SWEEP_M {
+            cur
+        } else {
+            agent.prev_pos
+        };
+        let near = point_segment_distance(wpos, from, cur) <= range;
+        agent.prev_pos = cur;
         if near && !agent.counted {
             agent.counted = true;
             if pool.rng.next_f64() < p {
@@ -548,6 +671,8 @@ pub fn mobile_capture_events(
                     AgentClass::Vehicle => walk_live.mobile_vehicle += 1,
                     AgentClass::Pedestrian => walk_live.mobile_glasses += 1,
                     AgentClass::Bus => walk_live.mobile_bus += 1,
+                    AgentClass::DeliveryRobot => walk_live.mobile_robot += 1,
+                    AgentClass::Tesla => walk_live.mobile_tesla += 1,
                 }
                 agent.flash = 1.0;
             }
@@ -556,3 +681,325 @@ pub fn mobile_capture_events(
         }
     }
 }
+
+/// Drive vehicles (taxis) + buses from the baked real-day schedules: a trip occupies
+/// a pooled entity while the clock is within its window; `animate_agents` then
+/// positions it from the `progress_m` we set here. Over the cap the active set is
+/// deterministically subsampled (earliest-by-start fill). Pedestrians are untouched
+/// (they stay on the diurnal model).
+#[allow(clippy::too_many_arguments)]
+pub fn replay_agents(
+    sim: Option<Res<Sim>>,
+    clock: Res<SimClock>,
+    ov: Res<OperatorsView>,
+    params: Res<Params>,
+    pool: Res<AgentPool>,
+    mut rs: ResMut<ReplayState>,
+    mut q: Query<&mut MobileAgent>,
+) {
+    let Some(sim) = sim else { return };
+    if ov.active || ov.t > 0.0 {
+        return; // Operators view owns the agents
+    }
+    // Runs whether playing or paused: it only *reads* `clock.time_of_day`, so a
+    // scrub-and-pause still shows exactly the trips active at that minute.
+    if pool.vehicles.len() != rs.veh_slot_trip.len() || pool.buses.len() != rs.bus_slot_trip.len() {
+        return; // pool / replay-state not yet aligned (pre-build)
+    }
+    let now = (clock.time_of_day * 60.0) as f32;
+
+    // ---------- Taxis: forward-cursor sweep over start-sorted trips ----------
+    let trips = &sim.taxi_day.trips;
+    let taxi_on = params.show_agents && params.dashcam_on && !params.heatmap_on;
+    let taxi_active = |t: &TaxiTrip| now >= t.pu_min && now < t.pu_min + t.dur_min;
+
+    // Wrap / scrub / toggled-off → drop all taxi slots and rebuild from the cursor.
+    let jumped = now < rs.veh_last_now - 1.0 || now > rs.veh_last_now + 30.0;
+    if !taxi_on || jumped {
+        for slot in 0..rs.veh_slot_trip.len() {
+            if rs.veh_slot_trip[slot] >= 0 {
+                if let Ok(mut a) = q.get_mut(pool.vehicles[slot]) {
+                    a.active = false;
+                }
+                rs.veh_slot_trip[slot] = -1;
+            }
+        }
+        rs.veh_cursor = 0;
+    }
+    if taxi_on {
+        // Free slots whose trip has ended.
+        for slot in 0..rs.veh_slot_trip.len() {
+            let ti = rs.veh_slot_trip[slot];
+            if ti >= 0 && !taxi_active(&trips[ti as usize]) {
+                if let Ok(mut a) = q.get_mut(pool.vehicles[slot]) {
+                    a.active = false;
+                }
+                rs.veh_slot_trip[slot] = -1;
+            }
+        }
+        // Admit started trips into free slots, in start order (subsample over cap).
+        let mut free = 0usize;
+        while rs.veh_cursor < trips.len() && trips[rs.veh_cursor].pu_min <= now {
+            let ti = rs.veh_cursor;
+            rs.veh_cursor += 1;
+            if !taxi_active(&trips[ti]) {
+                continue;
+            }
+            while free < rs.veh_slot_trip.len() && rs.veh_slot_trip[free] >= 0 {
+                free += 1;
+            }
+            if free >= rs.veh_slot_trip.len() {
+                break; // pool full
+            }
+            rs.veh_slot_trip[free] = ti as i32;
+            let route = sim.taxi_routes[trips[ti].route_idx as usize].clone();
+            if let Ok(mut a) = q.get_mut(pool.vehicles[free]) {
+                a.route = route;
+                a.active = true;
+                a.flash = 0.0;
+                a.counted = false;
+            }
+        }
+        // Position active taxis along their route by elapsed fraction — but through a
+        // turn-aware, speed-limit-capped pace (brake into corners, cruise on straights)
+        // instead of a flat constant-speed glide. The pace is precomputed per route.
+        for slot in 0..rs.veh_slot_trip.len() {
+            let ti = rs.veh_slot_trip[slot];
+            if ti >= 0 {
+                let t = &trips[ti as usize];
+                let frac = ((now - t.pu_min) / t.dur_min).clamp(0.0, 1.0) as f64;
+                if let Ok(mut a) = q.get_mut(pool.vehicles[slot]) {
+                    a.progress_m = match sim.taxi_paces.get(t.route_idx as usize) {
+                        Some(pace) => pace.arc_at(&a.route, frac),
+                        None => frac * a.route.total_m,
+                    };
+                }
+            }
+        }
+    }
+    rs.veh_last_now = now;
+
+    // ---------- Buses: full scan (few; dual window for after-midnight trips) ----------
+    let btrips = &sim.bus_day.trips;
+    let bus_on = params.show_agents && params.ace_on && !params.heatmap_on;
+    let bus_active = |t: &BusTrip| {
+        (now >= t.start_min && now < t.end_min)
+            || (now >= t.start_min - 1440.0 && now < t.end_min - 1440.0)
+    };
+    for slot in 0..rs.bus_slot_trip.len() {
+        let ti = rs.bus_slot_trip[slot];
+        if ti >= 0 && (!bus_on || !bus_active(&btrips[ti as usize])) {
+            rs.bus_mapped[ti as usize] = false;
+            rs.bus_slot_trip[slot] = -1;
+            if let Ok(mut a) = q.get_mut(pool.buses[slot]) {
+                a.active = false;
+            }
+        }
+    }
+    if bus_on {
+        let mut free = 0usize;
+        for ti in 0..btrips.len() {
+            if !bus_active(&btrips[ti]) || rs.bus_mapped[ti] {
+                continue;
+            }
+            while free < rs.bus_slot_trip.len() && rs.bus_slot_trip[free] >= 0 {
+                free += 1;
+            }
+            if free >= rs.bus_slot_trip.len() {
+                break;
+            }
+            rs.bus_slot_trip[free] = ti as i32;
+            rs.bus_mapped[ti] = true;
+            let route = sim.bus_routes[btrips[ti].shape_idx as usize].clone();
+            if let Ok(mut a) = q.get_mut(pool.buses[free]) {
+                a.route = route;
+                a.active = true;
+                a.flash = 0.0;
+                a.counted = false;
+            }
+        }
+        // Position active buses by their real per-stop time→arc keyframes, so motion
+        // tracks the actual timetable (dwell near stops, faster between them) rather
+        // than a flat constant speed.
+        for slot in 0..rs.bus_slot_trip.len() {
+            let ti = rs.bus_slot_trip[slot];
+            if ti >= 0 {
+                let t = &btrips[ti as usize];
+                let nm = if now >= t.start_min { now } else { now + 1440.0 };
+                let arc = bus_arc_at(&t.keyframes, nm) as f64;
+                if let Ok(mut a) = q.get_mut(pool.buses[slot]) {
+                    a.progress_m = arc;
+                }
+            }
+        }
+    }
+}
+
+/// Interpolate a bus trip's monotonic `[time_min, arc_m]` keyframes to the arc
+/// length at minute `t` (clamped to the trip's first/last stop).
+///
+/// Each keyframe is a stop's *departure* time, so within an inter-stop segment the
+/// bus **travels** (smoothstep-eased, decelerating into the stop) and then **dwells**
+/// at the upcoming stop until that departure time — giving visible stop-and-go motion
+/// instead of a flat constant-speed glide.
+fn bus_arc_at(kf: &[[f32; 2]], t: f32) -> f32 {
+    if kf.is_empty() {
+        return 0.0;
+    }
+    if t <= kf[0][0] {
+        return kf[0][1];
+    }
+    let last = kf[kf.len() - 1];
+    if t >= last[0] {
+        return last[1];
+    }
+    for w in kf.windows(2) {
+        let (t0, a0) = (w[0][0], w[0][1]);
+        let (t1, a1) = (w[1][0], w[1][1]);
+        if t >= t0 && t <= t1 {
+            let seg = t1 - t0;
+            if seg <= 0.0 {
+                return a1;
+            }
+            // Dwell at the segment's end (the arrival stop); travel fills the rest.
+            let dwell = BUS_DWELL_MIN.min(BUS_DWELL_FRAC * seg);
+            let travel = (seg - dwell).max(1e-4);
+            let f = ((t - t0) / travel).clamp(0.0, 1.0); // 1.0 → arrived, now dwelling
+            let eased = f * f * (3.0 - 2.0 * f); // smoothstep: ease out of / into stops
+            return a0 + (a1 - a0) * eased;
+        }
+    }
+    last[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landmarks_occlude_agents() {
+        // The landmark massing must draw above every mobile agent so a building's
+        // 2.5D silhouette occludes vehicles/peds/Teslas/robots driving behind it.
+        let agent_max = Z_VEHICLE.max(Z_PED).max(Z_BUS).max(Z_ROBOT).max(Z_TESLA);
+        assert!(
+            crate::LANDMARK_MASSING_Z > agent_max,
+            "landmark massing z ({}) must exceed every agent z ({agent_max})",
+            crate::LANDMARK_MASSING_Z,
+        );
+    }
+
+    #[test]
+    fn camera_icons_floor_to_min_screen_size() {
+        use crate::{
+            icon_floor_px, icon_half_for, ICON_FLOOR_FAR_PX, ICON_FLOOR_NEAR_PX, ICON_TAPER_FAR,
+            ICON_TAPER_NEAR,
+        };
+        let base = 13.0_f32; // a 26 m icon
+        // Zoomed in (small m/px): the intrinsic size wins, icons grow on screen.
+        assert_eq!(icon_half_for(base, 0.5), base);
+        // Zoomed out (large m/px): floored to the on-screen pixel floor for that zoom.
+        let scale = 9.0_f32; // ~island overview
+        let half = icon_half_for(base, scale);
+        assert!(half > base, "the pixel floor kicks in when zoomed out");
+        assert!(
+            (half / scale - icon_floor_px(scale)).abs() < 1e-3,
+            "at the floor, on-screen half-size == icon_floor_px(scale)",
+        );
+        // The floor tapers: smaller (in px) when zoomed out than when zoomed in.
+        assert!(icon_floor_px(ICON_TAPER_FAR + 5.0) < icon_floor_px(ICON_TAPER_NEAR - 1.0));
+        assert!((icon_floor_px(ICON_TAPER_NEAR - 1.0) - ICON_FLOOR_NEAR_PX).abs() < 1e-3);
+        assert!((icon_floor_px(ICON_TAPER_FAR + 1.0) - ICON_FLOOR_FAR_PX).abs() < 1e-3);
+        // Never smaller than the intrinsic size, however far in you zoom.
+        assert!(icon_half_for(base, 0.01) >= base);
+    }
+
+    #[test]
+    fn heatmap_colormap_is_perceptually_ordered() {
+        use crate::heat_rgba;
+        // Empty cells are fully transparent.
+        assert_eq!(heat_rgba(0.0), [0, 0, 0, 0]);
+        let lum = |c: [u8; 4]| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+        // Density reads as darkness: luminance decreases monotonically with intensity,
+        // so equal data steps look like equal visual steps (perceptual ordering).
+        let lums: Vec<f32> = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+            .iter()
+            .map(|&n| lum(heat_rgba(n)))
+            .collect();
+        for w in lums.windows(2) {
+            assert!(w[0] > w[1], "colormap must darken as density rises: {lums:?}");
+        }
+        // Alpha is held CONSTANT across density (density reads from color alone — a
+        // density-linked alpha would double the lightness gradient and break perceptual
+        // uniformity). Every non-empty cell shares one opacity, well above the floor.
+        assert_eq!(heat_rgba(0.1)[3], heat_rgba(0.9)[3], "non-empty cells share one alpha");
+        assert!(heat_rgba(0.1)[3] > 80, "low-density cells stay visible");
+    }
+
+    #[test]
+    fn declutter_drops_overlapping_lower_priority_labels() {
+        use crate::declutter_keep;
+        use bevy::math::Vec2;
+        // Boxes are fed in priority order. The first is kept; the second overlaps it (centres
+        // 10 apart, half-widths 8 each → |Δx| 10 < 16) so it yields; the third is far → kept.
+        let boxes = [
+            (Vec2::new(0.0, 0.0), 8.0, 5.0),
+            (Vec2::new(10.0, 0.0), 8.0, 5.0),
+            (Vec2::new(100.0, 0.0), 8.0, 5.0),
+        ];
+        assert_eq!(declutter_keep(&boxes), vec![true, false, true]);
+        // Disjoint boxes (touching beyond the half-width sum) all survive.
+        let disjoint = [
+            (Vec2::new(0.0, 0.0), 4.0, 4.0),
+            (Vec2::new(9.0, 0.0), 4.0, 4.0),
+        ];
+        assert_eq!(declutter_keep(&disjoint), vec![true, true]);
+    }
+
+    #[test]
+    fn future_mode_groups_speculative_layers() {
+        use crate::Params;
+        let mut p = Params::default();
+        // Smart glasses + future mode are off by default (the speculative layers hide).
+        assert!(!p.future_on && !p.glasses_on && !p.robots_on);
+        p.set_future(true);
+        assert!(p.future_on && p.glasses_on && p.robots_on, "one switch shows both");
+        p.set_future(false);
+        assert!(!p.future_on && !p.glasses_on && !p.robots_on, "and hides both");
+    }
+
+    #[test]
+    fn evidence_number_formatting() {
+        use crate::{compact_usd, group_thousands};
+        assert_eq!(group_thousands(242_742), "242,742");
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000_000), "1,000,000");
+        assert_eq!(compact_usd(27_911_985.0), "$27.9M");
+        assert_eq!(compact_usd(950.0), "$950");
+        assert_eq!(compact_usd(12_500.0), "$12K");
+        assert_eq!(compact_usd(2_500_000_000.0), "$2.5B");
+    }
+
+    #[test]
+    fn ace_ribbons_floor_to_min_screen_width() {
+        use crate::{ace_half_for, MIN_ACE_HALF_PX};
+        let base = 4.0_f32;
+        assert_eq!(ace_half_for(base, 0.5), base, "zoomed in: intrinsic width");
+        let scale = 4.6_f32;
+        let half = ace_half_for(base, scale);
+        assert!(half > base, "zoomed out: floored wider so it stays visible");
+        assert!((half / scale - MIN_ACE_HALF_PX).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bus_dwells_at_stops() {
+        // Stops: arc 0 at t=0, arc 100 at t=1. dwell = min(0.25, 0.4·1) = 0.25, so the
+        // bus travels over [0, 0.75] and holds at arc 100 through [0.75, 1.0].
+        let kf = [[0.0f32, 0.0], [1.0, 100.0]];
+        assert!((bus_arc_at(&kf, 0.75) - 100.0).abs() < 0.5, "arrives by end of travel");
+        assert!((bus_arc_at(&kf, 0.9) - 100.0).abs() < 0.5, "holds at the stop (dwell)");
+        let mid = bus_arc_at(&kf, 0.375);
+        assert!(mid > 0.0 && mid < 100.0, "moving strictly between stops");
+    }
+}
+

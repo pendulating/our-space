@@ -16,6 +16,8 @@ use sim_core::assets::{FixedSensorData, FixedSensorLayer, Provenance};
 use sim_core::exposure::SourceKind;
 use sim_core::projection::{EnuProjection, GeoOrigin};
 
+use crate::extent::Extent;
+
 /// Detector recall reported by Dahir et al.
 const RECALL: f64 = 0.63;
 
@@ -33,13 +35,7 @@ struct Row {
     camera_count: i32,
 }
 
-/// Loose Manhattan bounding box (keeps the island + immediate waterfront,
-/// excludes the other boroughs present in the NYC rows).
-fn in_manhattan_bbox(lat: f64, lon: f64) -> bool {
-    (40.698..=40.882).contains(&lat) && (-74.022..=-73.906).contains(&lon)
-}
-
-pub fn bake(csv_path: &str, out_path: &str) -> anyhow::Result<usize> {
+pub fn bake(csv_path: &str, out_path: &str, extent: Extent) -> anyhow::Result<usize> {
     let proj = EnuProjection::default();
     let mut rdr = csv::Reader::from_path(csv_path)
         .with_context(|| format!("opening {csv_path}"))?;
@@ -58,7 +54,7 @@ pub fn bake(csv_path: &str, out_path: &str) -> anyhow::Result<usize> {
             continue;
         }
         detections += 1;
-        if !in_manhattan_bbox(row.lat, row.lon) {
+        if !extent.contains_latlon(row.lat, row.lon) {
             continue;
         }
         if !seen.insert(row.panoid.clone()) {
@@ -93,7 +89,8 @@ pub fn bake(csv_path: &str, out_path: &str) -> anyhow::Result<usize> {
     std::fs::write(out_path, layer.to_bytes()?)
         .with_context(|| format!("writing {out_path}"))?;
     eprintln!(
-        "Dahir: {ny_rows} NY sample-points, {detections} detections, {count} unique Manhattan cameras baked -> {out_path}"
+        "Dahir: {ny_rows} NY sample-points, {detections} detections, {count} unique cameras baked for {} -> {out_path}",
+        extent.label()
     );
     Ok(count)
 }

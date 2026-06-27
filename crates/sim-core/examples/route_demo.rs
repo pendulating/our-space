@@ -4,7 +4,7 @@
 //! Run from the workspace root (so the asset paths resolve):
 //!   cargo run -p sim-core --example route_demo -- 40.758 -73.9855 40.7359 -73.9911
 
-use sim_core::assets::{AceCorridorLayer, DashcamFieldLayer, FixedSensorLayer, GraphAsset};
+use sim_core::assets::{AceCorridorLayer, CctvCameraLayer, DashcamFieldLayer, GraphAsset};
 use sim_core::scenario::{run_route, sensors_from_layer, FixedCameraDefaults};
 use sim_core::simulation::SimParams;
 use sim_core::{AceConfig, EnuProjection, MobileScenario, StreetGraph, Vec2};
@@ -21,7 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = "crates/app-interactive/assets/processed";
     let graph_path = std::env::var("GRAPH").unwrap_or_else(|_| format!("{base}/graph_manhattan.osgraph"));
     let graph = StreetGraph::from_asset(GraphAsset::from_bytes(&std::fs::read(&graph_path)?)?);
-    let layer = FixedSensorLayer::from_bytes(&std::fs::read(format!("{base}/cameras_fixed.oscam"))?)?;
+    let layer =
+        CctvCameraLayer::from_bytes(&std::fs::read(format!("{base}/cameras_fixed.oscctv"))?)?
+            .to_fixed_layer();
 
     let recall = layer.recall.unwrap_or(1.0);
     let sensors = sensors_from_layer(&layer, FixedCameraDefaults::default());
@@ -51,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let from = proj.to_enu(from_lat, from_lon);
     let to = proj.to_enu(to_lat, to_lon);
     let (_route, sum) = run_route(
-        &graph, &sensors, &[], &mobile, from, to, params, departure_hour, dashcam_field.as_ref(),
+        &graph, &sensors, &[], &mobile, from, to, params, departure_hour, dashcam_field.as_ref(), None, None, None,
     )?;
 
     println!("── our-space exposure demo ──────────────────────────────");

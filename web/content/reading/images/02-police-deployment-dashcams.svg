@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270" role="img" aria-label="ACM FAccT 2023 paper">
+  <rect width="480" height="270" fill="#f1e8d8"/>
+  <!-- page panel -->
+  <rect x="40" y="24" width="400" height="222" fill="#faf5ea" stroke="#c2b291" stroke-width="1.5"/>
+  <!-- left margin rule -->
+  <line x1="74" y1="24" x2="74" y2="246" stroke="#dabd8f" stroke-width="1"/>
+  <!-- title -->
+  <rect x="92" y="48" width="284" height="11" rx="3" fill="#241c12"/>
+  <rect x="92" y="66" width="196" height="11" rx="3" fill="#241c12"/>
+  <!-- body text, with redaction bars -->
+  <rect x="92" y="98"  width="270" height="6" rx="2" fill="#67563f" opacity="0.45"/>
+  <rect x="92" y="112" width="300" height="6" rx="2" fill="#67563f" opacity="0.45"/>
+  <rect x="92" y="126" width="92"  height="6" rx="2" fill="#a8541f"/>
+  <rect x="194" y="126" width="198" height="6" rx="2" fill="#67563f" opacity="0.45"/>
+  <rect x="92" y="140" width="300" height="6" rx="2" fill="#67563f" opacity="0.45"/>
+  <rect x="92" y="154" width="150" height="6" rx="2" fill="#3a2e21"/>
+  <rect x="252" y="154" width="110" height="6" rx="2" fill="#67563f" opacity="0.45"/>
+  <rect x="92" y="168" width="172" height="6" rx="2" fill="#a8541f"/>
+  <!-- venue -->
+  <text x="92" y="218" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2" fill="#a8541f">ACM · FAccT 2023</text>
+</svg>

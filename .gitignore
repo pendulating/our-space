@@ -23,3 +23,9 @@ __pycache__/
 #   Rebuild with ./web/build.sh and commit before pushing — see
 #   .github/workflows/deploy.yml.
 /web/node_modules
+
+# Agent/editor tooling — installed skills + local Claude Code config, not
+# part of the our·space project source.
+/.agents
+/.claude
+/skills-lock.json

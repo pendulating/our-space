@@ -20,37 +20,35 @@ struct AceRow {
     program: String,
 }
 
-/// Manhattan-route base key: leading 'M' + run of digits ("M15+" -> "M15",
-/// "M14A-SBS" -> "M14"). Returns None for non-Manhattan / unparseable routes.
-fn manhattan_base(name: &str) -> Option<String> {
-    let mut chars = name.chars();
-    if chars.next()? != 'M' {
-        return None;
-    }
-    let digits: String = name[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
-    } else {
-        Some(format!("M{digits}"))
-    }
-}
-
-pub fn bake(gtfs_dir: &str, ace_json: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
-    // 1. ACE route bases (Manhattan, Program == ACE).
+pub fn bake(
+    gtfs_dir: &str,
+    ace_json: &str,
+    out_path: &str,
+    extent: crate::extent::Extent,
+    boundary_geojson: Option<&str>,
+) -> anyhow::Result<(usize, usize)> {
+    // Optional borough clip: ACE shapes (e.g. the M60-SBS) run out to LGA, so the
+    // teal corridor lines + the analytical ACE term would extend off the island.
+    // Citywide bakes pass no boundary (the whole-NYC geometry is wanted).
+    let boundary = boundary_geojson
+        .map(crate::boundary::ManhattanBoundary::load)
+        .transpose()?;
+    // 1. ACE route bases (Program == ACE); Manhattan extent keeps only M… routes,
+    // NYC extent keeps all five boroughs.
     let ace_bytes = std::fs::read(ace_json).with_context(|| format!("reading {ace_json}"))?;
     let ace_rows: Vec<AceRow> = serde_json::from_slice(&ace_bytes).context("parsing ACE JSON")?;
     let ace_bases: HashSet<String> = ace_rows
         .iter()
         .filter(|r| r.program.eq_ignore_ascii_case("ACE"))
-        .filter_map(|r| manhattan_base(&r.route))
+        .filter_map(|r| extent.route_base(&r.route))
         .collect();
-    anyhow::ensure!(!ace_bases.is_empty(), "no Manhattan ACE routes found");
+    anyhow::ensure!(!ace_bases.is_empty(), "no ACE routes found for extent {}", extent.label());
 
     // 2. GTFS routes whose base is ACE -> route_ids + the matched short names.
     let mut ace_route_ids: HashSet<String> = HashSet::new();
     let mut matched_routes: Vec<String> = Vec::new();
     let mut route_id_to_short: HashMap<String, String> = HashMap::new();
-    let mut rdr = csv::Reader::from_path(format!("{gtfs_dir}/routes.txt"))
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_path(format!("{gtfs_dir}/routes.txt"))
         .with_context(|| format!("opening {gtfs_dir}/routes.txt"))?;
     let headers = rdr.headers()?.clone();
     let col = |name: &str| headers.iter().position(|h| h == name);
@@ -61,7 +59,7 @@ pub fn bake(gtfs_dir: &str, ace_json: &str, out_path: &str) -> anyhow::Result<(u
     for rec in rdr.records() {
         let rec = rec?;
         let short = rec.get(c_short).unwrap_or("");
-        if manhattan_base(short).is_some_and(|b| ace_bases.contains(&b)) {
+        if extent.route_base(short).is_some_and(|b| ace_bases.contains(&b)) {
             let id = rec.get(c_id).unwrap_or("").to_string();
             route_id_to_short.insert(id.clone(), short.to_string());
             ace_route_ids.insert(id);
@@ -74,7 +72,7 @@ pub fn bake(gtfs_dir: &str, ace_json: &str, out_path: &str) -> anyhow::Result<(u
     // 3. trips.txt -> shape_ids used by ACE routes (+ shape -> route short name).
     let mut shape_ids: HashSet<String> = HashSet::new();
     let mut shape_to_route: HashMap<String, String> = HashMap::new();
-    let mut rdr = csv::Reader::from_path(format!("{gtfs_dir}/trips.txt"))?;
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_path(format!("{gtfs_dir}/trips.txt"))?;
     let headers = rdr.headers()?.clone();
     let (c_rid, c_shape) = (
         headers.iter().position(|h| h == "route_id").context("trips route_id")?,
@@ -96,7 +94,7 @@ pub fn bake(gtfs_dir: &str, ace_json: &str, out_path: &str) -> anyhow::Result<(u
 
     // 4. shapes.txt -> ordered points per ACE shape.
     let mut shapes: HashMap<String, Vec<(u32, f64, f64)>> = HashMap::new();
-    let mut rdr = csv::Reader::from_path(format!("{gtfs_dir}/shapes.txt"))?;
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_path(format!("{gtfs_dir}/shapes.txt"))?;
     let headers = rdr.headers()?.clone();
     let (c_sid, c_lat, c_lon, c_seq) = (
         headers.iter().position(|h| h == "shape_id").context("shape_id")?,
@@ -127,27 +125,35 @@ pub fn bake(gtfs_dir: &str, ace_json: &str, out_path: &str) -> anyhow::Result<(u
             let p = proj.to_enu(*la, *lo);
             [p.x, p.y]
         }).collect();
-        for w in enu.windows(2) {
-            segments.push([w[0], w[1]]);
-        }
-        // Distance-decimated polyline (keep first/last + points >8 m apart).
-        let mut kept: Vec<[f32; 2]> = Vec::new();
-        for (i, p) in enu.iter().enumerate() {
-            let keep = i == 0
-                || i == enu.len() - 1
-                || kept.last().map_or(true, |k| {
-                    let (dx, dy) = (p[0] - k[0] as f64, p[1] - k[1] as f64);
-                    dx * dx + dy * dy > 64.0
-                });
-            if keep {
-                kept.push([p[0] as f32, p[1] as f32]);
+        // Clip to the boundary → one or more in-borough runs (no clip → the whole shape).
+        let runs = match &boundary {
+            Some(b) => b.clip_polyline(&enu),
+            None => vec![enu],
+        };
+        let route = shape_to_route.get(sid).cloned().unwrap_or_default();
+        for run in &runs {
+            for w in run.windows(2) {
+                segments.push([w[0], w[1]]);
             }
-        }
-        if kept.len() >= 2 {
-            polylines.push(AcePolyline {
-                route: shape_to_route.get(sid).cloned().unwrap_or_default(),
-                points: kept,
-            });
+            // Distance-decimated polyline (keep first/last + points >8 m apart).
+            let mut kept: Vec<[f32; 2]> = Vec::new();
+            for (i, p) in run.iter().enumerate() {
+                let keep = i == 0
+                    || i == run.len() - 1
+                    || kept.last().map_or(true, |k| {
+                        let (dx, dy) = (p[0] - k[0] as f64, p[1] - k[1] as f64);
+                        dx * dx + dy * dy > 64.0
+                    });
+                if keep {
+                    kept.push([p[0] as f32, p[1] as f32]);
+                }
+            }
+            if kept.len() >= 2 {
+                polylines.push(AcePolyline {
+                    route: route.clone(),
+                    points: kept,
+                });
+            }
         }
     }
     anyhow::ensure!(!segments.is_empty(), "no ACE shape geometry found");
@@ -163,7 +169,8 @@ pub fn bake(gtfs_dir: &str, ace_json: &str, out_path: &str) -> anyhow::Result<(u
             license: "MTA / OPEN-NY Terms of Use".into(),
             as_of: "2026-06-14".into(),
             notes: format!(
-                "Manhattan ACE routes ({}); enforcement hours assumed all-day.",
+                "{} ACE routes ({}); enforcement hours assumed all-day.",
+                extent.label(),
                 matched_routes.join(", ")
             ),
         },

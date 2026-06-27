@@ -231,16 +231,21 @@ Each subcommand writes to the `<out>` path it is given. Parent directories are a
 
 | Subcommand | Args | Module / entry | Produces |
 |---|---|---|---|
-| `bake-graph --overpass-json` | `<walk.json> <out>` | `graph_osm::bake` | routable pedestrian `GraphAsset` from OSM walk network |
+| `bake-graph --overpass-json` | `<walk.json> <out> [manhattan.geojson]` | `graph_osm::bake` | routable pedestrian `GraphAsset` from OSM walk network (optional GeoJSON clips it to the Manhattan borough) |
+| `bake-graph --overpass-drive` | `<walk.json> <out> [manhattan.geojson]` | `graph_osm::bake` (drive) | **drive** `GraphAsset` — excludes `highway=pedestrian` plazas + access-restricted ways, for vehicle/taxi routing (build-time only; not loaded at runtime) |
 | `bake-graph --synthetic` | `<rows> <cols> <spacing_m> <out>` | `graph_synth::synthetic_grid` | synthetic grid graph (testing/dev; no provenance source) |
 | `bake-cameras` | `<map_data.csv> <out>` | `cameras_dahir::bake` | Dahir-only fixed-CCTV `FixedSensorLayer` (fallback) |
 | `bake-cctv` | `<amnesty_counts.csv> <dahir_map_data.csv> <out>` | `amnesty::bake` | **unified** fixed-CCTV `FixedSensorLayer` (Amnesty census + Dahir, de-duplicated) |
-| `bake-ace` | `<gtfs_dir> <ace_routes.json> <out>` | `ace::bake` | `AceCorridorLayer` |
+| `bake-ace` | `<gtfs_dir> <ace_routes.json> <out> [manhattan.geojson]` | `ace::bake` | `AceCorridorLayer` (optional GeoJSON clips corridors to Manhattan) |
 | `bake-equity` | `<bg.geojson> <acs.json> <map_data.csv> <out>` | `equity::bake` | `EquityLayer` |
 | `bake-dashcam-field` | `<taxi_zones.geojson> <zone_trips.csv> <out>` | `dashcam::bake` | `DashcamFieldLayer` |
 | `bake-alpr` | `<alpr_overpass.json> <out>` | `alpr::bake` | ALPR `FixedSensorLayer` |
 | `bake-dot` | `<nyctmc_cameras.json> <out>` | `dot::bake` | NYC DOT traffic-cam `FixedSensorLayer` (locations only) |
 | `bake-vehicle-routes` | `<graph.osgraph> <taxi_zones.geojson> <zone_od.csv> <out> [max_routes]` | `vehicle_routes::bake` | `VehicleRoutesLayer` (weighted rideshare route pool for the animated agents) |
+| `bake-borough` | `<borough_boundaries.geojson> <BoroughName> <out>` | `borough::bake` | `BoroughOutline` (main-landmass coastline ring; the map frame) |
+| `bake-footprints` | `<building_footprints.geojson> <out> [manhattan.geojson]` | `footprints::bake` | `BuildingFootprints` (flat ENU rings; the ground fabric) |
+| `bake-landmarks` | `<landmarks_lod2.json> <out>` | `landmarks::bake` | `LandmarkMassing` (curated LoD2 buildings, oblique-rendered for orientation) |
+| `bake-linknyc` | `<kiosks.json> <out> [manhattan.geojson]` | `linknyc::bake` | `LinkNycLayer` — LinkNYC Wi-Fi kiosks as a fixed point layer (not cameras; conditional surveillance) |
 
 The heatmap is **not** a `data-pipeline` subcommand — it is produced by the `batch` crate: `batch heatmap <out.postcard> [hour]` (default `hour = 17.0`).
 

@@ -150,4 +150,19 @@ mod tests {
         // degenerate segment = point distance
         assert!((point_segment_distance(Vec2::new(0.0, 2.0), a, a) - 2.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn swept_pass_beats_point_test_no_tunneling() {
+        // A fast agent jumps from (-30, 5) to (30, 5) in one frame, passing the
+        // walker at the origin. Both endpoints are >22 m away (a point test at
+        // either frame misses), but the swept segment grazes within 5 m — the
+        // capture test must see it.
+        let walker = Vec2::new(0.0, 0.0);
+        let prev = Vec2::new(-30.0, 5.0);
+        let cur = Vec2::new(30.0, 5.0);
+        let range = 22.0;
+        assert!(prev.distance(walker) > range, "prev endpoint should be out of range");
+        assert!(cur.distance(walker) > range, "cur endpoint should be out of range");
+        assert!(point_segment_distance(walker, prev, cur) <= range, "swept path must register");
+    }
 }

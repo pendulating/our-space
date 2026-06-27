@@ -6,9 +6,12 @@
   <title>our·space — a survey of the watched commons</title>
   <meta name="description" content="An earthy, honest estimate of how many cameras and sensing devices could capture you on a walk through Manhattan. A model, not a surveillance map." />
 
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,900&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="preconnect" href="https://use.typekit.net" crossorigin />
+  <link rel="preconnect" href="https://p.typekit.net" crossorigin />
+  <!-- Host Grotesk (Adobe Fonts): the single typographic voice — shared with the
+       in-canvas egui UI (see crates/app-interactive/src/theme.rs). Hierarchy comes
+       from weight, size, case and tracking, not from mixing typefaces. -->
+  <link rel="stylesheet" href="https://use.typekit.net/vfq0lcs.css" />
 
   <!-- MapLibre GL: renders the NYC Human Geography vector basemap behind the
        transparent Bevy canvas. -->
@@ -17,8 +20,8 @@
 
   <style>
     :root {
-      --page: #e3d7bf;     /* aged parchment */
-      --surface: #efe6d2;  /* lighter plate */
+      --page: #ffffff;     /* white paper */
+      --surface: #f7f7f8;  /* faintly off-white plate */
       --ink: #3a2e21;      /* oak-gall ink */
       --ink-strong: #241c12;
       --muted: #67563f;    /* faded marginalia */
@@ -28,9 +31,10 @@
       --terra-link: #8c3f12;
       --cold: #345169;     /* the machine — slate intrusion */
       --lichen: #4e6638; --ochre: #7a5d18; --clay: #a8501f;
-      --display: "Fraunces", Georgia, serif;
-      --body: "Spectral", Georgia, serif;
-      --mono: "IBM Plex Mono", ui-monospace, monospace;
+      /* One family, many weights — Host Grotesk across the whole page. */
+      --display: "host-grotesk", "Helvetica Neue", Arial, sans-serif;
+      --body: "host-grotesk", "Helvetica Neue", Arial, sans-serif;
+      --mono: "host-grotesk", "Helvetica Neue", Arial, sans-serif; /* label use: uppercased + tracked */
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink);
@@ -51,23 +55,68 @@
       content: ""; position: absolute; left: 0; right: 3px; bottom: -1.5px; height: 2px;
       background: var(--terra); opacity: .5; }
     .plate { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
-    h1 { margin: 0; font-family: var(--display); font-weight: 900;
-      font-size: clamp(22px, 3.4vw, 34px); letter-spacing: -0.01em; color: var(--ink-strong);
-      text-shadow: 0 1px 0 rgba(255, 250, 238, .55); }
+    h1 { margin: 0; font-family: var(--display); font-weight: 800;
+      font-size: clamp(22px, 3.4vw, 34px); letter-spacing: -0.025em; line-height: 1.0;
+      color: var(--ink-strong); }
     h1 .dot { color: var(--terra); }
-    .seal { font-family: var(--display); font-weight: 600; font-size: 11px;
-      text-transform: uppercase; letter-spacing: .14em; color: var(--terra);
-      border: 1px solid var(--terra); border-radius: 3px; padding: 3px 8px;
-      transform: rotate(-1.5deg); opacity: .82; }
-    .subtitle { margin: 4px 0 0; font-style: italic; color: var(--muted);
-      font-size: clamp(13px, 1.6vw, 15px); max-width: 64ch; }
-    .subtitle strong { font-style: normal; font-weight: 600; color: var(--ink); }
+
+    /* ---- header: wordmark at left, "further reading" filling ALL the whitespace to
+       the right. The panel flexes to the full remaining width and lays its cards out
+       in a wrapping grid (as many columns as fit), so the cards span the header
+       horizontally and stay 1-2 short rows tall instead of one tall column. */
+    .masthead { display: flex; align-items: center; gap: clamp(20px, 4vw, 56px); }
+    .lead { flex: 0 1 auto; min-width: 0; }
+    .reading { flex: 1 1 0%; min-width: 0;
+      border-left: 1px solid var(--rule); padding-left: clamp(16px, 2vw, 26px); }
+    .reading[hidden] { display: none; }
+    .reading-title { margin: 0 0 7px; font-family: var(--display); font-weight: 700;
+      font-size: 11px; text-transform: uppercase; letter-spacing: .16em; color: var(--terra); }
+    .reading-cards { display: grid; gap: 8px;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); align-items: start; }
+    .reading-card { position: relative; display: block; border: 1px solid var(--rule-2);
+      border-radius: 4px; background: var(--page); overflow: hidden;
+      transition: transform .18s ease-out, box-shadow .18s ease-out, border-color .18s ease-out; }
+    .reading-card:hover { border-color: var(--terra); background: var(--surface);
+      transform: translateY(-3px); box-shadow: 0 7px 20px -10px rgba(36, 28, 18, .3); }
+    .reading-card:focus-visible { outline: 2px solid var(--terra); outline-offset: 2px; }
+    /* the teaser sits in a fixed, clipped frame so it can zoom on hover without
+       nudging the body text below it — the card itself only lifts */
+    .rc-frame { position: relative; overflow: hidden; height: 96px;
+      background: var(--surface); border-bottom: 1px solid var(--rule-2); }
+    .rc-thumb { display: block; width: 100%; height: 100%; object-fit: cover;
+      transition: transform .45s ease, filter .25s ease; }
+    .reading-card:hover .rc-thumb { transform: scale(1.05); filter: saturate(1.06); }
+    .rc-body { display: block; padding: 8px 11px 10px; }
+    .reading-card .rc-kind { display: inline-block; font-family: var(--mono); font-weight: 600;
+      font-size: 9px; text-transform: uppercase; letter-spacing: .15em; color: var(--cold);
+      transition: color .18s ease-out; }
+    .reading-card:hover .rc-kind { color: var(--terra); }
+    .reading-card .rc-title { font-family: var(--display); font-weight: 700; font-size: 14px;
+      line-height: 1.22; letter-spacing: -0.01em; color: var(--ink-strong); margin: 2px 0 3px;
+      transition: color .18s ease-out; }
+    .reading-card:hover .rc-title { color: var(--terra-link); }
+    .reading-card .rc-source { font-size: 11px; color: var(--muted); font-style: italic;
+      line-height: 1.3; }
+    @media (prefers-reduced-motion: reduce) {
+      .reading-card, .reading-card .rc-thumb, .reading-card .rc-kind,
+      .reading-card .rc-title { transition: none; }
+      .reading-card:hover, .reading-card:hover .rc-thumb { transform: none; }
+    }
+    @media (max-width: 760px) {
+      .masthead { flex-direction: column; align-items: stretch; }
+      .reading { width: 100%; border-left: none;
+        border-top: 1px solid var(--rule); padding-left: 0; padding-top: 10px; }
+    }
 
     /* ---- the map stage ---- */
-    #stage { position: relative; flex: 1; min-height: 0; background: var(--page); }
-    /* MapLibre basemap: the ground layer, behind everything. Input is owned by
-       the Bevy canvas on top, so the basemap itself ignores pointer events. */
-    #basemap { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+    /* White paper ground (matches the native build's ZINC_950 = #fff): the sim's
+       paper palette — ink linework, gray buildings, hazard-yellow accents — is
+       designed to read on this, and it's what shows when the basemap is toggled off. */
+    #stage { position: relative; flex: 1; min-height: 0; background: #ffffff; }
+    /* MapLibre basemap: an OPTIONAL ground layer, behind everything. Hidden by
+       default (toggled on from the panel); input is owned by the Bevy canvas on
+       top, so the basemap itself ignores pointer events. */
+    #basemap { position: absolute; inset: 0; z-index: 0; pointer-events: none; display: none; }
     #basemap canvas { outline: none; }
     /* The Bevy canvas sits on top, transparent, drawing only the sim layers. */
     #bevy-canvas { position: absolute; inset: 0; z-index: 1; display: block;
@@ -81,7 +130,8 @@
       animation: ink 1.8s cubic-bezier(.22, .61, .36, 1) infinite alternate; }
     .ink-tick { stroke: var(--terra); stroke-width: 2; opacity: .6; }
     @keyframes ink { to { stroke-dashoffset: 0; } }
-    #ov-title { font-family: var(--display); font-weight: 600; font-size: 20px; margin: 0 0 6px; }
+    #ov-title { font-family: var(--display); font-weight: 700; font-size: 20px;
+      letter-spacing: -0.015em; margin: 0 0 6px; }
     #ov-msg { color: var(--muted); font-style: italic; margin: 0; }
     @media (prefers-reduced-motion: reduce) { .ink-path { animation: none; stroke-dashoffset: 0; } }
 
@@ -90,24 +140,25 @@
       border-top: 2px solid var(--rule); box-shadow: 0 -1px 0 var(--rule-2) inset;
       display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
       font-style: italic; color: var(--muted); font-size: 13.5px; }
-    .seals { display: flex; gap: 6px; font-style: normal; }
-    .chip { font-family: var(--display); font-weight: 600; font-size: 11px; letter-spacing: .04em;
-      padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; background: transparent; }
-    .chip.a { color: var(--lichen); } .chip.b { color: var(--ochre); }
-    .chip.c { color: var(--clay); } .chip.d { color: var(--cold); }
     .prov { flex: 1; min-width: 240px; }
   </style>
 </head>
 <body>
   <div id="app">
     <header>
-      <div class="plate">
-        <h1>our<span class="dot">·</span>space</h1>
-        <span class="seal">Survey of the Watched Commons · Manhattan</span>
+      <div class="masthead">
+        <div class="lead">
+          <div class="plate">
+            <h1>OUR<span class="dot">·</span>SPACE</h1>
+          </div>
+        </div>
+        <!-- Further reading: cards baked from web/content/reading/*.md into reading.json
+             at build time, fetched + rendered below. Hidden until populated. -->
+        <aside class="reading" id="reading" aria-label="Further reading" hidden>
+          <h2 class="reading-title">Further reading</h2>
+          <div class="reading-cards" id="reading-cards"></div>
+        </aside>
       </div>
-      <p class="subtitle">Cameras and sensing devices are quietly filling public space. Trace a walk through
-        Manhattan and see how much of it is watched — and by whom. <strong>A model estimate with stated
-        sources, not a surveillance map; your route never leaves this browser.</strong></p>
     </header>
 
     <div id="stage">
@@ -130,9 +181,6 @@
     </div>
 
     <footer>
-      <span class="seals">
-        <span class="chip a">A mapped</span><span class="chip b">B estimated</span><span class="chip c">C modeled</span><span class="chip d">D speculative</span>
-      </span>
       <span class="prov">Streets © OpenStreetMap (ODbL) · fixed CCTV: Amnesty International <em>Decode Surveillance NYC</em> (CC&nbsp;BY-NC-ND&nbsp;4.0) + Dahir et&nbsp;al. 2025 (CC&nbsp;BY&nbsp;4.0), aggregated &amp; de-duplicated · ALPR plate readers: DeFlock via OSM (crowdsourced) · DOT traffic cams: NYC&nbsp;DOT (nyctmc.org) <em>locations only — images not used</em> · ACE: MTA&nbsp;GTFS + NY&nbsp;OpenData · diversity: US&nbsp;Census&nbsp;ACS · rideshare-camera density: NYC&nbsp;TLC Uber/Lyft trips. Smart glasses remain a <em>scenario</em>.</span>
     </footer>
   </div>
@@ -145,6 +193,7 @@
     (function () {
       const ARCGIS = 'https://tiles.arcgis.com/tiles/yG5s3afENB5iO9fj/arcgis/rest/services/NYC_Basemap_v3/VectorTileServer';
       let map = null;
+      let initStarted = false; // the basemap is created lazily, on first enable
       // Manhattan ENU origin (matches sim_core GeoOrigin::MANHATTAN) — the map's
       // starting view until the Bevy camera takes over on the first frame.
       const ORIGIN = { lon: -73.9712, lat: 40.7831 };
@@ -195,6 +244,19 @@
         map.jumpTo({ center: [lon, lat], zoom: z });
       };
 
+      // Show / hide the optional street basemap. The basemap is OFF by default —
+      // the MapLibre map is created lazily the first time it's enabled, so the page
+      // pays no basemap network cost unless the user opts in (panel → More layers →
+      // On the map → Street basemap). Driven from Bevy via Params.basemap_on.
+      window.ourspaceSetBasemapVisible = function (visible) {
+        const el = document.getElementById('basemap');
+        if (el) el.style.display = visible ? 'block' : 'none';
+        if (visible && !initStarted) {
+          initStarted = true;
+          initBasemap();
+        }
+      };
+
       // Honor the OS reduced-motion preference: the Operators view reads this once
       // at startup and snaps (no fly animation) when true. Defined synchronously
       // here so it exists before the wasm module loads.
@@ -202,7 +264,43 @@
         return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       };
 
-      initBasemap();
+      // No eager init: the basemap stays hidden until ourspaceSetBasemapVisible(true).
+    })();
+  </script>
+
+  <script>
+    // Further-reading cards: data lives in web/content/reading/*.md (one card per file),
+    // baked into reading.json by tools/build_reading.py at build time. Fetched at runtime
+    // so adding a markdown file + rebuilding is all it takes. Fails silent (panel stays
+    // hidden) when there's no reading.json — e.g. opened over file:// or before a build.
+    (function () {
+      const esc = (s) =>
+        String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+      fetch("reading.json", { cache: "no-cache" })
+        .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+        .then((cards) => {
+          if (!Array.isArray(cards) || cards.length === 0) return;
+          const wrap = document.getElementById("reading-cards");
+          const panel = document.getElementById("reading");
+          if (!wrap || !panel) return;
+          wrap.innerHTML = cards
+            .map(
+              (c) => `<a class="reading-card" href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">
+                ${c.image ? `<div class="rc-frame"><img class="rc-thumb" src="${esc(c.image)}" alt="" loading="lazy" decoding="async"></div>` : ""}
+                <div class="rc-body">
+                  <span class="rc-kind">${esc(c.kind || "reading")}</span>
+                  <div class="rc-title">${esc(c.title)}</div>
+                  ${c.source ? `<div class="rc-source">${esc(c.source)}</div>` : ""}
+                </div>
+              </a>`
+            )
+            .join("");
+          panel.hidden = false;
+        })
+        .catch(() => {
+          /* no reading.json — leave the panel hidden */
+        });
     })();
   </script>
 

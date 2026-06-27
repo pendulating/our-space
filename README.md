@@ -74,7 +74,8 @@ data/snapshots/    Dated raw-data snapshots + provenance (payloads gitignored).
   basemap** (ArcGIS vector tiles via MapLibre GL) as the ground layer beneath a
   **transparent** Bevy canvas. Bevy still owns all input; MapLibre is driven
   passively from the camera each frame (top-down, synced center + zoom). Native
-  dev keeps the parchment background.
+  dev renders on a dark "caution" theme (noalprs-inspired: near-black zinc + hazard
+  yellow), independent of the web shell's basemap.
 - ✅ **Running ACE buses**: the ACE routes animate as **moving buses** along their
   real GTFS route shapes, counts scaled by headway/time-of-day (schedule-simulated
   from the GTFS *static* feed — fully offline; structured so a future GTFS-realtime
@@ -97,21 +98,68 @@ Requires the Rust stable toolchain (`rustup`).
 cargo test -p sim-core --no-default-features
 
 # Bake assets (fetch raw snapshots into data/snapshots/ first; see below)
-cargo run -p data-pipeline -- bake-graph   --overpass-json data/snapshots/osm/manhattan_walk.json assets/processed/graph_manhattan.postcard
+# The trailing neighborhoods GeoJSON clips the graph to the Manhattan borough (drops
+# the Bronx/Queens/Brooklyn bridge approaches the Overpass bbox pulls in). Omit it for
+# the unclipped, region-wide network.
+cargo run -p data-pipeline -- bake-graph   --overpass-json data/snapshots/osm/manhattan_walk.json assets/processed/graph_manhattan.postcard data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
 # Fixed CCTV: Amnesty Decode Surveillance NYC census + Dahir et al., aggregated & de-duplicated
-cargo run -p data-pipeline -- bake-cctv    data/snapshots/amnesty/counts_per_intersections.csv data/snapshots/dahir/map_data.csv assets/processed/cameras_fixed.oscam
+cargo run -p data-pipeline -- bake-cctv    data/snapshots/amnesty/counts_per_intersections.csv data/snapshots/dahir/map_data.csv assets/processed/cameras_fixed.oscctv
 # ALPR plate readers (DeFlock via OSM/Overpass: man_made=surveillance, surveillance:type=ALPR)
 cargo run -p data-pipeline -- bake-alpr    data/snapshots/deflock/alpr.json assets/processed/alpr.osalpr
 # NYC DOT traffic cameras (nyctmc.org feed; locations only — images are never used)
 cargo run -p data-pipeline -- bake-dot     data/snapshots/dot/cameras.json  assets/processed/dot_cameras.osdot
-cargo run -p data-pipeline -- bake-ace     data/snapshots/gtfs/gtfs_m data/snapshots/gtfs/ace_routes.json assets/processed/ace_corridors.postcard
+# LinkNYC Wi-Fi kiosks (Socrata n6c5-95xh). A fixed point layer — not cameras, but
+# each surveils when you connect to its Wi-Fi. Trailing GeoJSON clips to Manhattan.
+#   curl -L "https://data.cityofnewyork.us/resource/n6c5-95xh.json?\$where=boro='Manhattan'&\$limit=5000&\$select=latitude,longitude,status,kiosk_type" -o data/snapshots/linknyc/kiosks_manhattan.json
+cargo run -p data-pipeline -- bake-linknyc data/snapshots/linknyc/kiosks_manhattan.json assets/processed/linknyc.oslink data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
+# ACE corridors (teal). Trailing neighborhoods GeoJSON clips shapes to Manhattan
+# (the M60-SBS otherwise runs out to LaGuardia); omit it to keep the full route.
+cargo run -p data-pipeline -- bake-ace     data/snapshots/gtfs/gtfs_m data/snapshots/gtfs/ace_routes.json assets/processed/ace_corridors.postcard data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
 cargo run -p data-pipeline -- bake-equity  data/snapshots/census/blockgroups.geojson data/snapshots/census/acs.json data/snapshots/dahir/map_data.csv assets/processed/equity.postcard
 # Rideshare-camera density (NYC TLC Uber/Lyft trips per taxi zone). Aggregate the
 # remote Parquet with DuckDB, then bake against the taxi-zone polygons:
 cargo run -p data-pipeline -- bake-dashcam-field data/snapshots/tlc/taxi_zones.geojson data/snapshots/tlc/zone_trips.csv assets/processed/dashcam_field.osfield
-# Animated rideshare-vehicle routes (real TLC zone O-D, routed over the walk
-# graph offline; drives the moving dashcam agents). Needs zone_od.csv (below):
-cargo run -p data-pipeline -- bake-vehicle-routes assets/processed/graph_manhattan.osgraph data/snapshots/tlc/taxi_zones.geojson data/snapshots/tlc/zone_od.csv assets/processed/vehicle_routes.osroutes 1000
+# Animated rideshare-vehicle routes (real TLC zone O-D, drives the moving dashcam
+# agents). Routed over a **drive** graph — the OSM network minus pedestrian plazas
+# (e.g. Broadway at Union Square) + access-restricted ways — so cars don't drive on
+# pedestrianized streets. The drive graph is a build-time artifact (the app loads the
+# walk graph for pedestrian routing); bake it first:
+cargo run -p data-pipeline -- bake-graph --overpass-drive data/snapshots/osm/manhattan_walk.json data/snapshots/osm/graph_manhattan_drive.osgraph data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
+cargo run -p data-pipeline -- bake-vehicle-routes data/snapshots/osm/graph_manhattan_drive.osgraph data/snapshots/tlc/taxi_zones.geojson data/snapshots/tlc/zone_od.csv assets/processed/vehicle_routes.osroutes 1000
+# Robotability field (speculative sidewalk delivery robots): the IRL-CT NYC
+# Robotability Score per-sidewalk (0..1), gridded over the walk-graph extent — it
+# weights where robots spawn + their exposure density. Fetch the scored GeoJSON,
+# then bake against the graph:
+#   curl -L https://raw.githubusercontent.com/IRL-CT/robotability/main/public/data/sidewalks.geojson -o data/snapshots/robotability/sidewalks.geojson
+cargo run --release -p data-pipeline -- bake-robotability assets/processed/graph_manhattan.osgraph data/snapshots/robotability/sidewalks.geojson assets/processed/robotability.osrobot
+# Tesla-camera field (private Tesla density by ZIP — Teslas run always-on Sentry/
+# Autopilot cameras). Fetch NYC ZIP polygons + per-ZIP Tesla counts (NYS DMV
+# w4pv-hbkt, make=TESLA, 5 boroughs), then bake:
+#   curl -L https://raw.githubusercontent.com/fedhere/PUI2015_EC/master/mam1612_EC/nyc-zip-code-tabulation-areas-polygons.geojson -o data/snapshots/teslas/nyc_zips.geojson
+#   curl -L "https://data.ny.gov/resource/w4pv-hbkt.csv?\$select=zip,count(*)+as+n&\$where=make='TESLA'+AND+county+in('NEW YORK','KINGS','QUEENS','BRONX','RICHMOND')&\$group=zip&\$limit=5000" -o data/snapshots/teslas/tesla_by_zip.csv
+# (commercial Teslas ≈ 7% of TLC FHVs — identifiable by VIN prefix 5YJ/7SA — are
+#  already represented by the rideshare-dashcam layer.)
+cargo run -p data-pipeline -- bake-teslas data/snapshots/teslas/nyc_zips.geojson data/snapshots/teslas/tesla_by_zip.csv assets/processed/teslas.osteslas
+# Automated photo-enforcement cameras (speed / bus-lane / red-light), located from
+# NYC DOT 'PHOTO ENFORCED' street signs (Street Sign Work Orders qt6m-xctn). The
+# fetch script queries Socrata, converts the state-plane coords (EPSG:2263) to
+# WGS84, and dedups co-located signs → a lon,lat,subtype CSV:
+#   python3 tools/fetch_enforcement.py   # -> data/snapshots/enforcement/enforcement_signs.csv
+cargo run -p data-pipeline -- bake-enforcement data/snapshots/enforcement/enforcement_signs.csv assets/processed/enforcement.oscam
+# Manhattan coastline outline (a visual frame around the street network), from the
+# NYC Borough Boundaries (DCP). Keeps the borough's main landmass only:
+#   curl -L "https://data.cityofnewyork.us/api/geospatial/gthc-hcne?method=export&format=GeoJSON" -o data/snapshots/boroughs/borough_boundaries.geojson
+cargo run -p data-pipeline -- bake-borough data/snapshots/boroughs/borough_boundaries.geojson Manhattan assets/processed/borough_manhattan.osboro
+# Building footprints (flat ground fabric). Fetch the ~45k Manhattan footprints
+# (BIN 1xxxxxx) from the NYC Building dataset, then bake (clipped to the borough):
+#   curl -L "https://data.cityofnewyork.us/resource/5zhs-2jue.geojson?\$select=the_geom,bin,height_roof,ground_elevation,feature_code&\$where=bin%20between%201000000%20and%201999999&\$limit=50000" -o data/snapshots/buildings/manhattan_footprints.geojson
+cargo run -p data-pipeline -- bake-footprints data/snapshots/buildings/manhattan_footprints.geojson assets/processed/footprints.osbldg data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
+# Landmark 2.5D massings (recognizable buildings for orientation), from the NYC 3D
+# Building Model (LoD2 CityGML). Download once (916 MB), extract the curated set via
+# the Python tool (streams only the covering tiles), then bake the JSON:
+#   curl -L https://s-media.nyc.gov/agencies/oti/DA_WISE_GML.zip -o data/snapshots/buildings/DA_WISE_GML.zip
+#   python3 tools/extract_landmarks.py   # -> data/snapshots/buildings/landmarks_lod2.json
+cargo run -p data-pipeline -- bake-landmarks data/snapshots/buildings/landmarks_lod2.json assets/processed/landmarks.oslmk
 
 # Citywide exposure heatmap (per-edge intensities; arg = reference hour 0..23)
 cargo run -p batch --release -- heatmap assets/processed/heatmap.postcard 17
@@ -135,8 +183,12 @@ python3 -m http.server -d web/dist 8080           # open http://localhost:8080 (
 `web/dist/` is a fully static bundle — deploy it to any static host with HTTPS
 (WebGPU requires a secure context): Cloudflare Pages, GitHub Pages, Netlify,
 Vercel. No server, API keys, or backend: the route is computed entirely in the
-browser and never transmitted. Note the ~46 MB payload (22 MB WASM + 24 MB baked
-layers); the page shows a loading screen while it fetches.
+browser and never transmitted. (The one exception is **address lookup** — typing a
+place sends *that query text*, and clicking the map to drop a pin sends *that one
+coordinate*, to the key-free NYC GeoSearch API (`geosearch.planninglabs.nyc`, DCP's
+PAD data) to resolve an address; the computed route itself still never leaves the
+browser.) Note the ~46 MB payload (22 MB WASM + 24 MB baked layers); the page shows a
+loading screen while it fetches.
 
 **GitHub Pages (continuous deployment).** `.github/workflows/deploy.yml` publishes
 the committed `web/dist/` to Pages on every push to `main` that touches it (or via

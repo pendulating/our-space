@@ -12,7 +12,7 @@
 //!   of encounters accumulated along the route, and `P(≥1) = 1 − e^(−mean)`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The detection recall of the Dahir et al. street-view camera detector
 /// (~63%). Observed fixed-camera density underestimates the truth by this
@@ -43,6 +43,15 @@ pub enum SourceKind {
     SmartGlasses,
     /// Automated license-plate readers (DeFlock-mapped: Flock + agency systems).
     Alpr,
+    /// Sidewalk delivery robots (Serve/Starship-style nav cameras). Speculative:
+    /// not yet legal to deploy in NYC, spawned by the Robotability Score field.
+    DeliveryRobot,
+    /// Tesla vehicles' always-on cameras (Sentry when parked + Autopilot while
+    /// driving). Density follows private NYS DMV registrations by ZIP.
+    TeslaCamera,
+    /// Automated photo-enforcement cameras (speed / bus-lane / red-light), located
+    /// from NYC DOT "PHOTO ENFORCED" street signs (Street Sign Work Orders).
+    EnforcementCamera,
 }
 
 impl SourceKind {
@@ -54,6 +63,9 @@ impl SourceKind {
             SourceKind::FixedCctv => ConfidenceTier::B,
             SourceKind::Dashcam => ConfidenceTier::C,
             SourceKind::SmartGlasses => ConfidenceTier::D,
+            SourceKind::DeliveryRobot => ConfidenceTier::D,
+            SourceKind::TeslaCamera => ConfidenceTier::C,
+            SourceKind::EnforcementCamera => ConfidenceTier::A, // mapped from posted signage
         }
     }
 
@@ -65,6 +77,9 @@ impl SourceKind {
             SourceKind::Dashcam => "Rideshare cams",
             SourceKind::SmartGlasses => "Smart glasses",
             SourceKind::Alpr => "ALPR readers",
+            SourceKind::DeliveryRobot => "Delivery robots",
+            SourceKind::TeslaCamera => "Tesla cameras",
+            SourceKind::EnforcementCamera => "Enforcement cams",
         }
     }
 
@@ -73,7 +88,10 @@ impl SourceKind {
     pub fn is_fixed(self) -> bool {
         matches!(
             self,
-            SourceKind::FixedCctv | SourceKind::DotLiveView | SourceKind::Alpr
+            SourceKind::FixedCctv
+                | SourceKind::DotLiveView
+                | SourceKind::Alpr
+                | SourceKind::EnforcementCamera
         )
     }
 
@@ -83,13 +101,16 @@ impl SourceKind {
         matches!(self, SourceKind::FixedCctv)
     }
 
-    pub const ALL: [SourceKind; 6] = [
+    pub const ALL: [SourceKind; 9] = [
         SourceKind::FixedCctv,
         SourceKind::DotLiveView,
         SourceKind::AceBus,
         SourceKind::Dashcam,
         SourceKind::SmartGlasses,
         SourceKind::Alpr,
+        SourceKind::DeliveryRobot,
+        SourceKind::TeslaCamera,
+        SourceKind::EnforcementCamera,
     ];
 }
 
@@ -113,11 +134,16 @@ pub fn p_at_least_one(expected: f64) -> f64 {
 /// The full exposure result, split by source plus the toggle metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExposureTally {
-    per_source: [SourceTally; 6],
+    per_source: [SourceTally; 9],
     /// (source index, device id) pairs already counted, so a fixed camera seen
     /// across many ticks counts once. Transient; not serialized.
     #[serde(skip)]
     fixed_seen: HashSet<(u8, u64)>,
+    /// Captured physical-camera groups → whether the group is surveyed-confirmed.
+    /// The headline counts these (co-located cross-source cameras once), with the
+    /// recall inflation applied only to CCTV-census-only (unconfirmed) groups.
+    #[serde(skip)]
+    fixed_groups: HashMap<u32, bool>,
     /// Total route length walked, meters.
     pub route_length_m: f64,
     /// Length of the route under ≥1 active fixed coverage, meters.
@@ -129,8 +155,9 @@ pub struct ExposureTally {
 impl Default for ExposureTally {
     fn default() -> Self {
         ExposureTally {
-            per_source: [SourceTally::default(); 6],
+            per_source: [SourceTally::default(); 9],
             fixed_seen: HashSet::new(),
+            fixed_groups: HashMap::new(),
             route_length_m: 0.0,
             covered_length_m: 0.0,
             recall_factor: 1.0,
@@ -151,6 +178,9 @@ impl ExposureTally {
             SourceKind::Dashcam => 3,
             SourceKind::SmartGlasses => 4,
             SourceKind::Alpr => 5,
+            SourceKind::DeliveryRobot => 6,
+            SourceKind::TeslaCamera => 7,
+            SourceKind::EnforcementCamera => 8,
         }
     }
 
@@ -158,14 +188,27 @@ impl ExposureTally {
         self.per_source[Self::idx(kind)]
     }
 
-    /// Record one tick during which fixed device `id` (of `kind`) captured the
-    /// walker: `frame_rate × dt` frames accrue; the device counts once.
-    pub fn record_fixed_capture(&mut self, kind: SourceKind, id: u64, frame_rate: f64, dt: f64) {
+    /// Record one tick during which fixed device `id` (of `kind`, physical-camera
+    /// `group`, surveyed-`confirmed`) captured the walker: `frame_rate × dt` frames
+    /// accrue; the device counts once per source (attestation) and the physical
+    /// group counts once toward the de-duplicated headline.
+    pub fn record_fixed_capture(
+        &mut self,
+        kind: SourceKind,
+        id: u64,
+        group: u32,
+        confirmed: bool,
+        frame_rate: f64,
+        dt: f64,
+    ) {
         let i = Self::idx(kind);
         self.per_source[i].frames += frame_rate * dt;
         if self.fixed_seen.insert((i as u8, id)) {
             self.per_source[i].devices += 1.0;
         }
+        // OR-in confirmation: a group is confirmed if any attesting source surveyed it.
+        let c = self.fixed_groups.entry(group).or_insert(false);
+        *c = *c || confirmed;
     }
 
     /// Accumulate mobile/ambient exposure for a class over a tick: expected
@@ -196,11 +239,27 @@ impl ExposureTally {
         }
     }
 
-    /// HEADLINE: total expected distinct devices that could have captured you,
-    /// across all classes (fixed recall-corrected), rounded.
+    /// Expected distinct **physical** fixed cameras that captured you — co-located
+    /// cameras attested by multiple sources counted once. Confirmed (surveyed)
+    /// groups count at face value; CCTV-census-only groups keep the recall inflation
+    /// (they stand in for the cameras the street-view census missed).
+    pub fn grouped_fixed_devices(&self) -> f64 {
+        self.fixed_groups
+            .values()
+            .map(|&confirmed| if confirmed { 1.0 } else { self.recall_factor })
+            .sum()
+    }
+
+    /// HEADLINE: total expected distinct devices that could have captured you —
+    /// de-duplicated physical fixed cameras (across sources) plus the mobile/ambient
+    /// classes' Poisson means, rounded.
     pub fn headline_device_count(&self) -> u32 {
-        let total: f64 = SourceKind::ALL.iter().map(|&k| self.adjusted_devices(k)).sum();
-        total.round().max(0.0) as u32
+        let mobile: f64 = SourceKind::ALL
+            .iter()
+            .filter(|k| !k.is_fixed())
+            .map(|&k| self.adjusted_devices(k))
+            .sum();
+        (self.grouped_fixed_devices() + mobile).round().max(0.0) as u32
     }
 
     /// Poisson P(≥1 capture) from a class (using its adjusted device mean).
@@ -238,9 +297,9 @@ mod tests {
     fn distinct_devices_counted_once_frames_accumulate() {
         let mut t = ExposureTally::new();
         for _ in 0..3 {
-            t.record_fixed_capture(SourceKind::FixedCctv, 1, 15.0, 1.0);
+            t.record_fixed_capture(SourceKind::FixedCctv, 1, 1, false, 15.0, 1.0);
         }
-        t.record_fixed_capture(SourceKind::FixedCctv, 2, 15.0, 1.0);
+        t.record_fixed_capture(SourceKind::FixedCctv, 2, 2, false, 15.0, 1.0);
         let s = t.source(SourceKind::FixedCctv);
         assert_eq!(s.devices, 2.0);
         assert!((s.frames - 60.0).abs() < 1e-9); // 4 capture-ticks × 15 fps
@@ -249,8 +308,8 @@ mod tests {
     #[test]
     fn same_id_different_kind_counts_separately() {
         let mut t = ExposureTally::new();
-        t.record_fixed_capture(SourceKind::FixedCctv, 7, 1.0, 1.0);
-        t.record_fixed_capture(SourceKind::DotLiveView, 7, 1.0, 1.0);
+        t.record_fixed_capture(SourceKind::FixedCctv, 7, 7, false, 1.0, 1.0);
+        t.record_fixed_capture(SourceKind::DotLiveView, 7, 8, true, 1.0, 1.0);
         assert_eq!(t.source(SourceKind::FixedCctv).devices, 1.0);
         assert_eq!(t.source(SourceKind::DotLiveView).devices, 1.0);
     }
@@ -270,13 +329,29 @@ mod tests {
         let mut t = ExposureTally::new();
         t.recall_factor = 1.0 / DAHIR_RECALL; // ~1.587
         for id in 0..10u64 {
-            t.record_fixed_capture(SourceKind::FixedCctv, id, 1.0, 1.0);
+            t.record_fixed_capture(SourceKind::FixedCctv, id, id as u32, false, 1.0, 1.0);
         }
         t.record_mobile(SourceKind::Dashcam, 4.0, 4.0); // mobile NOT recall-corrected
-        // fixed: 10 -> ~16 ; dashcam: 4 -> 4 ; headline ~20
+        // fixed: 10 distinct CCTV-only groups -> ~16 ; dashcam: 4 -> 4 ; headline ~20
         assert!((t.adjusted_devices(SourceKind::FixedCctv) - 10.0 / DAHIR_RECALL).abs() < 1e-9);
         assert_eq!(t.adjusted_devices(SourceKind::Dashcam), 4.0);
         assert_eq!(t.headline_device_count(), 20);
+    }
+
+    #[test]
+    fn co_located_cameras_count_once_confirmation_drops_recall() {
+        let mut t = ExposureTally::new();
+        t.recall_factor = 1.0 / DAHIR_RECALL;
+        // Two sources attest the SAME physical camera (group 0): CCTV + surveyed DOT.
+        t.record_fixed_capture(SourceKind::FixedCctv, 1, 0, true, 1.0, 1.0);
+        t.record_fixed_capture(SourceKind::DotLiveView, 2, 0, true, 1.0, 1.0);
+        // A separate CCTV-census-only camera (group 1) keeps the recall inflation.
+        t.record_fixed_capture(SourceKind::FixedCctv, 3, 1, false, 1.0, 1.0);
+        // Per-source attestation still overlaps (CCTV sees 2, DOT sees 1)…
+        assert_eq!(t.source(SourceKind::FixedCctv).devices, 2.0);
+        assert_eq!(t.source(SourceKind::DotLiveView).devices, 1.0);
+        // …but distinct physical cameras = confirmed group (1.0) + unconfirmed (recall).
+        assert!((t.grouped_fixed_devices() - (1.0 + 1.0 / DAHIR_RECALL)).abs() < 1e-9);
     }
 
     #[test]
