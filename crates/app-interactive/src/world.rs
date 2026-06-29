@@ -102,6 +102,43 @@ pub fn thick_line_list_mesh(segments: &[[Enu; 2]], half: f32, z: f32) -> Mesh {
     mesh
 }
 
+/// A filled-quad ribbon where each segment carries its **own** half-width and RGBA
+/// vertex color (pair with a white `ColorMaterial` so the colors show through). Used
+/// by the roving-coverage overlay to draw each street segment thicker and hotter the
+/// more often a camera vehicle has crossed it. `segments[i]` owns verts `[4i, 4i+3]`.
+pub fn colored_ribbon_mesh(
+    segments: &[[Enu; 2]],
+    halfs: &[f32],
+    colors: &[[f32; 4]],
+    z: f32,
+) -> Mesh {
+    let n = segments.len();
+    let mut verts: Vec<[f32; 3]> = Vec::with_capacity(n * 4);
+    let mut vcol: Vec<[f32; 4]> = Vec::with_capacity(n * 4);
+    let mut indices: Vec<u32> = Vec::with_capacity(n * 6);
+    for (i, [a, b]) in segments.iter().enumerate() {
+        let half = halfs[i];
+        let (ax, ay, bx, by) = (a.x as f32, a.y as f32, b.x as f32, b.y as f32);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len = (dx * dx + dy * dy).sqrt();
+        let inv = if len < 1e-6 { 0.0 } else { half / len };
+        let (nx, ny) = (-dy * inv, dx * inv);
+        verts.push([ax + nx, ay + ny, z]);
+        verts.push([bx + nx, by + ny, z]);
+        verts.push([bx - nx, by - ny, z]);
+        verts.push([ax - nx, ay - ny, z]);
+        let c = colors[i];
+        vcol.extend_from_slice(&[c, c, c, c]);
+        let base = (i * 4) as u32;
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vcol);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
 /// A 45° hatch fill clipped to a set of polygon rings (ENU meters) — the paving
 /// texture for the pedestrian plazas. For each ring we sweep parallel lines along
 /// the (1,−1) normal at `spacing` and keep only the spans *inside* the polygon

@@ -9,8 +9,10 @@
 mod agents;
 #[cfg(target_arch = "wasm32")]
 mod basemap;
+mod coverage;
 mod geocode;
 mod loading;
+mod movable;
 mod operators;
 mod storymap;
 mod theme;
@@ -30,7 +32,7 @@ use rstar::RTree;
 use agents::AgentPool;
 use loading::{
     AceRes, AlprRes, BoroughRes, BusDayRes, CamerasRes, CctvRes, DashcamFieldRes, DotRes, EquityRes,
-    FootprintsRes, GraphAssetRes, HeatmapRes, LandmarkRes, LinkNycRes, LoadingHandles,
+    FacilitiesRes, FootprintsRes, GraphAssetRes, HeatmapRes, LandmarkRes, LinkNycRes, LoadingHandles,
     NeighborhoodRes, ParksRes, PlazaRes, RobotabilityRes, TaxiDayRes, TeslaFieldRes,
     VehicleRoutesRes,
 };
@@ -41,7 +43,7 @@ use sim_core::assets::{
 };
 use sim_core::simulation::SimParams;
 use sim_core::{
-    AceConfig, DashcamConfig, EnuProjection, FixedCameraDefaults, GeoOrigin, GlassesConfig,
+    AceConfig, DashcamConfig, EnuProjection, FixedCameraDefaults, GlassesConfig,
     MobileScenario, RobotConfig, Route, RouteSummary, StreetGraph, TeslaConfig, Vec2 as Enu,
 };
 
@@ -110,6 +112,9 @@ const FLY_DUR: f32 = 0.7; // seconds
 // Paths relative to the AssetServer root (`assets/`); works native + web.
 // Distinct extensions disambiguate the per-type postcard loaders.
 const GRAPH_PATH: &str = "processed/graph_manhattan.osgraph";
+/// Manhattan drive network (CSCL, incl. the FDR/highways; carries road class in
+/// segment_id). Taxi routes are baked over it, and the coverage overlay snaps to it.
+const GRAPH_DRIVE_PATH: &str = "processed/graph_manhattan_drive.osgraph";
 const CAMERAS_PATH: &str = "processed/cameras_fixed.oscctv";
 /// Automated photo-enforcement cameras (DOT signage), a `FixedSensorLayer`.
 const ENFORCEMENT_PATH: &str = "processed/enforcement.oscam";
@@ -250,6 +255,9 @@ const LANDMARKS_PATH: &str = "processed/landmarks.oslmk";
 const BRIDGES_PATH: &str = "processed/bridges.oslmk";
 /// LinkNYC Wi-Fi/phone kiosks — a fixed point layer (not cameras).
 const LINKNYC_PATH: &str = "processed/linknyc.oslink";
+/// Institutions (schools + libraries) — Manhattan-only default vs all five boroughs.
+const FACILITIES_PATH: &str = "processed/facilities.osfac";
+const FACILITIES_PATH_NYC: &str = "processed/facilities_nyc.osfac";
 /// Vertical extrusion scale for the landmark massing: world-meters of screen-up
 /// shift per meter of building height. Pure vertical (no sideways skew) so every
 /// building stands straight up; depth + recognizability come from per-face shading,
@@ -293,8 +301,11 @@ const MAX_ENTROPY: f64 = 1.6094379;
 
 /// Interaction mode: route between two points, a one-point walkshed, or the
 /// neighborhood camera-density overview (a read-only mode driven by hovering).
+/// `None` is the startup state — nothing is selected, the map is inert, and the
+/// panel prompts the visitor to pick how to explore.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    None,
     Route,
     Walkshed,
     Neighborhoods,
@@ -374,6 +385,8 @@ impl NeighborhoodStat {
 #[derive(Resource)]
 pub struct Sim {
     pub graph: StreetGraph,
+    /// Drive network (CSCL, incl. highways) the roving-coverage overlay snaps onto.
+    pub drive_graph: StreetGraph,
     pub sensors: Vec<sim_core::SensorInstance>,
     pub layer: FixedSensorLayer,
     pub ace_segments: Vec<[Enu; 2]>,
@@ -518,9 +531,10 @@ impl Default for Params {
             neighborhoods_on: false,
             choropleth_on: false,
             neighborhoods_all: false,
-            // Civic default: lead with "how watched is my *area*" — one click maps a
-            // 10-minute walkshed. The A→B route is the secondary mode.
-            mode: Mode::Walkshed,
+            // No mode is selected at startup: the visitor first chooses how to
+            // explore (their area, an A→B walk, or neighborhoods). The map stays
+            // inert until then — no seeded example, no accidental clicks.
+            mode: Mode::None,
             show_agents: true,
             exposure_mode: ExposureMode::Analytical,
         }
@@ -604,6 +618,82 @@ pub(crate) struct SelectedAlpr(pub Option<usize>);
 pub(crate) struct AlprMakerBreakdown(pub Vec<(operators::Maker, usize)>);
 /// Click within this many CSS px of an ALPR/CCTV marker to open its metadata modal.
 const ALPR_PICK_PX: f32 = 16.0;
+
+// ---- Institutions (schools + libraries) explore view ----
+/// Radius (m) around an institution within which deduplicated fixed cameras are
+/// counted as "watching" it — its surveillance-exposure score. ~2–3 blocks.
+const FACILITY_SCAN_M: f64 = 200.0;
+/// Click within this many CSS px of an institution marker to open its modal.
+const FACILITY_PICK_PX: f32 = 14.0;
+
+/// One institution's clickable record (runtime; ENU + metadata + nearby-camera score).
+#[derive(Clone)]
+pub(crate) struct FacilityPin {
+    pub pos: Vec2,
+    pub name: String,
+    pub kind: sim_core::assets::FacilityKind,
+    pub subtype: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Deduplicated fixed cameras within [`FACILITY_SCAN_M`] (one per physical camera).
+    pub cameras_near: u32,
+}
+/// All institutions + a surveillance-ranked index, for the left panel + click-picking.
+#[derive(Resource, Default)]
+pub(crate) struct FacilityDirectory {
+    pub pins: Vec<FacilityPin>,
+    /// Indices into `pins`, most-watched first (computed once, at world build).
+    pub ranked: Vec<usize>,
+}
+/// The institution the user selected (index into `FacilityDirectory.pins`); `Some`
+/// shows the modal + highlights its marker.
+#[derive(Resource, Default)]
+pub(crate) struct SelectedFacility(pub Option<usize>);
+
+/// The "Institutions" explore view: a toggle + a slide-in transition for the left
+/// ranking panel, plus the per-class visibility filters. Activated from the EXPLORE
+/// section of the right panel.
+#[derive(Resource)]
+pub(crate) struct InstitutionsView {
+    pub active: bool,
+    /// Slide-in progress for the left panel (0 = off-screen, 1 = docked); eased.
+    pub t: f32,
+    pub show_schools: bool,
+    pub show_libraries: bool,
+}
+impl Default for InstitutionsView {
+    fn default() -> Self {
+        InstitutionsView { active: false, t: 0.0, show_schools: true, show_libraries: true }
+    }
+}
+/// Rank facility indices most-watched first (nearby-camera count desc, then name asc
+/// for stable ties). Pulled out of `build_world` so it's unit-testable.
+fn rank_facilities(pins: &[FacilityPin]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..pins.len()).collect();
+    idx.sort_by(|&a, &b| {
+        pins[b]
+            .cameras_near
+            .cmp(&pins[a].cameras_near)
+            .then_with(|| pins[a].name.cmp(&pins[b].name))
+    });
+    idx
+}
+
+/// On-map institution marker (one merged mesh per class); visibility follows the view.
+#[derive(Component)]
+pub(crate) struct FacilityMarker {
+    pub kind: sim_core::assets::FacilityKind,
+}
+/// The single reusable ring that highlights the selected institution.
+#[derive(Component)]
+pub(crate) struct FacilityHighlight;
+/// Handle to the [`FacilityHighlight`] entity (moved onto the selected institution).
+#[derive(Resource)]
+pub(crate) struct FacilityHighlightEntity(pub Entity);
+/// World size (m) of an institution marker square, and its painter z (above cameras
+/// so the subjects read clearly while the view is up).
+const FACILITY_MARK_SIZE: f32 = 26.0;
+const FACILITY_MARK_Z: f32 = 1.6;
 /// Camera-marker modals (ALPR/CCTV) only open at/below this zoom (camera m/px). Zoomed
 /// further out the markers are tiny + dense and a click is almost always meant for the
 /// area/route, so the modals stay out of the way of "my area" / the walk.
@@ -715,7 +805,7 @@ pub struct WalkshedState {
 #[derive(Component)]
 pub(crate) struct BaseMap; // streets (cameras now carry OperatorMesh); hidden in heatmap mode
 #[derive(Component)]
-struct FovWedge;
+pub(crate) struct FovWedge;
 #[derive(Component)]
 pub(crate) struct AceVis;
 /// Holds the ACE corridor segments + base width so `scale_ace_corridors` can rebuild
@@ -862,11 +952,18 @@ fn main() {
     .init_resource::<SelectedAlpr>()
     .init_resource::<CctvDirectory>()
     .init_resource::<SelectedCctv>()
+    .init_resource::<FacilityDirectory>()
+    .init_resource::<SelectedFacility>()
+    .init_resource::<InstitutionsView>()
     .init_resource::<NeighborhoodLive>()
     .init_resource::<SimClock>()
     .init_resource::<SimDate>()
     .init_resource::<ThemeReady>()
     .init_resource::<agents::ReplayState>()
+    .init_resource::<movable::MovablePanels>()
+    .init_resource::<coverage::CoverageView>()
+    .init_resource::<coverage::Coverage>()
+    .init_resource::<coverage::EdgeGrid>()
     .init_resource::<FootprintRegions>()
     .insert_resource(AgentPool::empty())
     .add_systems(Startup, (start_loading, init_reduced_motion))
@@ -876,7 +973,7 @@ fn main() {
             (build_world, manage_footprint_regions),
             advance_clock,
             (camera_control, fly_camera).chain(),
-            (handle_click, seed_example_walkshed, geocode::geocode_tick, apply_geocode, storymap_tick, storymap_autostart),
+            (handle_click, geocode::geocode_tick, apply_geocode, storymap_tick, storymap_autostart),
             recompute_on_change,
             animate_walker,
             (walk_capture_events, agents::mobile_capture_events).chain(),
@@ -897,8 +994,20 @@ fn main() {
                 operators::operators_fade_scene,
             )
                 .chain(),
-            sync_mode,
-            (sync_visibility, sync_building_visibility, sync_leader_visibility),
+            (
+                sync_mode,
+                (sync_visibility, sync_building_visibility, sync_leader_visibility),
+                (
+                    coverage::coverage_drive,
+                    coverage::coverage_accumulate,
+                    coverage::coverage_render,
+                    coverage::coverage_scene,
+                )
+                    .chain()
+                    .after(agents::animate_agents)
+                    .after(sync_visibility)
+                    .after(sync_building_visibility),
+            ),
             rebuild_heatmap,
             rebuild_equity,
             rebuild_neighborhoods,
@@ -911,10 +1020,15 @@ fn main() {
                 highlight_neighborhood,
                 sample_neighborhood_mobile,
             ),
+            (
+                institutions_tick,
+                facility_markers_visibility,
+                facility_highlight_follow,
+            ),
             (ui::setup_theme, apply_reset, smoke_exit),
         ),
     )
-    .add_systems(EguiPrimaryContextPass, (ui::ui_panel, ui::citywide_nudge, ui::storymap_ui, ui::alpr_modal, ui::cctv_modal));
+    .add_systems(EguiPrimaryContextPass, (ui::ui_panel, ui::citywide_nudge, ui::coverage_overlay, ui::storymap_ui, ui::alpr_modal, ui::cctv_modal, ui::institutions_panel));
     // Web: keep the MapLibre basemap synced to the Bevy camera each frame.
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Update, basemap::sync_basemap);
@@ -1105,11 +1219,16 @@ fn start_loading(
     };
     // Parks: Manhattan-clipped default, all five boroughs citywide (small either way).
     let parks_path = if citywide { PARKS_PATH_NYC } else { PARKS_PATH };
+    // Institutions (schools + libraries): Manhattan-only default, all five citywide.
+    let facilities_path = if citywide { FACILITIES_PATH_NYC } else { FACILITIES_PATH };
     // Rideshare/taxi: all-borough HVFHV on the citywide graph, vs Manhattan-only.
     let taxi_day_path = if citywide { TAXI_DAY_PATH_NYC } else { TAXI_DAY_PATH };
+    // Coverage snaps to a drive graph with highways; citywide CSCL already has them.
+    let drive_graph_path = if citywide { GRAPH_PATH_NYC } else { GRAPH_DRIVE_PATH };
 
     commands.insert_resource(LoadingHandles {
         graph: asset_server.load(graph_path),
+        drive_graph: asset_server.load(drive_graph_path),
         cameras: asset_server.load(cameras_path),
         enforcement: asset_server.load(ENFORCEMENT_PATH),
         ace: asset_server.load(ace_path),
@@ -1131,6 +1250,7 @@ fn start_loading(
         landmarks: asset_server.load(LANDMARKS_PATH),
         bridges: asset_server.load(BRIDGES_PATH),
         linknyc: asset_server.load(LINKNYC_PATH),
+        facilities: asset_server.load(facilities_path),
         built: false,
     });
     route.status = if citywide {
@@ -1256,7 +1376,7 @@ fn build_world(
     equities: Res<Assets<EquityRes>>,
     // Bundled into one tuple param to stay under Bevy's 16-param-per-system cap.
     #[allow(clippy::type_complexity)]
-    (dashcams, alprs, dots, vroutes, neighborhoods_asset, bus_days, taxi_days, robots_field_asset, tesla_field_asset, borough_asset, footprints_asset, parks_asset, plazas_asset, landmark_asset, linknyc_asset): (
+    (dashcams, alprs, dots, vroutes, neighborhoods_asset, bus_days, taxi_days, robots_field_asset, tesla_field_asset, borough_asset, footprints_asset, parks_asset, plazas_asset, landmark_asset, linknyc_asset, facilities_asset): (
         Res<Assets<DashcamFieldRes>>,
         Res<Assets<AlprRes>>,
         Res<Assets<DotRes>>,
@@ -1272,6 +1392,7 @@ fn build_world(
         Res<Assets<PlazaRes>>,
         Res<Assets<LandmarkRes>>,
         Res<Assets<LinkNycRes>>,
+        Res<Assets<FacilitiesRes>>,
     ),
     asset_server: Res<AssetServer>,
     mut commands: Commands,
@@ -1287,6 +1408,7 @@ fn build_world(
     let citywide = city.map(|c| c.citywide).unwrap_or(false);
     let (
         Some(g),
+        Some(dg),
         Some(c),
         Some(enf),
         Some(a),
@@ -1308,8 +1430,10 @@ fn build_world(
         Some(lmk),
         Some(brg),
         Some(link),
+        Some(fac),
     ) = (
         graphs.get(&handles.graph),
+        graphs.get(&handles.drive_graph),
         cctvs.get(&handles.cameras),
         cams.get(&handles.enforcement),
         aces.get(&handles.ace),
@@ -1331,11 +1455,14 @@ fn build_world(
         landmark_asset.get(&handles.landmarks),
         landmark_asset.get(&handles.bridges),
         linknyc_asset.get(&handles.linknyc),
+        facilities_asset.get(&handles.facilities),
     ) else {
         return; // still loading
     };
 
     let graph = StreetGraph::from_asset(g.0.clone());
+    // The drive network (incl. highways) the coverage overlay snaps onto.
+    let drive_graph = StreetGraph::from_asset(dg.0.clone());
     // CCTV now carries per-camera provenance (`CctvCameraLayer`); project to the shared
     // sensor type for the exposure model.
     let layer = c.0.to_fixed_layer();
@@ -1940,6 +2067,79 @@ fn build_world(
     let cam_max_range = sensors.iter().map(|s| s.wedge.range_m).fold(0.0_f64, f64::max);
     let cam_query_r2 = (cam_max_range + 2.0).powi(2);
 
+    // ---- Institutions (schools + libraries): clickable directory + surveillance score.
+    // Each institution is scored by the count of *deduplicated* fixed cameras within
+    // FACILITY_SCAN_M (one per physical camera `group`, matching the walkshed/headline),
+    // then ranked most-watched first. Per-class markers are spawned hidden — the
+    // Institutions explore view reveals them.
+    {
+        use sim_core::assets::FacilityKind;
+        let fac_proj = EnuProjection::default();
+        let scan_r2 = FACILITY_SCAN_M * FACILITY_SCAN_M;
+        let mut fac_pins: Vec<FacilityPin> = fac
+            .0
+            .facilities
+            .iter()
+            .map(|f| {
+                let mut groups = std::collections::HashSet::new();
+                for cand in cam_index.locate_within_distance([f.x, f.y], scan_r2) {
+                    groups.insert(sensors[cand.data as usize].group);
+                }
+                let (lat, lon) = fac_proj.to_wgs84(Enu::new(f.x, f.y));
+                FacilityPin {
+                    pos: Vec2::new(f.x as f32, f.y as f32),
+                    name: f.name.clone(),
+                    kind: f.kind,
+                    subtype: f.subtype.clone(),
+                    lat,
+                    lon,
+                    cameras_near: groups.len() as u32,
+                }
+            })
+            .collect();
+        // Surveillance ranking: most cameras nearby first, name-stable on ties.
+        let ranked = rank_facilities(&fac_pins);
+        // Per-class merged-quad markers in cool ink (subjects, not warm sensors).
+        for (kind, color) in [
+            (FacilityKind::School, theme::map::ca(0x43, 0x37, 0x8a, 0.95)), // indigo
+            (FacilityKind::Library, theme::map::ca(0x0d, 0x6b, 0x66, 0.95)), // teal
+        ] {
+            let pts: Vec<Enu> = fac_pins
+                .iter()
+                .filter(|p| p.kind == kind)
+                .map(|p| Enu::new(p.pos.x as f64, p.pos.y as f64))
+                .collect();
+            if pts.is_empty() {
+                continue;
+            }
+            commands.spawn((
+                Mesh2d(meshes.add(world::merged_icon_quads(&pts, FACILITY_MARK_SIZE))),
+                MeshMaterial2d(materials.add(color)),
+                Transform::from_xyz(0.0, 0.0, FACILITY_MARK_Z),
+                Visibility::Hidden,
+                FacilityMarker { kind },
+            ));
+        }
+        // A single reusable highlight ring, parked off until an institution is selected.
+        let highlight = commands
+            .spawn((
+                Mesh2d(meshes.add(Annulus::new(17.0, 23.0))),
+                MeshMaterial2d(materials.add(theme::map::ca(0xc2, 0x41, 0x0c, 0.95))),
+                Transform::from_xyz(0.0, 0.0, FACILITY_MARK_Z + 0.2),
+                Visibility::Hidden,
+                FacilityHighlight,
+            ))
+            .id();
+        commands.insert_resource(FacilityHighlightEntity(highlight));
+        info!(
+            "institutions: {} loaded ({} schools, {} libraries)",
+            fac_pins.len(),
+            fac_pins.iter().filter(|p| p.kind == FacilityKind::School).count(),
+            fac_pins.iter().filter(|p| p.kind == FacilityKind::Library).count(),
+        );
+        commands.insert_resource(FacilityDirectory { pins: std::mem::take(&mut fac_pins), ranked });
+    }
+
     // Pulse-overlay pool: a handful of recycled "seen you" rings that flash on a
     // camera as the live walk passes it (replaces per-camera flash now that dots
     // are a merged static mesh).
@@ -2092,6 +2292,7 @@ fn build_world(
 
     commands.insert_resource(Sim {
         graph,
+        drive_graph,
         sensors,
         layer,
         ace_segments,
@@ -2790,7 +2991,7 @@ fn handle_click(
     drag: Res<DragState>,
     params: Res<Params>,
     // Bundled into one tuple param: a Bevy system caps at 16 params and this was at 16.
-    (clock, ov, mut geo, story, dir, mut sel, cctv_dir, mut cctv_sel): (Res<SimClock>, Res<OperatorsView>, ResMut<geocode::Geocoder>, Res<storymap::StoryMap>, Res<AlprDirectory>, ResMut<SelectedAlpr>, Res<CctvDirectory>, ResMut<SelectedCctv>),
+    (clock, ov, mut geo, story, dir, mut sel, cctv_dir, mut cctv_sel, inst, fac_dir, mut fac_sel, mut fly): (Res<SimClock>, Res<OperatorsView>, ResMut<geocode::Geocoder>, Res<storymap::StoryMap>, Res<AlprDirectory>, ResMut<SelectedAlpr>, Res<CctvDirectory>, ResMut<SelectedCctv>, Res<InstitutionsView>, Res<FacilityDirectory>, ResMut<SelectedFacility>, ResMut<CameraFly>),
     windows: Query<&Window>,
     cam_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     sim: Option<Res<Sim>>,
@@ -2810,6 +3011,31 @@ fn handle_click(
     }
     // Place a point on click-release — but not if the cursor was dragged (pan).
     if wants.pointer || !buttons.just_released(MouseButton::Left) || drag.moved_px > 6.0 {
+        return;
+    }
+    // The Institutions explore view owns clicks: a click near a marker selects + flies to
+    // that institution; otherwise it's inert (the ranking list is the primary interface).
+    if inst.active {
+        if let (Ok(window), Ok((cam, cam_t))) = (windows.single(), cam_q.single()) {
+            if let Some(world_pt) = window
+                .cursor_position()
+                .and_then(|c| cam.viewport_to_world_2d(cam_t, c).ok())
+            {
+                let pick_r = FACILITY_PICK_PX * cam_t.scale().x;
+                let pick_r2 = pick_r * pick_r;
+                if let Some((i, _)) = fac_dir
+                    .pins
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i, p.pos.distance_squared(world_pt)))
+                    .filter(|(_, d2)| *d2 <= pick_r2)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                {
+                    fac_sel.0 = Some(i);
+                    fly.request(FlyTo::Point { center: fac_dir.pins[i].pos, scale: FLY_AREA_ZOOM });
+                }
+            }
+        }
         return;
     }
     // Neighborhood-density mode is read by hovering (the live breakdown follows the cursor),
@@ -2862,6 +3088,7 @@ fn handle_click(
     let (click_lat, click_lon) = EnuProjection::default().to_wgs84(enu);
 
     match params.mode {
+        Mode::None => {} // no mode selected — the map is inert until one is chosen
         Mode::Walkshed => {
             for e in &walkshed_vis {
                 commands.entity(e).despawn();
@@ -3243,33 +3470,6 @@ fn place_walkshed(
     walkshed_state.summary = Some(summary);
 }
 
-/// Onboarding: the first frame the world exists, drop a worked-example walkshed in
-/// SoHo so a visitor sees the headline immediately instead of a blank map. Fires
-/// once (the `Local` latch); any real click replaces it and clears the hint.
-fn seed_example_walkshed(
-    mut done: Local<bool>,
-    sim: Option<Res<Sim>>,
-    params: Res<Params>,
-    mut walkshed_state: ResMut<WalkshedState>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    if *done {
-        return;
-    }
-    let Some(sim) = sim else { return }; // wait for the async world build
-    *done = true;
-    if params.mode != Mode::Walkshed {
-        return; // honor a non-default starting mode
-    }
-    // SoHo, roughly Spring St & Broadway, projected into the map's ENU frame.
-    let enu = EnuProjection::new(GeoOrigin::MANHATTAN).to_enu(40.7233, -74.0030);
-    place_walkshed(enu, &sim, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
-    walkshed_state.status =
-        Some("Example: a 10-minute walk from SoHo. Click anywhere to recenter.".into());
-}
-
 /// Animated walk: pulse each camera as the looping walker enters its view, and
 /// keep a live "captured this pass" tally (resets each loop).
 #[allow(clippy::too_many_arguments)]
@@ -3378,6 +3578,7 @@ fn sync_mode(
     }
     *route = RouteState {
         status: match params.mode {
+            Mode::None => String::new(),
             Mode::Route => "Click to set start (A), then destination (B).".into(),
             Mode::Walkshed => "Click a point to map its 10-minute walkshed.".into(),
             Mode::Neighborhoods => "Hover a neighborhood for its camera breakdown.".into(),
@@ -3492,8 +3693,14 @@ fn spawn_marker(
 
 /// Advance the master clock when playing (cycling 0→24→0). Paused by the time
 /// panel / reduced motion, and while the Operators view holds the world frozen.
-fn advance_clock(time: Res<Time>, ov: Res<OperatorsView>, mut clock: ResMut<SimClock>) {
-    if !clock.playing || ov.active || ov.t > 0.0 {
+fn advance_clock(
+    time: Res<Time>,
+    ov: Res<OperatorsView>,
+    cov_view: Res<coverage::CoverageView>,
+    mut clock: ResMut<SimClock>,
+) {
+    // The roving-coverage overlay drives its own single-day clock.
+    if !clock.playing || ov.active || ov.t > 0.0 || cov_view.active {
         return;
     }
     let dh = clock.rate * time.delta_secs_f64() / 3600.0;
@@ -3989,6 +4196,7 @@ fn apply_reset(
     }
     *route = RouteState {
         status: match params.mode {
+            Mode::None => String::new(),
             Mode::Route => "Click to set start (A), then destination (B).".into(),
             Mode::Walkshed => "Click a point to map its 10-minute walkshed.".into(),
             Mode::Neighborhoods => "Hover a neighborhood for its camera breakdown.".into(),
@@ -4128,6 +4336,7 @@ fn rebuild_neighborhoods(
     params: Res<Params>,
     sim: Option<Res<Sim>>,
     live: Res<NeighborhoodLive>,
+    asset_server: Res<AssetServer>,
     mut last: Local<Option<(bool, bool, bool)>>,
     vis: Query<Entity, With<NeighborhoodVis>>,
     labels: Query<Entity, With<NeighborhoodLabel>>,
@@ -4135,6 +4344,9 @@ fn rebuild_neighborhoods(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
+    // The ExtraBold cut (matches the panel's display face) for the live "mobile" count,
+    // so the hazard-yellow row reads heavier over the choropleth. Handle is path-cached.
+    let bold: Handle<Font> = asset_server.load("fonts/HostGrotesk-ExtraBold.ttf");
     let key = (
         params.neighborhoods_on,
         params.neighborhoods_all,
@@ -4228,10 +4440,11 @@ fn rebuild_neighborhoods(
             .with_child((
                 TextSpan::new(format!("{} mobile", m.total())),
                 TextFont {
-                    font_size: 30.0,
+                    font: bold.clone(),
+                    font_size: 32.0,
                     ..default()
                 },
-                TextColor(theme::map::ca(0xfa, 0xcc, 0x15, 0.98)), // hazard yellow
+                TextColor(theme::map::ca(0xfa, 0xcc, 0x15, 1.0)), // hazard yellow (bold, on the dark plate)
                 NeighborhoodId(i),
             ))
             .with_child((
@@ -4551,6 +4764,71 @@ fn pick_neighborhood(
         .position(|st| show(st) && st.contains(p));
 }
 
+/// Seconds for the Institutions left panel to fully slide in / out.
+const INSTITUTIONS_FADE_S: f32 = 0.28;
+
+/// Drive the Institutions explore view: ease the left panel's slide-in `t`, yield to
+/// the other takeover views (Operators / coverage), and forget the selection once the
+/// panel has fully closed.
+fn institutions_tick(
+    time: Res<Time>,
+    ov: Res<OperatorsView>,
+    cov: Res<coverage::CoverageView>,
+    mut inst: ResMut<InstitutionsView>,
+    mut sel: ResMut<SelectedFacility>,
+) {
+    if inst.active && (ov.active || cov.active) {
+        inst.active = false; // a full-screen takeover opened — leave Institutions
+    }
+    let target = if inst.active { 1.0 } else { 0.0 };
+    let step = time.delta_secs() / INSTITUTIONS_FADE_S;
+    if inst.t < target {
+        inst.t = (inst.t + step).min(target);
+    } else if inst.t > target {
+        inst.t = (inst.t - step).max(target);
+    }
+    if !inst.active && inst.t <= 0.0 {
+        sel.0 = None;
+    }
+}
+
+/// Show/hide institution markers with the view + the per-class filters.
+fn facility_markers_visibility(
+    inst: Res<InstitutionsView>,
+    mut markers: Query<(&FacilityMarker, &mut Visibility)>,
+) {
+    use sim_core::assets::FacilityKind;
+    let on = inst.active || inst.t > 0.01;
+    for (m, mut vis) in &mut markers {
+        let show = on
+            && match m.kind {
+                FacilityKind::School => inst.show_schools,
+                FacilityKind::Library => inst.show_libraries,
+            };
+        *vis = if show { Visibility::Visible } else { Visibility::Hidden };
+    }
+}
+
+/// Move the highlight ring onto the selected institution (or hide it).
+fn facility_highlight_follow(
+    inst: Res<InstitutionsView>,
+    sel: Res<SelectedFacility>,
+    dir: Res<FacilityDirectory>,
+    hl: Option<Res<FacilityHighlightEntity>>,
+    mut q: Query<(&mut Transform, &mut Visibility), With<FacilityHighlight>>,
+) {
+    let Some(hl) = hl else { return };
+    let Ok((mut t, mut vis)) = q.get_mut(hl.0) else { return };
+    let pin = sel.0.and_then(|i| dir.pins.get(i));
+    if let (true, Some(p)) = (inst.active, pin) {
+        t.translation.x = p.pos.x;
+        t.translation.y = p.pos.y;
+        *vis = Visibility::Visible;
+    } else {
+        *vis = Visibility::Hidden;
+    }
+}
+
 /// `OURSPACE_SHOT=1` (native, dev-only): snap into the Operators view and save a
 /// screenshot, so the stacked layout can be eyeballed from a headless run.
 #[cfg(not(target_arch = "wasm32"))]
@@ -4563,10 +4841,44 @@ fn shot_capture(
     sim: Option<Res<Sim>>,
     city: Option<Res<CityScope>>,
     mut cam: Query<&mut Transform, With<Camera2d>>,
+    mut cov_view: ResMut<coverage::CoverageView>,
+    (mut inst, mut fac_sel, fac_dir): (
+        ResMut<InstitutionsView>,
+        ResMut<SelectedFacility>,
+        Res<FacilityDirectory>,
+    ),
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
     if std::env::var("OURSPACE_SHOT").is_err() || sim.is_none() {
+        return;
+    }
+    // Institutions explore view: open the left ranking panel, select the most-watched
+    // institution (highlight + fly), and grab a frame. `OURSPACE_INSTITUTIONS=1`.
+    if std::env::var("OURSPACE_INSTITUTIONS").is_ok() {
+        *frames += 1;
+        if *frames == 3 {
+            clock.playing = false;
+            inst.active = true;
+            if let Ok(mut t) = cam.single_mut() {
+                t.scale = Vec3::splat(5.0);
+                t.translation = Vec3::new(-200.0, 2200.0, t.translation.z);
+            }
+        }
+        if *frames == 24 {
+            fac_sel.0 = fac_dir.ranked.first().copied(); // most-watched institution
+        }
+        if *frames == 40 {
+            let shot = |commands: &mut Commands, path: &'static str| {
+                commands
+                    .spawn(bevy::render::view::screenshot::Screenshot::primary_window())
+                    .observe(bevy::render::view::screenshot::save_to_disk(path));
+            };
+            shot(&mut commands, "/tmp/ourspace_institutions.png");
+        }
+        if *frames == 48 {
+            exit.write(AppExit::Success);
+        }
         return;
     }
     let shot = |commands: &mut Commands, path: &'static str| {
@@ -4574,6 +4886,60 @@ fn shot_capture(
             .spawn(bevy::render::view::screenshot::Screenshot::primary_window())
             .observe(bevy::render::view::screenshot::save_to_disk(path));
     };
+    // Operators-view morph: open the stack at full motion (no reduced_motion) and grab
+    // frames spanning the texture→chip dissolve. `OURSPACE_MORPH=1`.
+    if std::env::var("OURSPACE_MORPH").is_ok() {
+        *frames += 1;
+        if *frames == 6 {
+            clock.playing = false;
+            ov.active = true; // animate the flight (reduced_motion stays false)
+        }
+        if *frames == 26 {
+            shot(&mut commands, "/tmp/ourspace_morph_a.png");
+        }
+        if *frames == 34 {
+            shot(&mut commands, "/tmp/ourspace_morph_b.png");
+        }
+        if *frames == 42 {
+            shot(&mut commands, "/tmp/ourspace_morph_c.png");
+        }
+        if *frames == 90 {
+            shot(&mut commands, "/tmp/ourspace_morph_settled.png");
+        }
+        if *frames == 100 {
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
+    // Roving-coverage capture: launch the overlay and let the (sped-up) day replay,
+    // grabbing a mid-day and an end-of-day frame. `OURSPACE_COVERAGE=1`.
+    if std::env::var("OURSPACE_COVERAGE").is_ok() {
+        *frames += 1;
+        if *frames == 3 {
+            cov_view.active = true; // coverage_drive frames the view + starts the fast day
+        }
+        if *frames >= 4 {
+            clock.rate = 6000.0; // ~14 s/day so the replay fits the shot budget
+        }
+        if *frames == 165 {
+            shot(&mut commands, "/tmp/ourspace_coverage_mid.png");
+        }
+        // Whole-island framing for the final frame so the shoreline highways
+        // (FDR east, West Side Hwy / Henry Hudson west) read as continuous ribbons.
+        if *frames == 610 {
+            if let Ok(mut t) = cam.single_mut() {
+                t.scale = Vec3::splat(13.0);
+                t.translation = Vec3::new(-500.0, 600.0, t.translation.z);
+            }
+        }
+        if *frames == 620 {
+            shot(&mut commands, "/tmp/ourspace_coverage_full.png");
+        }
+        if *frames == 680 {
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
     // Citywide build: a single five-borough overview shot (the Manhattan phases
     // below assume the island framing), then exit.
     if city.map(|c| c.citywide).unwrap_or(false) {
@@ -4711,5 +5077,39 @@ fn smoke_exit(
     if *frames == 50 {
         let _ = std::fs::write("/tmp/ourspace_frames.txt", format!("frames_ok={}\n", *frames));
         exit.write(AppExit::Success);
+    }
+}
+
+#[cfg(test)]
+mod facility_tests {
+    use super::*;
+    use sim_core::assets::FacilityKind;
+
+    fn pin(name: &str, cameras_near: u32, kind: FacilityKind) -> FacilityPin {
+        FacilityPin {
+            pos: Vec2::ZERO,
+            name: name.to_string(),
+            kind,
+            subtype: String::new(),
+            lat: 0.0,
+            lon: 0.0,
+            cameras_near,
+        }
+    }
+
+    #[test]
+    fn ranks_by_camera_count_then_name() {
+        use FacilityKind::*;
+        let pins = vec![
+            pin("Beta School", 3, School),
+            pin("Most Watched", 10, Library),
+            pin("Alpha School", 3, School), // ties with Beta on count → name breaks it
+            pin("Quiet Library", 0, Library),
+        ];
+        let ranked = rank_facilities(&pins);
+        // Most cameras first; the 3-camera tie resolves alphabetically (Alpha before Beta);
+        // the zero-camera entry sorts last.
+        let names: Vec<&str> = ranked.iter().map(|&i| pins[i].name.as_str()).collect();
+        assert_eq!(names, ["Most Watched", "Alpha School", "Beta School", "Quiet Library"]);
     }
 }

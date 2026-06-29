@@ -42,6 +42,10 @@ pub mod ui {
     // Warning ramp (signature → hot).
     pub const YELLOW: Color32 = c(0xfa, 0xcc, 0x15);
     pub const YELLOW_500: Color32 = c(0xea, 0xb3, 0x08);
+    /// A deep gold for the warm "mobile / now" accent **on the light paper ground** —
+    /// the signature hazard-yellow is unreadable on white (~1.4:1), this reads ~4.3:1
+    /// while staying in the yellow family. (On dark plates the bright `YELLOW` is used.)
+    pub const GOLD: Color32 = c(0xa1, 0x62, 0x07);
     pub const AMBER: Color32 = c(0xf5, 0x9e, 0x0b);
     pub const ORANGE: Color32 = c(0xf9, 0x73, 0x16);
     // Surveillance ramp (warm, high-contrast on white): maroon CCTV → red plate

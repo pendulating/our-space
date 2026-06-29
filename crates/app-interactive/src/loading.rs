@@ -15,9 +15,9 @@ use serde::de::DeserializeOwned;
 
 use sim_core::assets::{
     AceCorridorLayer, AlprReaderLayer, BoroughOutline, BuildingFootprints, BusDayLayer,
-    CctvCameraLayer, DashcamFieldLayer, EquityLayer, FixedSensorLayer, GraphAsset, HeatmapLayer,
-    LandmarkMassing, LinkNycLayer, NeighborhoodLayer, RobotabilityField, TaxiDayLayer, TeslaField,
-    VehicleRoutesLayer,
+    CctvCameraLayer, DashcamFieldLayer, EquityLayer, FacilityLayer, FixedSensorLayer, GraphAsset,
+    HeatmapLayer, LandmarkMassing, LinkNycLayer, NeighborhoodLayer, RobotabilityField, TaxiDayLayer,
+    TeslaField, VehicleRoutesLayer,
 };
 
 macro_rules! postcard_asset {
@@ -51,6 +51,8 @@ postcard_asset!(ParksRes, BuildingFootprints);
 postcard_asset!(PlazaRes, BuildingFootprints);
 postcard_asset!(LandmarkRes, LandmarkMassing);
 postcard_asset!(LinkNycRes, LinkNycLayer);
+// Institutions (schools + libraries) — subjects of surveillance, ranked by nearby cameras.
+postcard_asset!(FacilitiesRes, FacilityLayer);
 
 /// Generic loader for any postcard-encoded `Asset` newtype. Each instance owns a
 /// distinct file extension so the right loader resolves per asset type (a single
@@ -111,6 +113,7 @@ pub fn register(app: &mut App) {
         .init_asset::<PlazaRes>()
         .init_asset::<LandmarkRes>()
         .init_asset::<LinkNycRes>()
+        .init_asset::<FacilitiesRes>()
         .register_asset_loader(PostcardLoader::<GraphAssetRes>::new("osgraph"))
         .register_asset_loader(PostcardLoader::<CamerasRes>::new("oscam"))
         .register_asset_loader(PostcardLoader::<CctvRes>::new("oscctv"))
@@ -131,13 +134,17 @@ pub fn register(app: &mut App) {
         .register_asset_loader(PostcardLoader::<ParksRes>::new("ospark"))
         .register_asset_loader(PostcardLoader::<PlazaRes>::new("osplaza"))
         .register_asset_loader(PostcardLoader::<LandmarkRes>::new("oslmk"))
-        .register_asset_loader(PostcardLoader::<LinkNycRes>::new("oslink"));
+        .register_asset_loader(PostcardLoader::<LinkNycRes>::new("oslink"))
+        .register_asset_loader(PostcardLoader::<FacilitiesRes>::new("osfac"));
 }
 
 /// Handles requested at startup; the world is built once they resolve.
 #[derive(Resource)]
 pub struct LoadingHandles {
     pub graph: Handle<GraphAssetRes>,
+    /// A drive network (CSCL, incl. highways like the FDR) the roving-coverage
+    /// overlay snaps vehicle motion onto, so highway use lights up too.
+    pub drive_graph: Handle<GraphAssetRes>,
     /// Fixed-CCTV census (Amnesty + Dahir) with per-camera provenance (`.oscctv`).
     pub cameras: Handle<CctvRes>,
     /// Photo-enforcement cameras — a plain `FixedSensorLayer` (`.oscam`).
@@ -164,5 +171,7 @@ pub struct LoadingHandles {
     /// Iconic bridge massings (same `.oslmk` schema as `landmarks`).
     pub bridges: Handle<LandmarkRes>,
     pub linknyc: Handle<LinkNycRes>,
+    /// Civic institutions (schools + libraries) for the Institutions explore view.
+    pub facilities: Handle<FacilitiesRes>,
     pub built: bool,
 }

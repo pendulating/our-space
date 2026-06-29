@@ -21,6 +21,55 @@ pub enum RouteError {
 /// Default pedestrian walking speed (m/s) — ~4.8 km/h.
 pub const DEFAULT_WALK_SPEED_MPS: f64 = 1.34;
 
+/// mph → m/s.
+const MPH: f64 = 0.44704;
+
+/// Heuristic ceiling (m/s) for the time-based A*: the straight-line ÷ max-speed
+/// heuristic is admissible only if `max_speed` is ≥ every edge's speed. NYC's
+/// fastest posted limit in CSCL is 50 mph; 60 gives headroom, and `class_speed_mps`
+/// is capped here so no edge can ever exceed it.
+pub const MAX_DRIVE_SPEED_MPS: f64 = 60.0 * MPH; // 26.82 m/s
+
+/// Decode the CSCL drive-graph `EdgeData.segment_id` into `(rw_type, posted_mph)`.
+/// To avoid a graph-asset format change, the drive bake packs both the road class
+/// and the posted speed limit into the one `i64`: `segment_id = rw_type * 100 +
+/// posted_mph` (posted_mph 0 = unknown). The ranges don't overlap, so we can still
+/// read a **legacy** graph that stored the bare `rw_type` (1..=14): values ≤ 14 are
+/// taken as a raw class with unknown speed. Anything else (None, or the raw OSM way
+/// id the *walk* graph stores here) decodes to `(0, 0)` → the 25 mph default. Only
+/// the drive graph's timed router and coverage call this, so the walk-graph way-id
+/// case is never actually hit.
+pub fn unpack_class(segment_id: Option<i64>) -> (i64, i64) {
+    match segment_id {
+        Some(s) if (0..=14).contains(&s) => (s, 0), // legacy: bare rw_type
+        Some(s) if s >= 100 => (s.div_euclid(100), s.rem_euclid(100)), // packed rw*100+mph
+        _ => (0, 0),
+    }
+}
+
+/// Free-flow speed (m/s) for a CSCL drive-graph edge, from its packed `segment_id`.
+/// Prefers the segment's **posted speed limit** when the bake recorded one; else
+/// falls back to a per-class default — surface streets get NYC's 25 mph, highways /
+/// ramps / bridges / tunnels are faster, so time-based routing prefers them for fast
+/// trips (revealing FDR / Henry Hudson / West Side Hwy use). Unknown class/speed
+/// (`None`) → 25 mph, making the time router equivalent to shortest-distance on a
+/// graph without road classes. Always capped at [`MAX_DRIVE_SPEED_MPS`].
+pub fn class_speed_mps(segment_id: Option<i64>) -> f64 {
+    let (rw, posted_mph) = unpack_class(segment_id);
+    let mph = if posted_mph > 0 {
+        posted_mph as f64 // segment's own posted limit
+    } else {
+        match rw {
+            2 => 40.0, // Highway (FDR, Henry Hudson, West Side Hwy)
+            9 => 30.0, // Ramp
+            3 => 30.0, // Bridge
+            4 => 35.0, // Tunnel
+            _ => 25.0, // Street / Alley / unknown — NYC default limit
+        }
+    };
+    (mph * MPH).min(MAX_DRIVE_SPEED_MPS)
+}
+
 /// A routable pedestrian graph in local ENU meters.
 pub struct StreetGraph {
     origin: GeoOrigin,
@@ -108,6 +157,89 @@ impl StreetGraph {
         let a = self.snap_nearest(from).ok_or(RouteError::Empty)?;
         let b = self.snap_nearest(to).ok_or(RouteError::Empty)?;
         self.route(a, b)
+    }
+
+    /// Route by **free-flow time** (edge cost = `length / class_speed`) instead of
+    /// distance, so fast/long trips take the highways. Used for the dashcam-vehicle
+    /// (taxi) routes. On a graph without road classes (`segment_id` = None) every
+    /// edge gets the 25 mph default, making this equivalent to shortest-distance.
+    pub fn route_timed(&self, start: u32, goal: u32) -> Result<Route, RouteError> {
+        if self.positions.is_empty() {
+            return Err(RouteError::Empty);
+        }
+        let start_ix = NodeIndex::new(start as usize);
+        let goal_ix = NodeIndex::new(goal as usize);
+        let goal_pos = self.positions[goal as usize];
+        // Admissible heuristic: straight-line distance ÷ the fastest possible edge
+        // speed never overestimates remaining travel time.
+        let result = astar(
+            &self.g,
+            start_ix,
+            |n| n == goal_ix,
+            |e| {
+                let edge = &self.asset.edges[*e.weight()];
+                edge.length_m / class_speed_mps(edge.segment_id)
+            },
+            |n| self.positions[n.index()].distance(goal_pos) / MAX_DRIVE_SPEED_MPS,
+        );
+        let (_cost, path) = result.ok_or(RouteError::NoPath)?;
+        Ok(self.build_route(&path))
+    }
+
+    /// Snap two ENU points to the nearest nodes and route by free-flow time.
+    pub fn route_points_timed(&self, from: Vec2, to: Vec2) -> Result<Route, RouteError> {
+        let a = self.snap_nearest(from).ok_or(RouteError::Empty)?;
+        let b = self.snap_nearest(to).ok_or(RouteError::Empty)?;
+        self.route_timed(a, b)
+    }
+
+    /// Route by free-flow time, multiplying the cost of highway/ramp edges (CSCL
+    /// `rw_type` 2 / 9, carried in `segment_id`) by `hw_penalty`. `hw_penalty = 1.0`
+    /// is the plain fastest path; a large penalty forces the surface-street
+    /// alternative. Returns the route, its true (un-penalized) free-flow time in
+    /// seconds (the `t_r` the route-inference likelihood scores against), and the
+    /// list of **edge indices** it traverses (for the sensing-power metric).
+    pub fn route_timed_pen(
+        &self,
+        start: u32,
+        goal: u32,
+        hw_penalty: f64,
+    ) -> Result<(Route, f64, Vec<u32>), RouteError> {
+        if self.positions.is_empty() {
+            return Err(RouteError::Empty);
+        }
+        let start_ix = NodeIndex::new(start as usize);
+        let goal_ix = NodeIndex::new(goal as usize);
+        let goal_pos = self.positions[goal as usize];
+        // Highway/ramp = CSCL rw_type 2 / 9 (decoded from the packed segment_id).
+        let is_hw = |sid: Option<i64>| matches!(unpack_class(sid).0, 2 | 9);
+        let result = astar(
+            &self.g,
+            start_ix,
+            |n| n == goal_ix,
+            |e| {
+                let edge = &self.asset.edges[*e.weight()];
+                let t = edge.length_m / class_speed_mps(edge.segment_id);
+                if is_hw(edge.segment_id) {
+                    t * hw_penalty
+                } else {
+                    t
+                }
+            },
+            |n| self.positions[n.index()].distance(goal_pos) / MAX_DRIVE_SPEED_MPS,
+        );
+        let (_cost, path) = result.ok_or(RouteError::NoPath)?;
+        // True free-flow seconds + traversed edge indices along the chosen path.
+        let mut t_r = 0.0;
+        let mut edges = Vec::with_capacity(path.len().saturating_sub(1));
+        for pair in path.windows(2) {
+            if let Some(ei) = self.g.find_edge(pair[0], pair[1]) {
+                let e = self.g[ei];
+                t_r += self.asset.edges[e].length_m / class_speed_mps(self.asset.edges[e].segment_id);
+                edges.push(e as u32);
+            }
+        }
+        Ok((self.build_route(&path), t_r, edges))
     }
 
     /// All street reachable on foot within `max_seconds` of `start` (a walkshed
