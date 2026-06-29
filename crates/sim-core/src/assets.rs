@@ -236,6 +236,46 @@ impl LinkNycLayer {
     }
 }
 
+/// The institution class for the "Institutions" explore view. Kept tiny + `Copy`
+/// so it can tag both the baked record and the runtime pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FacilityKind {
+    School,
+    Library,
+}
+
+/// One civic institution (a school or library) in ENU meters, from the NYC
+/// Facilities Database. A *subject* of surveillance, not a sensor — it carries no
+/// FOV and never enters the exposure model; the app ranks it by how many cameras
+/// sit nearby.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Facility {
+    pub x: f64,
+    pub y: f64,
+    pub name: String,
+    pub kind: FacilityKind,
+    /// The dataset's finer `factype` (e.g. "PUBLIC ELEMENTARY SCHOOL", "BRANCH
+    /// LIBRARY") — shown in the click modal.
+    pub subtype: String,
+}
+
+/// The baked institutions layer — schools + libraries as fixed map points.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacilityLayer {
+    pub origin: GeoOrigin,
+    pub facilities: Vec<Facility>,
+    pub provenance: Provenance,
+}
+
+impl FacilityLayer {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
 /// One ACE route shape as an ordered ENU polyline — the path a bus drives. Used
 /// to animate running buses (the `segments` soup below stays for the analytical
 /// curb-distance exposure model). `f32` keeps the bundle small; decorative.
@@ -741,6 +781,25 @@ pub struct TaxiOdMinute {
     pub trips: u32,
 }
 
+/// Analytic sensing-power summary (O'Keeffe et al., PNAS 2019) for the day's
+/// fleet: the closed-form coverage curve `C(N) = (1/S)·Σ_i[1−(1−q_i)^N]` reduced
+/// to a few headline points, for the citable coverage headline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SensingPower {
+    /// Total drive segments `S` (the coverage denominator).
+    pub segments_total: u32,
+    /// Segments the full fleet senses ≥ once (the asymptotic-ceiling numerator).
+    pub segments_sensed: u32,
+    /// Total trips `M` in the day.
+    pub trips_total: u32,
+    /// Random trips to reach ⅓ coverage.
+    pub n_third: u32,
+    /// Random trips to reach ½ coverage.
+    pub n_half: u32,
+    /// Trips per for-hire-vehicle-day used to convert trips → vehicles (≈27).
+    pub trips_per_vehicle_day: u16,
+}
+
 /// A day's worth of real rideshare trips (one date): a shared routed-O-D pool, a
 /// sampled trip list (for the visuals, capped to the on-screen pool), and the full
 /// per-minute O-D aggregate (for the estimate).
@@ -755,6 +814,8 @@ pub struct TaxiDayLayer {
     /// Full per-minute O-D counts (for the analytical flux).
     pub od_per_minute: Vec<TaxiOdMinute>,
     pub provenance: Provenance,
+    /// Analytic sensing-power summary for the coverage headline (Stage 4).
+    pub sensing: SensingPower,
 }
 
 impl TaxiDayLayer {
@@ -919,6 +980,7 @@ mod tests {
                 trips: 3,
             }],
             provenance: prov(),
+            sensing: Default::default(),
         };
         let back = TaxiDayLayer::from_bytes(&taxi.to_bytes().unwrap()).unwrap();
         assert_eq!(back.trips[0].route_idx, 0);

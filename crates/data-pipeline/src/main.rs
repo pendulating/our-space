@@ -18,6 +18,7 @@ mod enforcement;
 mod dot;
 mod equity;
 mod extent;
+mod facilities;
 mod footprints;
 mod parks;
 mod plazas;
@@ -104,8 +105,10 @@ fn run() -> anyhow::Result<()> {
             let trips = args.get(5).context(USAGE)?;
             let date: u32 = args.get(6).context(USAGE)?.parse().context("date YYYYMMDD")?;
             let out = args.get(7).context(USAGE)?;
+            // [footprints.geojson] optional: dasymetric within-zone endpoint weighting.
+            let footprints = args.get(8).map(String::as_str);
             ensure_parent(out)?;
-            taxi_day::bake(graph, geojson, perminute, trips, date, out)?;
+            taxi_day::bake(graph, geojson, perminute, trips, date, out, footprints)?;
             Ok(())
         }
         Some("bake-robotability") => {
@@ -192,6 +195,14 @@ fn run() -> anyhow::Result<()> {
             linknyc::bake(json, out, boundary)?;
             Ok(())
         }
+        Some("bake-facilities") => {
+            let json = args.get(2).context(USAGE)?;
+            let out = args.get(3).context(USAGE)?;
+            let boro = args.get(4).map(String::as_str); // optional borough filter (e.g. MANHATTAN)
+            ensure_parent(out)?;
+            facilities::bake(json, out, boro)?;
+            Ok(())
+        }
         Some("bake-dashcam-field") => {
             let geojson = args.get(2).context(USAGE)?;
             let trips = args.get(3).context(USAGE)?;
@@ -262,12 +273,22 @@ fn bake_graph(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         Some("--cscl") => {
-            // Citywide five-borough street network from NYC's CSCL centerline GeoJSON
-            // (Socrata inkn-q76z) — the Overpass route can't pull all of NYC at once.
+            // Five-borough street network from NYC's CSCL centerline GeoJSON (Socrata
+            // inkn-q76z) — the Overpass route can't pull all of NYC at once. Optional
+            // 3rd arg clips to a borough boundary (e.g. a Manhattan drive graph whose
+            // rw_type, carried in segment_id, drives time-based taxi routing); optional
+            // 4th arg is a parks GeoJSON whose interiors are dropped from the drivable
+            // surface network (CSCL codes car-free park drives/paths as "Street").
             let geojson = args.get(1).context(USAGE)?;
             let out = args.get(2).context(USAGE)?;
+            // `-` (or empty) skips an optional path arg, so parks can be passed without
+            // a borough clip (the citywide graph keeps all five boroughs).
+            let opt = |i: usize| args.get(i).map(String::as_str).filter(|s| !s.is_empty() && *s != "-");
+            let boundary = opt(3);
+            let parks = opt(4);
+            let open_streets = opt(5); // NYC DOT Open Streets (car-free) mask
             ensure_parent(out)?;
-            graph_osm::bake_cscl(geojson, out)?;
+            graph_osm::bake_cscl(geojson, out, boundary, parks, open_streets)?;
             Ok(())
         }
         _ => bail!(USAGE),
@@ -294,7 +315,7 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-graph --synthetic <rows> <cols> <spacing_m> <out.postcard>\n  \
     data-pipeline bake-graph --overpass-json <walk.json> <out.postcard> [manhattan.geojson]\n  \
     data-pipeline bake-graph --overpass-drive <walk.json> <out.osgraph> [manhattan.geojson]\n  \
-    data-pipeline bake-graph --cscl <cscl.geojson> <out.osgraph>   (citywide, NYC Street Centerline)\n  \
+    data-pipeline bake-graph --cscl <cscl.geojson> <out.osgraph> [boundary.geojson|-] [parks.geojson|-] [open_streets.geojson]\n  \
     data-pipeline bake-cameras <map_data.csv> <out.postcard> [manhattan|nyc]\n  \
     data-pipeline bake-cctv <amnesty_counts_per_intersections.csv> <dahir_map_data.csv> <out.postcard> [manhattan|nyc]\n  \
     data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard> [manhattan|nyc] [boundary.geojson]\n  \

@@ -82,10 +82,31 @@ CSCL_GEOJSON="${CSCL_GEOJSON:-$SNAP/osm/cscl.geojson}"
 if [ ! -f "$CSCL_GEOJSON" ]; then
   echo "    fetching CSCL centerline -> $CSCL_GEOJSON"
   mkdir -p "$(dirname "$CSCL_GEOJSON")"
+  # trafdir (NV = non-vehicular) + nonped (D = park drives) drive the drivability
+  # classifier; posted_speed feeds the time router. See graph_osm::bake_cscl.
   curl -sS --compressed -o "$CSCL_GEOJSON" \
-    "https://data.cityofnewyork.us/resource/inkn-q76z.geojson?\$select=the_geom,rw_type,nonped&\$limit=200000"
+    "https://data.cityofnewyork.us/resource/inkn-q76z.geojson?\$select=the_geom,rw_type,trafdir,nonped,posted_speed,full_street_name&\$limit=200000"
 fi
-"$BIN" bake-graph --cscl "$CSCL_GEOJSON" "$OUT/graph_nyc.osgraph"
+# Parks GeoJSON (also baked as a layer below) doubles as the mask that drops car-free
+# park-interior drives from the citywide graph — fetch it before the graph bake.
+PARKS_GEOJSON="${PARKS_GEOJSON:-$SNAP/parks/parks.geojson}"
+if [ ! -f "$PARKS_GEOJSON" ]; then
+  echo "    fetching Parks Properties -> $PARKS_GEOJSON"
+  mkdir -p "$(dirname "$PARKS_GEOJSON")"
+  curl -sS --compressed -o "$PARKS_GEOJSON" \
+    "https://data.cityofnewyork.us/resource/enfh-gkve.geojson?\$select=multipolygon,signname,typecategory,borough,acres&\$limit=10000"
+fi
+# NYC DOT Open Streets (car-free streets) — Layer 4 of the drivability mask: CSCL still
+# codes pedestrianized blocks (Broadway plazas, West Village Open Streets) as vehicular.
+OPENST_GEOJSON="${OPENST_GEOJSON:-$SNAP/open_streets/open_streets.geojson}"
+if [ ! -f "$OPENST_GEOJSON" ]; then
+  echo "    fetching Open Streets -> $OPENST_GEOJSON"
+  mkdir -p "$(dirname "$OPENST_GEOJSON")"
+  curl -sS --compressed -o "$OPENST_GEOJSON" \
+    "https://data.cityofnewyork.us/resource/uiay-nctu.geojson?\$select=the_geom,appronstre,reviewstat,boroughname,apprdayswe&\$limit=2000"
+fi
+# `-` = no borough clip (keep all five boroughs); then parks + Open Streets masks.
+"$BIN" bake-graph --cscl "$CSCL_GEOJSON" "$OUT/graph_nyc.osgraph" - "$PARKS_GEOJSON" "$OPENST_GEOJSON"
 
 echo "==> iconic 3D bridges (decks + towers + cables) from named CSCL bridge segments"
 # A second, name-carrying CSCL pull (the graph query drops stname_label): every
@@ -129,6 +150,19 @@ if [ ! -f "$PLAZAS_GEOJSON" ]; then
 fi
 "$BIN" bake-plazas "$PLAZAS_GEOJSON" "$OUT/plazas.osplaza"
 
+echo "==> institutions (schools + libraries) — Manhattan-only + citywide"
+# NYC Facilities Database (ji82-xba5), pre-filtered to schools (K-12) + libraries.
+# Baked twice: Manhattan-only for the default build, all five boroughs for ?city=nyc.
+FACILITIES_JSON="${FACILITIES_JSON:-$SNAP/facilities/facilities.json}"
+if [ ! -f "$FACILITIES_JSON" ]; then
+  echo "    fetching Facilities Database -> $FACILITIES_JSON"
+  mkdir -p "$(dirname "$FACILITIES_JSON")"
+  curl -sS --compressed -o "$FACILITIES_JSON" \
+    "https://data.cityofnewyork.us/resource/ji82-xba5.json?\$select=facname,latitude,longitude,boro,facgroup,facsubgrp,factype,address&\$where=facgroup%20in('SCHOOLS%20(K-12)','LIBRARIES')&\$limit=5000"
+fi
+"$BIN" bake-facilities "$FACILITIES_JSON" "$OUT/facilities.osfac" MANHATTAN
+"$BIN" bake-facilities "$FACILITIES_JSON" "$OUT/facilities_nyc.osfac"
+
 echo "==> citywide rideshare/taxi (all-borough TLC HVFHV, routed on the citywide graph)"
 # The Manhattan taxi_day filtered HVFHV to Manhattan↔Manhattan; the citywide build
 # wants all five boroughs. DuckDB streams one real day out of the published HVFHV
@@ -145,7 +179,9 @@ if [ ! -f "$TAXI_TRIPS_NYC" ]; then
     duckdb -c "INSTALL httpfs; LOAD httpfs;
       COPY (SELECT CAST(date_part('hour',pickup_datetime)*60+date_part('minute',pickup_datetime) AS INTEGER) AS pu_min,
                    PULocationID, DOLocationID,
-                   CAST(GREATEST(1,date_diff('minute',pickup_datetime,dropoff_datetime)) AS INTEGER) AS dur_min
+                   CAST(GREATEST(1,date_diff('minute',pickup_datetime,dropoff_datetime)) AS INTEGER) AS dur_min,
+                   ROUND(trip_miles,3) AS trip_miles,
+                   CAST(trip_time AS INTEGER) AS trip_time
             FROM read_parquet('$TAXI_PARQUET')
             WHERE pickup_datetime >= TIMESTAMP '$TAXI_DAY_SRC 00:00:00'
               AND pickup_datetime <  TIMESTAMP '$TAXI_DAY_SRC 00:00:00' + INTERVAL 1 DAY

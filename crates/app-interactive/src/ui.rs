@@ -318,10 +318,13 @@ pub fn ui_panel(
     nbhd_live: bevy::prelude::Res<crate::NeighborhoodLive>,
     mut clock: ResMut<crate::SimClock>,
     date: bevy::prelude::Res<crate::SimDate>,
-    (mut more_open, mut advanced_open, alpr_makers): (
+    (mut more_open, mut advanced_open, alpr_makers, mut cov_view, mut movables, mut inst): (
         bevy::prelude::Local<bool>,
         bevy::prelude::Local<bool>,
         bevy::prelude::Res<crate::AlprMakerBreakdown>,
+        ResMut<crate::coverage::CoverageView>,
+        ResMut<crate::movable::MovablePanels>,
+        ResMut<crate::InstitutionsView>,
     ),
     theme_ready: bevy::prelude::Res<crate::ThemeReady>,
     mut geocoder: ResMut<crate::geocode::Geocoder>,
@@ -375,17 +378,20 @@ pub fn ui_panel(
         .exact_width(PANEL_WIDTH_PX)
         .show(ctx, |ui| {
             // ---- masthead ----
-            // The page's HTML <header> already carries the "our·space" wordmark, so the
-            // panel leads with the question instead (no duplicate title).
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("How watched is a place in Manhattan?")
-                    .font(theme::display(20.0))
-                    .color(pal::ZINC_100),
-            );
-            ui.add_space(10.0);
+            // The page's HTML <header> already carries the "our·space" wordmark and the
+            // framing copy, so the panel leads straight into the mode selector.
+            ui.add_space(8.0);
 
             // ---- what am I measuring? (the one decision the visitor makes) ----
+            // Three icon chips: a pin-in-circle (your area), a walking figure (A→B),
+            // and the Financial District's real outline (neighborhoods). The icon sits
+            // over the label; the whole column is one click target.
+            let fidi_ring: Option<&[[f64; 2]]> = sim.as_ref().and_then(|s| {
+                s.neighborhoods
+                    .iter()
+                    .find(|n| n.name == "Financial District")
+                    .map(|n| n.exterior.as_slice())
+            });
             ui.horizontal(|ui| {
                 // Re-clicking the mode you're already in clears its placed area/walk — a
                 // toggle-off affordance (same effect as Reset, scoped to the active mode).
@@ -395,10 +401,20 @@ pub fn ui_panel(
                 let in_neigh = params.mode == Mode::Neighborhoods;
                 let area_present = walkshed.summary.is_some();
                 let route_present = route.a.is_some() || route.summary.is_some();
-                let mut r_walk = ui.selectable_value(&mut params.mode, Mode::Walkshed, "My area");
-                let mut r_route = ui.selectable_value(&mut params.mode, Mode::Route, "A walk A→B");
+
+                let gap = 6.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                // `.max(8)` guards against a degenerately-narrow panel producing a
+                // negative width (→ a bad rect + negative icon radius/height downstream).
+                let col_w = ((ui.available_width() - 2.0 * gap) / 3.0).floor().max(8.0);
+
+                let mut r_walk = mode_button(ui, in_walkshed, col_w, "My area", paint_pin_in_circle);
+                let mut r_route = mode_button(ui, in_route, col_w, "A→B walk", paint_walker);
                 let mut r_neigh =
-                    ui.selectable_value(&mut params.mode, Mode::Neighborhoods, "Neighborhoods");
+                    mode_button(ui, in_neigh, col_w, "Neighborhoods", |p, r, c| {
+                        paint_neighborhood_outline(p, r, c, fidi_ring)
+                    });
+
                 if in_walkshed && area_present {
                     r_walk = r_walk.on_hover_text("Click again to clear your area");
                 }
@@ -408,16 +424,26 @@ pub fn ui_panel(
                 if in_neigh {
                     r_neigh = r_neigh.on_hover_text("Click again to leave Neighborhoods");
                 }
-                if (in_walkshed && area_present && r_walk.clicked())
-                    || (in_route && route_present && r_route.clicked())
-                {
-                    reset.0 = true;
+
+                // Selection + the re-click affordances. A re-click on My area / A→B clears
+                // its placed visuals (staying in the mode); a re-click on Neighborhoods
+                // leaves to the no-mode start state.
+                if r_walk.clicked() {
+                    if in_walkshed && area_present {
+                        reset.0 = true;
+                    } else {
+                        params.mode = Mode::Walkshed;
+                    }
                 }
-                // Re-clicking the active Neighborhoods chip leaves the mode (back to the
-                // default "My area"). `selectable_value` re-asserts Neighborhoods on click,
-                // so flip it back when it was already active.
-                if in_neigh && r_neigh.clicked() {
-                    params.mode = Mode::Walkshed;
+                if r_route.clicked() {
+                    if in_route && route_present {
+                        reset.0 = true;
+                    } else {
+                        params.mode = Mode::Route;
+                    }
+                }
+                if r_neigh.clicked() {
+                    params.mode = if in_neigh { Mode::None } else { Mode::Neighborhoods };
                 }
             });
             // The neighborhood-density view is a mode now (not an EXPLORE checkbox): keep the
@@ -426,6 +452,9 @@ pub fn ui_panel(
             params.neighborhoods_on = matches!(params.mode, Mode::Neighborhoods);
             ui.label(
                 egui::RichText::new(match params.mode {
+                    Mode::None => {
+                        "Pick how to explore: map your area, trace a walk, or compare neighborhoods."
+                    }
                     Mode::Walkshed => {
                         "Search an address or click the map. Every camera within a 10-minute walk."
                     }
@@ -442,6 +471,7 @@ pub fn ui_panel(
             // ---- address search (type a place; or click the map) ----
             use crate::geocode::Field;
             match params.mode {
+                Mode::None => {} // no mode chosen yet — no inputs; the hero card prompts
                 Mode::Walkshed => {
                     address_field(ui, &mut geocoder, Field::Walkshed, "Search an address or place");
                     if ui
@@ -473,9 +503,9 @@ pub fn ui_panel(
                     });
                 }
                 Mode::Neighborhoods => {
-                    // No address search in this mode — just the scope toggle. The hovered
-                    // region's breakdown lands in the result card below.
-                    ui.checkbox(&mut params.neighborhoods_all, "Include all five boroughs");
+                    // No address search in this mode — the hovered region's breakdown lands
+                    // in the result card below. (The five-borough scope is reached by the
+                    // on-map outer-borough nudge → the citywide build, not a checkbox.)
                 }
             }
             ui.add_space(8.0);
@@ -489,6 +519,7 @@ pub fn ui_panel(
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     match params.mode {
+                        Mode::None => result_none(ui),
                         Mode::Walkshed => result_walkshed(ui, &route, &walkshed),
                         Mode::Route => {
                             result_route(ui, &mut params, &route, &walk_live, clock.time_of_day)
@@ -549,6 +580,37 @@ pub fn ui_panel(
                         }
                     }
                 });
+            }
+
+            // Roving-coverage replay — a one-day time-lapse that lights up each street
+            // by how often a moving camera (rideshare dashcam or ACE bus) crosses it.
+            if ui
+                .selectable_label(cov_view.active, "Roving coverage (one day)")
+                .on_hover_text(
+                    "Replay a day in 30 seconds. Streets glow brighter the more often a camera vehicle passes.",
+                )
+                .clicked()
+            {
+                cov_view.active = !cov_view.active;
+                if cov_view.active {
+                    ov.active = false;
+                }
+            }
+
+            // Institutions — rank schools & libraries by the cameras watching them.
+            // Opens a sliding ranking panel on the left + marks them on the map.
+            if ui
+                .selectable_label(inst.active, "Institutions (schools & libraries)")
+                .on_hover_text(
+                    "Rank schools and libraries by the cameras nearby. Opens a panel on the left; click an entry to fly there.",
+                )
+                .clicked()
+            {
+                inst.active = !inst.active;
+                if inst.active {
+                    ov.active = false; // mutually exclusive with the other takeover views
+                    cov_view.active = false;
+                }
             }
 
             // Camera-density choropleth ("the heatmap") — an Explore toggle that lives
@@ -899,19 +961,24 @@ pub fn ui_panel(
         }
     }
 
-    // ---- bottom-center live day clock (hidden while the Operators view is up) ----
-    if !ov.active {
-        egui::Area::new(egui::Id::new("time_bar"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -18.0))
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(pal::ZINC_900)
-                    .stroke(egui::Stroke::new(1.5, pal::ZINC_700))
-                    .inner_margin(egui::Margin::symmetric(16, 12))
-                    .corner_radius(8)
-                    .show(ui, |ui| {
-                        ui.set_width(440.0);
-                        ui.horizontal(|ui| {
+    // ---- live day clock (hidden while a takeover overlay is up) ----
+    // Movable: it floats over the map, so it's a `movable_panel` (drag the grip to
+    // reposition when it occludes something). Seeds bottom-center, clamps to view.
+    if !ov.active && !cov_view.active {
+        let frame = egui::Frame::new()
+            .fill(pal::ZINC_900)
+            .stroke(egui::Stroke::new(1.5, pal::ZINC_700))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .corner_radius(8);
+        crate::movable::movable_panel(
+            ctx,
+            &mut movables,
+            "time_bar",
+            440.0,
+            |screen| egui::pos2(screen.center().x - 236.0, screen.bottom() - 122.0),
+            frame,
+            |ui| {
+                ui.horizontal(|ui| {
                             if ui
                                 .button(if clock.playing { "  Pause  " } else { "  Play  " })
                                 .clicked()
@@ -947,12 +1014,150 @@ pub fn ui_panel(
                                 clock.playing = false; // scrubbing pauses the clock
                             }
                         }
-                    });
-            });
+            },
+        );
     }
 
     wants.pointer = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
     wants.keyboard = ctx.wants_keyboard_input();
+}
+
+/// The hero card before any mode is chosen: a short prompt pointing at the three
+/// mode buttons above. Keeps the card from reading as broken on first load.
+fn result_none(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new("Start exploring")
+            .font(theme::display(22.0))
+            .color(pal::ZINC_100),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "Choose a mode above. Map your area, trace an A→B walk, or compare \
+             neighborhoods by camera density.",
+        )
+        .size(13.0)
+        .color(pal::ZINC_300),
+    );
+}
+
+/// One mode chip in the selector: a monochrome ink icon stacked over a label, the
+/// whole `width`×58 column a single click target. `selected` paints the active plate.
+fn mode_button(
+    ui: &mut egui::Ui,
+    selected: bool,
+    width: f32,
+    label: &str,
+    paint_icon: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 58.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    if selected {
+        painter.rect_filled(rect, 6.0, pal::ZINC_800);
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(1.0, pal::ZINC_600),
+            egui::StrokeKind::Inside,
+        );
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 6.0, pal::ZINC_900);
+    }
+    // Icons are monochrome ink (no per-mode color), per the design brief.
+    let ink = pal::ZINC_100;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 17.0),
+        egui::vec2(26.0, 26.0),
+    );
+    paint_icon(&painter, icon_rect, ink);
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 6.0),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        egui::FontId::proportional(11.0),
+        if selected { ink } else { pal::ZINC_300 },
+    );
+    resp
+}
+
+/// "My area" icon: a ring (the reachable area) with a centered location pin.
+fn paint_pin_in_circle(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.5 - 1.0;
+    painter.circle_stroke(c, r, egui::Stroke::new(1.6, color));
+    // Centered pin: a round head over a triangular point, with a paper "eye".
+    let head = egui::pos2(c.x, c.y - r * 0.16);
+    let hr = r * 0.30;
+    let tip = egui::pos2(c.x, c.y + r * 0.58);
+    let lx = egui::pos2(c.x - hr * 0.95, head.y + hr * 0.5);
+    let rx = egui::pos2(c.x + hr * 0.95, head.y + hr * 0.5);
+    painter.add(egui::Shape::convex_polygon(vec![lx, rx, tip], color, egui::Stroke::NONE));
+    painter.circle_filled(head, hr, color);
+    painter.circle_filled(head, hr * 0.42, pal::ZINC_950);
+}
+
+/// "A→B walk" icon: a mid-stride stick walker.
+fn paint_walker(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let s = egui::Stroke::new(1.7, color);
+    let cx = rect.center().x;
+    let top = rect.top() + 2.5;
+    let bottom = rect.bottom() - 2.5;
+    let h = bottom - top;
+    let head_r = h * 0.13;
+    let head = egui::pos2(cx - h * 0.02, top + head_r);
+    painter.circle_filled(head, head_r, color);
+    let neck = egui::pos2(head.x, head.y + head_r);
+    let hip = egui::pos2(cx, top + h * 0.62);
+    painter.line_segment([neck, hip], s); // torso
+    painter.line_segment([hip, egui::pos2(cx + h * 0.22, bottom)], s); // front leg
+    painter.line_segment([hip, egui::pos2(cx - h * 0.20, bottom - h * 0.05)], s); // back leg
+    let shoulder = egui::pos2(head.x, neck.y + h * 0.08);
+    painter.line_segment([shoulder, egui::pos2(cx - h * 0.20, top + h * 0.55)], s); // back arm
+    painter.line_segment([shoulder, egui::pos2(cx + h * 0.18, top + h * 0.52)], s); // front arm
+}
+
+/// "Neighborhoods" icon: the Financial District's real outline, fit into the box
+/// (uniform scale, Y flipped from ENU north-up to screen y-down). Falls back to a
+/// generic rounded square if the ring isn't loaded yet.
+fn paint_neighborhood_outline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+    ring: Option<&[[f64; 2]]>,
+) {
+    let Some(ring) = ring.filter(|r| r.len() >= 3) else {
+        painter.rect_stroke(
+            rect.shrink(3.0),
+            3.0,
+            egui::Stroke::new(1.6, color),
+            egui::StrokeKind::Inside,
+        );
+        return;
+    };
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in ring {
+        minx = minx.min(p[0]);
+        maxx = maxx.max(p[0]);
+        miny = miny.min(p[1]);
+        maxy = maxy.max(p[1]);
+    }
+    let (w, h) = ((maxx - minx).max(1e-6), (maxy - miny).max(1e-6));
+    let pad = 3.0_f64;
+    let box_w = (rect.width() as f64 - 2.0 * pad).max(1.0);
+    let box_h = (rect.height() as f64 - 2.0 * pad).max(1.0);
+    let s = (box_w / w).min(box_h / h);
+    let ox = rect.left() as f64 + pad + (box_w - w * s) * 0.5;
+    let oy = rect.top() as f64 + pad + (box_h - h * s) * 0.5;
+    let pts: Vec<egui::Pos2> = ring
+        .iter()
+        .map(|p| {
+            egui::pos2(
+                (ox + (p[0] - minx) * s) as f32,
+                (oy + (maxy - p[1]) * s) as f32, // flip Y
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.6, color)));
 }
 
 /// The walkshed result inside the hero card.
@@ -1012,9 +1217,11 @@ fn result_neighborhoods(
         return;
     };
     ui.label(
+        // Place name in plain ink, not the terracotta reserved for surveillance stats —
+        // the neighborhood name is a label, not a number to be alarmed by.
         egui::RichText::new(format!("{} · {}", n.name, n.borough))
             .font(theme::display(20.0))
-            .color(TERRACOTTA),
+            .color(pal::ZINC_100),
     );
     ui.label(format!("{} fixed cameras  ·  {:.0} per km²", n.total, n.density));
     egui::Grid::new("nbhd_breakdown")
@@ -1037,9 +1244,11 @@ fn result_neighborhoods(
     if m.total() > 0 {
         ui.add_space(4.0);
         ui.label(
+            // Deep gold + the ExtraBold display face: readable on the light card and
+            // visibly heavier than the surrounding body text.
             egui::RichText::new(format!("+ {} mobile sensors here now", m.total()))
-                .color(pal::YELLOW)
-                .strong(),
+                .font(theme::display(14.0))
+                .color(pal::GOLD),
         );
         egui::Grid::new("nbhd_mobile").num_columns(2).striped(true).show(ui, |ui| {
             let row = |ui: &mut egui::Ui, label: &str, v: u32| {
@@ -1474,6 +1683,203 @@ fn cross_source_note(ui: &mut egui::Ui, also: &[&'static str]) {
 /// Per-camera metadata modal for a clicked ALPR — DeFlock's crowdsourced maker/operator
 /// plus deep-links to OpenStreetMap and DeFlock. `SelectedAlpr` is set by
 /// `handle_click` (clicking on/near a reader); closing the window clears it.
+/// Shorten a label to `max` chars with an ellipsis (for the ranking rows).
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+/// The Institutions ranking panel — a sliding LEFT card listing schools + libraries,
+/// most-watched first. Clicking an entry flies the camera there and highlights its
+/// marker; per-class chips filter the list + the map markers. Drawn while the view's
+/// slide-in `t > 0` and anchored *below* the "SIMULATED DAY" header so it never
+/// occludes it. A new left sidebar, parallel to the right control panel.
+pub fn institutions_panel(
+    mut contexts: EguiContexts,
+    mut inst: ResMut<crate::InstitutionsView>,
+    dir: Res<crate::FacilityDirectory>,
+    mut sel: ResMut<crate::SelectedFacility>,
+    mut fly: ResMut<crate::CameraFly>,
+    mut wants: ResMut<EguiWants>,
+) {
+    if inst.t <= 0.001 {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    use sim_core::assets::FacilityKind;
+    const W: f32 = 292.0;
+    // Kind accent dots, matching the on-map markers (indigo school / teal library).
+    let school_c = egui::Color32::from_rgb(0x43, 0x37, 0x8a);
+    let library_c = egui::Color32::from_rgb(0x0d, 0x6b, 0x66);
+    let kind_color = |k: FacilityKind| match k {
+        FacilityKind::School => school_c,
+        FacilityKind::Library => library_c,
+    };
+
+    // Slide in from off-screen-left to docked at x=16 (smoothstep on the view's `t`).
+    let e = inst.t * inst.t * (3.0 - 2.0 * inst.t);
+    let x = 16.0 - (1.0 - e) * (W + 28.0);
+
+    egui::Area::new(egui::Id::new("institutions_panel"))
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(x, 92.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(pal::ZINC_950)
+                .stroke(egui::Stroke::new(1.0, pal::ZINC_700))
+                .inner_margin(egui::Margin::same(14))
+                .corner_radius(10)
+                .show(ui, |ui| {
+                    ui.set_width(W);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Institutions")
+                                .font(theme::display(20.0))
+                                .color(pal::ZINC_100),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Close").clicked() {
+                                inst.active = false;
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new("Schools & libraries, ranked by cameras within 200 m.")
+                            .size(12.0)
+                            .weak(),
+                    );
+                    ui.add_space(6.0);
+
+                    // Which institution *type* is most watched — the per-class averages,
+                    // ranked. (The list below ranks individual institutions.)
+                    let mut types: Vec<(FacilityKind, &str, u32, f64)> = [
+                        (FacilityKind::School, "Schools"),
+                        (FacilityKind::Library, "Libraries"),
+                    ]
+                    .iter()
+                    .map(|&(k, label)| {
+                        let items: Vec<&crate::FacilityPin> =
+                            dir.pins.iter().filter(|p| p.kind == k).collect();
+                        let n = items.len() as u32;
+                        let avg = if n > 0 {
+                            items.iter().map(|p| p.cameras_near as f64).sum::<f64>() / n as f64
+                        } else {
+                            0.0
+                        };
+                        (k, label, n, avg)
+                    })
+                    .collect();
+                    types.sort_by(|a, b| b.3.total_cmp(&a.3));
+                    for (k, label, n, avg) in &types {
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, kind_color(*k));
+                            ui.label(
+                                egui::RichText::new(format!("{label}: {avg:.1} avg"))
+                                    .strong()
+                                    .size(12.0)
+                                    .color(pal::ZINC_100),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("· {n}")).size(11.0).weak(),
+                            );
+                        });
+                    }
+                    ui.add_space(4.0);
+
+                    // Per-class filter chips (also gate the on-map markers).
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(inst.show_schools, "Schools").clicked() {
+                            inst.show_schools = !inst.show_schools;
+                        }
+                        if ui.selectable_label(inst.show_libraries, "Libraries").clicked() {
+                            inst.show_libraries = !inst.show_libraries;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    // The ranked, filtered list — click a row to fly + highlight.
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        let mut rank = 0u32;
+                        for &i in &dir.ranked {
+                            let Some(p) = dir.pins.get(i) else { continue };
+                            let shown = match p.kind {
+                                FacilityKind::School => inst.show_schools,
+                                FacilityKind::Library => inst.show_libraries,
+                            };
+                            if !shown {
+                                continue;
+                            }
+                            rank += 1;
+                            let selected = sel.0 == Some(i);
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Sense::click(),
+                            );
+                            let painter = ui.painter_at(rect);
+                            if selected {
+                                painter.rect_filled(rect, 4.0, pal::ZINC_800);
+                            } else if resp.hovered() {
+                                painter.rect_filled(rect, 4.0, pal::ZINC_900);
+                            }
+                            let cy = rect.center().y;
+                            // Camera-count badge (the ranking key), in deep gold.
+                            painter.text(
+                                egui::pos2(rect.left() + 8.0, cy),
+                                egui::Align2::LEFT_CENTER,
+                                format!("{}", p.cameras_near),
+                                theme::display(13.0),
+                                pal::GOLD,
+                            );
+                            // Name.
+                            painter.text(
+                                egui::pos2(rect.left() + 38.0, cy),
+                                egui::Align2::LEFT_CENTER,
+                                ellipsize(&p.name, 30),
+                                egui::FontId::proportional(12.0),
+                                pal::ZINC_100,
+                            );
+                            // Kind dot (right).
+                            painter.circle_filled(
+                                egui::pos2(rect.right() - 8.0, cy),
+                                3.5,
+                                kind_color(p.kind),
+                            );
+                            if resp.clicked() {
+                                sel.0 = Some(i);
+                                fly.request(crate::FlyTo::Point {
+                                    center: p.pos,
+                                    scale: crate::FLY_AREA_ZOOM,
+                                });
+                            }
+                            resp.on_hover_text(format!(
+                                "{} · {} cameras within 200 m",
+                                if p.subtype.is_empty() { "Institution" } else { &p.subtype },
+                                p.cameras_near
+                            ));
+                        }
+                        if rank == 0 {
+                            ui.label(
+                                egui::RichText::new("No institutions in view. Enable a class above.")
+                                    .weak()
+                                    .size(12.0),
+                            );
+                        }
+                    });
+                });
+        });
+
+    // This panel is interactive: make sure clicks on it don't fall through to the map.
+    wants.pointer = wants.pointer || ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+}
+
 pub fn alpr_modal(
     mut contexts: EguiContexts,
     dir: Res<crate::AlprDirectory>,
@@ -1609,4 +2015,116 @@ pub fn cctv_modal(
     if !open {
         sel.0 = None;
     }
+}
+
+/// The roving-coverage HUD — a bottom-center card shown while the one-day coverage
+/// replay is up (the normal time-bar is hidden then). Names the hour, the running
+/// segment tally, a heat legend, and the replay/exit controls. A separate egui pass
+/// from `ui_panel`, where only the launch toggle lives.
+pub fn coverage_overlay(
+    mut contexts: EguiContexts,
+    mut cov_view: ResMut<crate::coverage::CoverageView>,
+    cov: bevy::prelude::Res<crate::coverage::Coverage>,
+    clock: bevy::prelude::Res<crate::SimClock>,
+    theme_ready: bevy::prelude::Res<crate::ThemeReady>,
+    sim: Option<bevy::prelude::Res<crate::Sim>>,
+) {
+    if !theme_ready.0 || !cov_view.active {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    let (h, m) = (
+        clock.time_of_day.floor() as i32,
+        (clock.time_of_day.fract() * 60.0).floor() as i32,
+    );
+    let finished = cov_view.finished;
+    let covered = cov.covered;
+
+    egui::Area::new(egui::Id::new("coverage_hud"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 236))
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .corner_radius(10)
+                .show(ui, |ui| {
+                    ui.set_max_width(360.0);
+                    ui.spacing_mut().item_spacing.y = 5.0;
+                    ui.label(
+                        egui::RichText::new("ROVING COVERAGE")
+                            .font(theme::display(11.0))
+                            .color(TERRACOTTA),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:02}:{:02}", h, m))
+                                .font(theme::display(22.0))
+                                .color(pal::ZINC_100),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!("{} segments covered", covered))
+                                .color(pal::ZINC_400),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(if finished {
+                            "Day complete. Each street a camera vehicle crossed, brighter the more often."
+                        } else {
+                            "A day in 30 seconds. Streets brighten with each camera-vehicle pass."
+                        })
+                        .size(12.0)
+                        .weak(),
+                    );
+                    // Sensing-power headline (O'Keeffe): how few camera-vehicles it
+                    // takes to watch a third of the network in a day.
+                    if let Some(sim) = &sim {
+                        let sp = &sim.taxi_day.sensing;
+                        if sp.n_third > 0 && sp.trips_per_vehicle_day > 0 {
+                            let vehicles = (sp.n_third as f32 / sp.trips_per_vehicle_day as f32)
+                                .round()
+                                .max(1.0) as u32;
+                            let pct = if sp.segments_total > 0 {
+                                100.0 * sp.segments_sensed as f32 / sp.segments_total as f32
+                            } else {
+                                0.0
+                            };
+                            ui.add_space(1.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Sensing power: ~{vehicles} camera-vehicles would watch a third \
+                                     of these streets in a day (the full fleet reaches {pct:.0}%).",
+                                ))
+                                .size(12.0)
+                                .color(TERRACOTTA),
+                            );
+                        }
+                    }
+                    // heat legend: once → often
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("once").small().color(pal::ZINC_300));
+                        for c in [(247, 209, 102), (237, 117, 33), (201, 49, 18), (166, 23, 18)] {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(22.0, 9.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                rect,
+                                1.5,
+                                egui::Color32::from_rgb(c.0, c.1, c.2),
+                            );
+                        }
+                        ui.label(egui::RichText::new("often").small().color(pal::ZINC_300));
+                    });
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if finished && ui.button("Replay").clicked() {
+                            cov_view.restart = true;
+                        }
+                        if ui.button(if finished { "Done" } else { "Stop" }).clicked() {
+                            cov_view.active = false;
+                        }
+                    });
+                });
+        });
 }

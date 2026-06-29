@@ -208,6 +208,196 @@ impl ManhattanBoundary {
     }
 }
 
+/// A mask of park polygons (NYC Parks Properties): "is this point inside any
+/// park?" Used to keep the drive graph out of **car-free park interiors** —
+/// Central Park's drives/paths read as `rw_type` 1 ("Street") in CSCL but the
+/// park has been closed to cars since 2018, so routing must not shortcut through
+/// it. Reuses the same ring + bbox-prefilter machinery as `ManhattanBoundary`.
+pub struct ParkMask {
+    rings: Vec<Ring>,
+}
+
+impl ParkMask {
+    /// Load every park polygon's exterior ring(s) from the Parks GeoJSON,
+    /// projected with the canonical ENU origin (aligns with the graph it filters).
+    pub fn load(geojson_path: &str) -> Result<Self> {
+        let bytes =
+            std::fs::read(geojson_path).with_context(|| format!("reading {geojson_path}"))?;
+        let fc: geojson::FeatureCollection =
+            serde_json::from_slice(&bytes).context("parsing parks GeoJSON")?;
+        let proj = EnuProjection::default();
+        let mut rings: Vec<Ring> = Vec::new();
+        for f in fc.features {
+            let Some(geom) = f.geometry else { continue };
+            let raw_rings: Vec<Vec<[f64; 2]>> = match geom.value {
+                geojson::Value::Polygon(rs) => {
+                    rs.into_iter().take(1).map(|r| r.iter().map(|p| [p[0], p[1]]).collect()).collect()
+                }
+                geojson::Value::MultiPolygon(polys) => polys
+                    .into_iter()
+                    .filter_map(|poly| poly.into_iter().next())
+                    .map(|r| r.iter().map(|p| [p[0], p[1]]).collect())
+                    .collect(),
+                _ => continue,
+            };
+            for raw in raw_rings {
+                if raw.len() < 4 {
+                    continue;
+                }
+                let pts: Vec<[f64; 2]> = raw
+                    .iter()
+                    .map(|p| {
+                        let e = proj.to_enu(p[1], p[0]);
+                        [e.x, e.y]
+                    })
+                    .collect();
+                let (mut minx, mut miny, mut maxx, mut maxy) =
+                    (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for p in &pts {
+                    minx = minx.min(p[0]);
+                    miny = miny.min(p[1]);
+                    maxx = maxx.max(p[0]);
+                    maxy = maxy.max(p[1]);
+                }
+                rings.push(Ring { pts, bbox: [minx, miny, maxx, maxy] });
+            }
+        }
+        anyhow::ensure!(!rings.is_empty(), "no park rings in {geojson_path}");
+        Ok(ParkMask { rings })
+    }
+
+    /// Is ENU point `p` inside any park?
+    pub fn contains(&self, p: [f64; 2]) -> bool {
+        let pt = Vec2::new(p[0], p[1]);
+        for r in &self.rings {
+            if p[0] >= r.bbox[0]
+                && p[0] <= r.bbox[2]
+                && p[1] >= r.bbox[1]
+                && p[1] <= r.bbox[3]
+                && point_in_ring(pt, &r.pts)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// A mask of **car-free streets** from the NYC DOT Open Streets program (Socrata
+/// `uiay-nctu`): polyline geometry of streets closed to through traffic. CSCL still
+/// codes these as ordinary vehicular streets (its LION vintage predates the closures),
+/// so without this the router sends cars down pedestrianized blocks (Broadway near
+/// Union Square, the West Village/LES permanent Open Streets, etc.).
+///
+/// Two filters at load: (1) `reviewstat` starts with "Full Closure" (full + school
+/// closures are car-free; "Limited Local Access" still admits local cars, so it's
+/// kept), and (2) the closure is active on the **simulated weekday** — the trip model
+/// is one real Tuesday, so weekend-only closures (5 Ave Sundays, Columbus Ave) stay
+/// drivable while permanent and weekday closures drop.
+///
+/// Match is **colinear proximity**: a street segment is car-free if its midpoint is
+/// within `OPEN_ST_THRESH_M` of an Open-Streets sub-segment running roughly parallel
+/// (|cos θ| > `OPEN_ST_COS`). The parallel test avoids dropping a cross street merely
+/// because it meets a closed street at a corner.
+pub struct OpenStreetMask {
+    /// Closed sub-segments: (a, b, unit direction, bbox [minx,miny,maxx,maxy]).
+    segs: Vec<(Vec2, Vec2, Vec2, [f64; 4])>,
+}
+
+const OPEN_ST_THRESH_M: f64 = 10.0;
+const OPEN_ST_COS: f64 = 0.87; // ~30°
+
+impl OpenStreetMask {
+    /// Load the Open Streets GeoJSON, keeping only full/school closures active on
+    /// `weekday` (a three-letter abbreviation as it appears in `apprdayswe`, e.g.
+    /// "Tue"), projected with the canonical ENU origin.
+    pub fn load(geojson_path: &str, weekday: &str) -> Result<Self> {
+        let bytes =
+            std::fs::read(geojson_path).with_context(|| format!("reading {geojson_path}"))?;
+        let fc: geojson::FeatureCollection =
+            serde_json::from_slice(&bytes).context("parsing Open Streets GeoJSON")?;
+        let proj = EnuProjection::default();
+        let mut segs: Vec<(Vec2, Vec2, Vec2, [f64; 4])> = Vec::new();
+        for f in fc.features {
+            let props = f.properties.as_ref();
+            let reviewstat = props
+                .and_then(|p| p.get("reviewstat"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Full + school closures are car-free; "Limited Local Access" keeps cars.
+            if !reviewstat.starts_with("Full Closure") {
+                continue;
+            }
+            let days = props
+                .and_then(|p| p.get("apprdayswe"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !days.contains(weekday) {
+                continue;
+            }
+            let Some(geom) = f.geometry else { continue };
+            let lines: Vec<Vec<[f64; 2]>> = match geom.value {
+                geojson::Value::LineString(line) => {
+                    vec![line.iter().map(|p| [p[0], p[1]]).collect()]
+                }
+                geojson::Value::MultiLineString(lines) => lines
+                    .into_iter()
+                    .map(|l| l.iter().map(|p| [p[0], p[1]]).collect())
+                    .collect(),
+                _ => continue,
+            };
+            for line in lines {
+                let pts: Vec<Vec2> = line.iter().map(|p| proj.to_enu(p[1], p[0])).collect();
+                for w in pts.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let d = b.sub(a);
+                    let len = d.length();
+                    if len < 1e-6 {
+                        continue;
+                    }
+                    let dir = Vec2::new(d.x / len, d.y / len);
+                    let bbox = [a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)];
+                    segs.push((a, b, dir, bbox));
+                }
+            }
+        }
+        anyhow::ensure!(!segs.is_empty(), "no active car-free segments in {geojson_path}");
+        Ok(OpenStreetMask { segs })
+    }
+
+    /// Is a street segment with midpoint `mid` and unit travel direction `dir`
+    /// car-free (colinear with, and close to, an Open-Streets sub-segment)?
+    pub fn blocks(&self, mid: Vec2, dir: Vec2) -> bool {
+        for (a, b, sdir, bbox) in &self.segs {
+            if mid.x < bbox[0] - OPEN_ST_THRESH_M
+                || mid.x > bbox[2] + OPEN_ST_THRESH_M
+                || mid.y < bbox[1] - OPEN_ST_THRESH_M
+                || mid.y > bbox[3] + OPEN_ST_THRESH_M
+            {
+                continue;
+            }
+            if (dir.x * sdir.x + dir.y * sdir.y).abs() > OPEN_ST_COS
+                && point_seg_dist(mid, *a, *b) < OPEN_ST_THRESH_M
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Distance from point `p` to segment `a`→`b` in ENU meters.
+fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let ab = b.sub(a);
+    let l2 = ab.x * ab.x + ab.y * ab.y;
+    if l2 <= 1e-12 {
+        return p.distance(a);
+    }
+    let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / l2).clamp(0.0, 1.0);
+    let proj = Vec2::new(a.x + t * ab.x, a.y + t * ab.y);
+    p.distance(proj)
+}
+
 /// Ray-casting point-in-polygon on an ENU ring (mirrors sim_core's private one).
 fn point_in_ring(p: Vec2, ring: &[[f64; 2]]) -> bool {
     let n = ring.len();

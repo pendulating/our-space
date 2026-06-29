@@ -27,9 +27,26 @@ const STAGGER: f32 = 0.40;
 const CHIP_FILL: f32 = 0.86;
 /// Progress at which a sensor's *appearance* morphs from its on-map mark (the branded
 /// wordmark / moving icon) to the solid bar-graph chip. Keeping the texture for the
-/// first half means the markers fly off the map looking like themselves, then snap to
+/// first half means the markers fly off the map looking like themselves, then change to
 /// the stacked-chart shape mid-flight (rather than turning into squares on click).
 const CHIP_MORPH_T: f32 = 0.5;
+/// Half-width (in progress units) of the dissolve window around `CHIP_MORPH_T`, and the
+/// dimmest alpha at the swap instant. The mark briefly fades as it crosses the swap so
+/// the wordmark→solid-chip change reads as a soft cross-dissolve, not a hard pop.
+const MORPH_DISSOLVE_HALF: f32 = 0.14;
+const MORPH_DISSOLVE_FLOOR: f32 = 0.22;
+
+/// Alpha multiplier that dips to [`MORPH_DISSOLVE_FLOOR`] right at the texture↔chip
+/// swap and is 1.0 outside the window — masking the discrete shape change behind a
+/// quick fade so the morph feels seamless.
+fn morph_dissolve(t: f32) -> f32 {
+    let d = (t - CHIP_MORPH_T).abs();
+    if d >= MORPH_DISSOLVE_HALF {
+        1.0
+    } else {
+        MORPH_DISSOLVE_FLOOR + (1.0 - MORPH_DISSOLVE_FLOOR) * (d / MORPH_DISSOLVE_HALF)
+    }
+}
 
 // ----------------------------------------------------------- operator columns --
 
@@ -723,17 +740,23 @@ pub fn operators_chip_material(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     q: Query<&OperatorMesh>,
-    mut last: Local<Option<bool>>,
+    // (last solid state, last dissolve alpha) — so we act on the texture edge *and* on
+    // every frame the dissolve is mid-fade.
+    mut last: Local<(Option<bool>, f32)>,
 ) {
-    // Drive the icon→chip morph off animation *progress*, not the on/off edge, so the
-    // marks keep their map appearance through the first half of the flight and only
-    // become solid chips at the midpoint (`CHIP_MORPH_T`). Edge-triggered on that
-    // derived boolean, so it still costs nothing except on the one frame it flips.
+    // Drive the icon→chip morph off animation *progress*: the marks keep their map
+    // appearance through the first half of the flight, then swap to solid chips at the
+    // midpoint (`CHIP_MORPH_T`) — with a brief alpha dissolve around that instant so the
+    // wordmark→square change cross-fades instead of popping.
     let solid = ov.t >= CHIP_MORPH_T;
-    if *last == Some(solid) {
+    let dim = morph_dissolve(ov.t);
+    let (last_solid, last_dim) = *last;
+    // Outside the dissolve window `dim` is a constant 1.0, so this still no-ops every
+    // frame except the swap edge; inside it we update per-frame to run the fade.
+    if last_solid == Some(solid) && (dim - last_dim).abs() < 1e-3 {
         return;
     }
-    *last = Some(solid);
+    *last = (Some(solid), dim);
     for om in &q {
         if let Some(mat) = materials.get_mut(&om.material) {
             if solid {
@@ -764,6 +787,10 @@ pub fn operators_chip_material(
                 }
             }
         }
+        // Apply the dissolve dim last, on whatever base color this chip ended up with.
+        if let Some(mat) = materials.get_mut(&om.material) {
+            mat.color.set_alpha(dim);
+        }
     }
 }
 
@@ -774,32 +801,31 @@ pub fn operators_mobile_material(
     ov: Res<OperatorsView>,
     pool: Res<AgentPool>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut last: Local<Option<bool>>,
+    mut last: Local<(Option<bool>, f32)>,
 ) {
-    // Same midpoint morph as the fixed chips (see `operators_chip_material`): peds and
-    // buses keep their moving icons through the first half of the flight, then snap to
-    // solid META/MTA chips at `CHIP_MORPH_T`.
+    // Same midpoint morph + dissolve as the fixed chips (see `operators_chip_material`):
+    // peds and buses keep their moving icons through the first half of the flight, then
+    // cross-dissolve to solid META/MTA chips around `CHIP_MORPH_T`.
     let solid = ov.t >= CHIP_MORPH_T;
-    if *last == Some(solid) {
+    let dim = morph_dissolve(ov.t);
+    let (last_solid, last_dim) = *last;
+    if last_solid == Some(solid) && (dim - last_dim).abs() < 1e-3 {
         return;
     }
-    *last = Some(solid);
-    if let Some(m) = materials.get_mut(&pool.ped_mat) {
-        if solid {
-            m.texture = None;
-            m.color = OperatorCol::Meta.color();
-        } else {
-            m.texture = Some(pool.glasses_icon.clone());
-            m.color = Color::WHITE;
-        }
-    }
-    if let Some(m) = materials.get_mut(&pool.bus_mat) {
-        if solid {
-            m.texture = None;
-            m.color = OperatorCol::Mta.color();
-        } else {
-            m.texture = Some(pool.bus_icon.clone());
-            m.color = Color::WHITE;
+    *last = (Some(solid), dim);
+    for (mat_handle, icon, chip) in [
+        (&pool.ped_mat, &pool.glasses_icon, OperatorCol::Meta),
+        (&pool.bus_mat, &pool.bus_icon, OperatorCol::Mta),
+    ] {
+        if let Some(m) = materials.get_mut(mat_handle) {
+            if solid {
+                m.texture = None;
+                m.color = chip.color();
+            } else {
+                m.texture = Some(icon.clone());
+                m.color = Color::WHITE;
+            }
+            m.color.set_alpha(dim);
         }
     }
 }

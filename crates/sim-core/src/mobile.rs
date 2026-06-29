@@ -342,6 +342,7 @@ mod tests {
             trips: vec![],
             od_per_minute: od,
             provenance: prov(),
+            sensing: Default::default(),
         };
 
         let r = RealDayRates::from_day(&bus, &taxi);

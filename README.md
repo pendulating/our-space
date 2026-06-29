@@ -112,6 +112,11 @@ cargo run -p data-pipeline -- bake-dot     data/snapshots/dot/cameras.json  asse
 # each surveils when you connect to its Wi-Fi. Trailing GeoJSON clips to Manhattan.
 #   curl -L "https://data.cityofnewyork.us/resource/n6c5-95xh.json?\$where=boro='Manhattan'&\$limit=5000&\$select=latitude,longitude,status,kiosk_type" -o data/snapshots/linknyc/kiosks_manhattan.json
 cargo run -p data-pipeline -- bake-linknyc data/snapshots/linknyc/kiosks_manhattan.json assets/processed/linknyc.oslink data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
+# Institutions (schools + libraries) for the "Institutions" explore view (NYC Facilities
+# Database ji82-xba5). Subjects of surveillance, ranked in-app by nearby cameras. The
+# trailing borough name filters (omit for all five boroughs → facilities_nyc.osfac).
+#   curl -L "https://data.cityofnewyork.us/resource/ji82-xba5.json?\$select=facname,latitude,longitude,boro,facgroup,facsubgrp,factype,address&\$where=facgroup%20in('SCHOOLS%20(K-12)','LIBRARIES')&\$limit=5000" -o data/snapshots/facilities/facilities.json
+cargo run -p data-pipeline -- bake-facilities data/snapshots/facilities/facilities.json assets/processed/facilities.osfac MANHATTAN
 # ACE corridors (teal). Trailing neighborhoods GeoJSON clips shapes to Manhattan
 # (the M60-SBS otherwise runs out to LaGuardia); omit it to keep the full route.
 cargo run -p data-pipeline -- bake-ace     data/snapshots/gtfs/gtfs_m data/snapshots/gtfs/ace_routes.json assets/processed/ace_corridors.postcard data/snapshots/neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson
@@ -244,6 +249,23 @@ curl -L --create-dirs -o data/snapshots/dot/cameras.json \
 #           WHERE PULocationID IN (IDS) AND DOLocationID IN (IDS) AND PULocationID <> DOLocationID
 #           GROUP BY 1,2 HAVING COUNT(*) >= 200 ORDER BY trips DESC)
 #     TO 'data/snapshots/tlc/zone_od.csv' (HEADER);"
+
+# Per-trip schedule replay (the animated rideshare day + Stage-3 route inference)
+# needs one real day at trip granularity, WITH the routed distance + duration that
+# drive route inference. One Tuesday (2024-06-25), Manhattan↔Manhattan:
+#   duckdb -c "INSTALL httpfs; LOAD httpfs;
+#     COPY (SELECT CAST(date_part('hour',pickup_datetime)*60+date_part('minute',pickup_datetime) AS INTEGER) AS pu_min,
+#                  PULocationID, DOLocationID,
+#                  CAST(GREATEST(1,date_diff('minute',pickup_datetime,dropoff_datetime)) AS INTEGER) AS dur_min,
+#                  ROUND(trip_miles,3) AS trip_miles, CAST(trip_time AS INTEGER) AS trip_time
+#           FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2024-06.parquet')
+#           WHERE pickup_datetime >= TIMESTAMP '2024-06-25' AND pickup_datetime < TIMESTAMP '2024-06-26'
+#             AND PULocationID <> DOLocationID AND PULocationID IN (IDS) AND DOLocationID IN (IDS)
+#           ORDER BY pu_min) TO 'data/snapshots/tlc/taxi_trips_all.csv' (HEADER);"
+#   # then derive the per-minute O-D aggregate from that CSV (no second parquet scan):
+#   duckdb -c "COPY (SELECT pu_min, PULocationID, DOLocationID, COUNT(*) AS trips
+#                    FROM read_csv_auto('data/snapshots/tlc/taxi_trips_all.csv')
+#                    GROUP BY 1,2,3) TO 'data/snapshots/tlc/taxi_perminute_od.csv' (HEADER);"
 ```
 
 ## Data sources & licenses

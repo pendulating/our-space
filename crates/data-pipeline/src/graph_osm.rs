@@ -362,12 +362,26 @@ struct CsclGeom {
 #[derive(Deserialize)]
 struct CsclProps {
     rw_type: Option<String>,
+    /// Traffic direction: `TW`/`FT`/`TF` (vehicular) or `NV` (**non-vehicular** —
+    /// CSCL's own "not for cars" flag: pedestrian malls, promenades, bike paths).
+    trafdir: Option<String>,
+    /// Non-pedestrian indicator — a DOE *school-walk-route* exclusion, not a vehicle
+    /// field. `V` ≈ vehicular-only (highways); `D` ≈ park / off-grid. We use `D`
+    /// **only inside a park polygon** as the residual signal for car-free park drives.
+    nonped: Option<String>,
+    /// Posted speed limit (mph, as a string); absent on most ramps/alleys.
+    posted_speed: Option<String>,
+    /// Full street name — used to whitelist the Central Park **transverses** (open
+    /// crosstown car routes) back in, since they share the loop drives' `nonped=D`.
+    full_street_name: Option<String>,
 }
 
-/// CSCL `rw_type` codes kept as the citywide street network: 1 Street, 2 Highway,
-/// 3 Bridge, 4 Tunnel, 10 Alley. Dropped: 6 Path/Trail, 9 non-physical/paper streets,
-/// 14 Ferry route, 12 Railroad, 5 Boardwalk, 7 Step street, 8 Driveway, 13 U-turn.
-const CSCL_KEEP_RW: &[&str] = &["1", "2", "3", "4", "10"];
+/// CSCL `rw_type` codes kept as the drivable street network: 1 Street, 2 Highway,
+/// 3 Bridge, 4 Tunnel, 9 Ramp, 10 Alley. Ramps (9, per the NYC LION coding) are the
+/// grade-separated connectors between highways and surface streets — without them the
+/// FDR / Henry Hudson would be an isolated component and get dropped. Excluded: 6
+/// Path/Trail, 12 non-physical/paper, 14 Ferry, 5 Boardwalk, 7 Step, 8 Driveway, 13 U-turn.
+const CSCL_KEEP_RW: &[&str] = &["1", "2", "3", "4", "9", "10"];
 
 /// Intern a point into a node index, snapping to a 1 m grid so segments meeting at a
 /// shared intersection collapse onto one node (CSCL endpoints coincide to <0.1 m).
@@ -386,30 +400,126 @@ fn intern_snapped(
     i
 }
 
+/// Weekday (as it appears in Open Streets `apprdayswe`) the trip model represents.
+/// Both the Manhattan (2024-06-25) and citywide (2024-06-25) baked days are Tuesdays,
+/// so Open-Streets closures active on a Tuesday are dropped from the drive graph while
+/// weekend-only closures stay drivable. See `docs/TRIP_MODEL.md` (one real day).
+const SIM_WEEKDAY: &str = "Tue";
+
 /// Build the citywide street graph from the NYC CSCL centerline GeoJSON.
-pub fn bake_cscl(geojson_path: &str, out_path: &str) -> anyhow::Result<(usize, usize)> {
+pub fn bake_cscl(
+    geojson_path: &str,
+    out_path: &str,
+    boundary_geojson: Option<&str>,
+    parks_geojson: Option<&str>,
+    open_streets_geojson: Option<&str>,
+) -> anyhow::Result<(usize, usize)> {
     let data = std::fs::read(geojson_path).with_context(|| format!("reading {geojson_path}"))?;
     let fc: CsclFc = serde_json::from_slice(&data).context("parsing CSCL GeoJSON")?;
     let proj = EnuProjection::default();
+    // Optional borough clip (e.g. a Manhattan-only drive graph for taxi routing +
+    // coverage): drop any segment with an endpoint off the island.
+    let boundary = boundary_geojson
+        .map(crate::boundary::ManhattanBoundary::load)
+        .transpose()?;
+    // Optional park mask: CSCL codes car-free park interiors (Central Park's
+    // drives/paths) as `rw_type` 1 "Street", so the router would shortcut cars
+    // through them. Drop surface segments whose midpoint falls inside a park.
+    let parks = parks_geojson.map(crate::boundary::ParkMask::load).transpose()?;
+    // Optional Open Streets mask: NYC DOT car-free streets active on the simulated
+    // weekday (CSCL still codes them vehicular). Layer 4 of the drivability blacklist.
+    let open = open_streets_geojson
+        .map(|p| crate::boundary::OpenStreetMask::load(p, SIM_WEEKDAY))
+        .transpose()?;
 
     let mut keys: HashMap<(i64, i64), u32> = HashMap::new();
     let mut points: Vec<NodePoint> = Vec::new();
     let mut edges: Vec<EdgeData> = Vec::new();
-    let (mut total, mut kept) = (0usize, 0usize);
+    let (mut total, mut kept, mut dropped_nv, mut dropped_park, mut dropped_open) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
 
     for f in &fc.features {
         total += 1;
         let Some(geom) = &f.geometry else { continue };
-        let rw = f.properties.rw_type.as_deref().unwrap_or("");
+        let p = &f.properties;
+        let rw = p.rw_type.as_deref().unwrap_or("");
+        // Layer 1 — physical roadway type. Keep only the drivable classes (drops
+        // paths, steps, boardwalks, driveways, ferries, paper/u-turn segments).
         if !CSCL_KEEP_RW.contains(&rw) {
             continue;
         }
+        let rw_class: i64 = rw.parse().unwrap_or(0);
+        // Layer 2 — authoritative non-vehicular flag. `trafdir == "NV"` is CSCL's own
+        // "not for cars" designation, and catches the cases Layer 1 can't: pedestrian
+        // malls / promenades / bike paths that are mis-typed as `rw_type` 1 "Street".
+        // Exempt highways/ramps (rw 2/9): an NV flag there is a coding error, not a
+        // pedestrianization, and dropping it could sever the FDR / a parkway ramp.
+        let trafdir = p.trafdir.as_deref().unwrap_or("");
+        if trafdir == "NV" && !matches!(rw_class, 2 | 9) {
+            dropped_nv += 1;
+            continue;
+        }
+        // Posted speed limit (mph) — packed into `segment_id` alongside the class so
+        // the time router can use real limits; 0 = unknown → per-class fallback.
+        let posted_mph: i64 = p
+            .posted_speed
+            .as_deref()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .clamp(0, 60);
+        let nonped = p.nonped.as_deref().unwrap_or("");
+        // Central Park's crosstown transverses (65/79/86/97 St) are open to cars but
+        // share the closed loop drives' `nonped=D` coding (they're sunken cuts the
+        // park bridges over, so peds can't walk them). Their *name* is the only clean
+        // separator: "TRANSVERSE" appears on exactly those 42 segments citywide.
+        let is_transverse = p
+            .full_street_name
+            .as_deref()
+            .is_some_and(|n| n.to_ascii_uppercase().contains("TRANSVERSE"));
         kept += 1;
         for part in &geom.coordinates {
             if part.len() < 2 {
                 continue;
             }
             let verts: Vec<Vec2> = part.iter().map(|c| proj.to_enu(c[1], c[0])).collect(); // [lon, lat]
+            // Borough clip (when given): both endpoints must be on-island.
+            if let Some(b) = &boundary {
+                let on = |p: Vec2| b.contains([p.x, p.y]);
+                if !(on(verts[0]) && on(*verts.last().unwrap())) {
+                    continue;
+                }
+            }
+            // Layer 3 — policy-closed park interiors. CSCL leaves Central Park's loop
+            // drives coded *vehicular* (trafdir TW/FT/TF) though they've been closed to
+            // cars since 2018, so `trafdir` alone misses them. Inside a park, the loop
+            // drives (and footpaths/malls) carry `nonped == "D"` (a DOE school-walk-route
+            // exclusion), so we drop `nonped=D` drivable surface classes (1/3/4/10) whose
+            // midpoint sits in a park — **except** the named transverses, which are open
+            // crosstown car routes that share the same `nonped=D` coding. Highways/ramps
+            // (2/9) are already exempt above; only surface classes reach here.
+            if let Some(pk) = &parks {
+                if nonped == "D" && !is_transverse && matches!(rw_class, 1 | 3 | 4 | 10) {
+                    let mid = verts[verts.len() / 2];
+                    if pk.contains([mid.x, mid.y]) {
+                        dropped_park += 1;
+                        continue;
+                    }
+                }
+            }
+            // Layer 4 — NYC DOT Open Streets (car-free on the simulated weekday). CSCL
+            // codes these as ordinary streets; drop a segment colinear with and close
+            // to a closed Open-Streets run. Surface classes only (Open Streets are never
+            // highways/ramps).
+            if let Some(os) = &open {
+                if matches!(rw_class, 1 | 3 | 4 | 10) {
+                    let mid = verts[verts.len() / 2];
+                    let dir = verts.last().unwrap().sub(verts[0]).normalize();
+                    if os.blocks(mid, dir) {
+                        dropped_open += 1;
+                        continue;
+                    }
+                }
+            }
             let a = intern_snapped(verts[0], &mut keys, &mut points);
             let b = intern_snapped(*verts.last().unwrap(), &mut keys, &mut points);
             if a == b {
@@ -424,12 +534,18 @@ pub fn bake_cscl(geojson_path: &str, out_path: &str) -> anyhow::Result<(usize, u
                 to: b,
                 length_m: len,
                 polyline: verts.iter().map(|p| [p.x, p.y]).collect(),
-                segment_id: None,
+                // Pack road class + posted speed: rw_type * 100 + posted_mph (0 =
+                // unknown). Decoded by `sim_core::graph::unpack_class`.
+                segment_id: Some(rw_class * 100 + posted_mph),
             });
         }
     }
     anyhow::ensure!(!points.is_empty(), "no street segments parsed from CSCL");
-    eprintln!("CSCL segments: {kept}/{total} kept (rw_type {CSCL_KEEP_RW:?})");
+    eprintln!(
+        "CSCL segments: {kept}/{total} kept (rw_type {CSCL_KEEP_RW:?}); dropped {dropped_nv} \
+         non-vehicular (trafdir=NV) + {dropped_park} closed park drives (nonped=D in a park) + \
+         {dropped_open} Open-Streets blocks (car-free on {SIM_WEEKDAY})"
+    );
 
     let (nodes, edges) = largest_component(points, edges);
     let (n, m) = (nodes.len(), edges.len());
@@ -457,8 +573,11 @@ pub fn bake_cscl(geojson_path: &str, out_path: &str) -> anyhow::Result<(usize, u
                 .into(),
             license: "NYC Open Data — public domain".into(),
             as_of: "2026".into(),
-            notes: "Five-borough street centerline (rw_type street/highway/bridge/tunnel/alley); \
-                    intersections snapped at 1 m; largest connected component."
+            notes: "Five-borough street centerline, drivable network: rw_type \
+                    street/highway/bridge/tunnel/ramp/alley, minus trafdir=NV (non-vehicular), \
+                    nonped=D park-interior drives, and DOT Open Streets car-free on the simulated \
+                    weekday; posted speed packed in segment_id; intersections snapped at 1 m; \
+                    largest connected component."
                 .into(),
         },
     };
