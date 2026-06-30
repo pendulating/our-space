@@ -5,7 +5,7 @@
 use crate::exposure::SourceKind;
 use crate::math::Vec2;
 use crate::projection::GeoOrigin;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Provenance metadata shipped with every layer so the UI can show an honest
 /// "source / date / license" badge.
@@ -800,6 +800,85 @@ pub struct SensingPower {
     pub trips_per_vehicle_day: u16,
 }
 
+/// Polyline quantization grid (metres). Reconstruction error is ≤ `QUANT_M / 2`
+/// (0.5 m) — invisible for a moving dot, far below street width, and small enough that
+/// most decimated-segment deltas fit in a single postcard varint byte.
+const QUANT_M: f32 = 1.0;
+
+/// An ENU-metre polyline stored compactly: an exact `f32` origin (the first point)
+/// plus per-point grid-index *deltas* on a [`QUANT_M`] grid. Postcard varint-encodes
+/// the small zig-zag deltas to ~1 byte per coordinate (vs 4 for a raw `f32`), shrinking
+/// the citywide taxi-route pool ~3–4×. Decodes back to the `Vec<[f32; 2]>` every
+/// consumer expects via `Deref`, so call sites are unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuantPolyline(pub Vec<[f32; 2]>);
+
+impl std::ops::Deref for QuantPolyline {
+    type Target = Vec<[f32; 2]>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Wire form: exact origin + grid-index deltas for points `[1..]`.
+#[derive(Serialize, Deserialize)]
+struct PolyWire {
+    o: [f32; 2],
+    d: Vec<[i32; 2]>,
+}
+
+impl Serialize for QuantPolyline {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let pts = &self.0;
+        let o = pts.first().copied().unwrap_or([0.0, 0.0]);
+        let mut d = Vec::with_capacity(pts.len().saturating_sub(1));
+        let (mut pgx, mut pgy) = (0i32, 0i32);
+        for p in pts.iter().skip(1) {
+            let gx = ((p[0] - o[0]) / QUANT_M).round() as i32;
+            let gy = ((p[1] - o[1]) / QUANT_M).round() as i32;
+            d.push([gx - pgx, gy - pgy]);
+            pgx = gx;
+            pgy = gy;
+        }
+        PolyWire { o, d }.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for QuantPolyline {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let w = PolyWire::deserialize(de)?;
+        let mut pts = Vec::with_capacity(w.d.len() + 1);
+        pts.push(w.o);
+        let (mut gx, mut gy) = (0i32, 0i32);
+        for delta in &w.d {
+            gx += delta[0];
+            gy += delta[1];
+            pts.push([w.o[0] + gx as f32 * QUANT_M, w.o[1] + gy as f32 * QUANT_M]);
+        }
+        Ok(QuantPolyline(pts))
+    }
+}
+
+/// One baked taxi O-D route: a space-compressed [`QuantPolyline`] plus its length and
+/// sampling weight. Same role as [`VehicleRoute`], but the polyline is delta-quantized
+/// because the citywide pool is ~200k routes (raw `f32` would be ~110 MB).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxiRoute {
+    pub polyline: QuantPolyline,
+    pub length_m: f32,
+    pub weight: f32,
+}
+
+impl From<VehicleRoute> for TaxiRoute {
+    fn from(v: VehicleRoute) -> Self {
+        TaxiRoute {
+            polyline: QuantPolyline(v.polyline),
+            length_m: v.length_m,
+            weight: v.weight,
+        }
+    }
+}
+
 /// A day's worth of real rideshare trips (one date): a shared routed-O-D pool, a
 /// sampled trip list (for the visuals, capped to the on-screen pool), and the full
 /// per-minute O-D aggregate (for the estimate).
@@ -808,7 +887,7 @@ pub struct TaxiDayLayer {
     pub origin: GeoOrigin,
     pub service_date: u32,
     /// Shared routed O-D polyline pool; `TaxiTrip.route_idx` indexes this.
-    pub routes: Vec<VehicleRoute>,
+    pub routes: Vec<TaxiRoute>,
     /// Sampled real trips, sorted ascending by `pu_min`.
     pub trips: Vec<TaxiTrip>,
     /// Full per-minute O-D counts (for the analytical flux).
@@ -963,8 +1042,8 @@ mod tests {
         let taxi = TaxiDayLayer {
             origin: GeoOrigin::MANHATTAN,
             service_date: 20260421,
-            routes: vec![VehicleRoute {
-                polyline: vec![[0.0, 0.0], [10.0, 0.0]],
+            routes: vec![TaxiRoute {
+                polyline: QuantPolyline(vec![[0.0, 0.0], [10.0, 0.0]]),
                 length_m: 10.0,
                 weight: 1.0,
             }],
@@ -985,5 +1064,23 @@ mod tests {
         let back = TaxiDayLayer::from_bytes(&taxi.to_bytes().unwrap()).unwrap();
         assert_eq!(back.trips[0].route_idx, 0);
         assert_eq!(back.od_per_minute[0].trips, 3);
+        // QuantPolyline survives the round-trip (10.0 m lands exactly on the 0.5 m grid).
+        assert_eq!(back.routes[0].polyline.0, vec![[0.0, 0.0], [10.0, 0.0]]);
+    }
+
+    #[test]
+    fn quant_polyline_roundtrips_within_tolerance() {
+        // Off-grid coords snap to ≤ QUANT_M/2; deltas reconstruct cumulatively.
+        let pts = vec![[1000.3, -2000.7], [1037.9, -1985.2], [1037.9, -1820.0]];
+        let q = QuantPolyline(pts.clone());
+        let bytes = postcard::to_allocvec(&q).unwrap();
+        let back: QuantPolyline = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.0.len(), pts.len());
+        for (a, b) in pts.iter().zip(back.0.iter()) {
+            assert!((a[0] - b[0]).abs() <= QUANT_M, "x off by >{QUANT_M}");
+            assert!((a[1] - b[1]).abs() <= QUANT_M, "y off by >{QUANT_M}");
+        }
+        // Origin is exact (not snapped).
+        assert_eq!(back.0[0], [1000.3, -2000.7]);
     }
 }

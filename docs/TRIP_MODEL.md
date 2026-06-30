@@ -291,6 +291,29 @@ Later stages: `EdgeData`/asset may still gain real per-edge speed once we want
 calibrated (non-class-default) limits; new data-pipeline modules for the zone
 weight surfaces (Layer 1) and the route-likelihood reranker (Layer 2).
 
+## Runtime scaling: viewport culling + route compression (citywide all-taxis)
+
+The citywide build routes **every** O-D pair (`MAX_OD_PAIRS=40000`, `MAX_ROUTES`
+uncapped) → ~195k routes / ~545k real trips, vs the Manhattan build's smaller pool.
+Two mechanisms keep that performant:
+
+- **Viewport cull** (`agents.rs::replay_agents`). `Sim.taxi_route_bboxes` holds one ENU
+  bbox per route; the forward-cursor admit loop only spends a pooled slot on a trip
+  whose route bbox overlaps the visible rect (camera `translation ± viewport·scale`).
+  So the fixed `MAX_VEHICLES` (6000) pool bounds the *on-screen* taxi count, not the
+  day's global peak (~13.3k @ 17:33): zoom into a neighborhood and every in-view taxi
+  shows; zoom out to the whole city and 6000 subsample into an already-dense blob. A
+  settled pan/zoom triggers a rebuild that re-seeks the active window by binary search
+  (`partition_point` on `pu_min`), so it stays O(active). Measured: ~120 fps
+  (vsync-capped) in WASM at peak; the whole-city frame cost is basemap-bound, not taxis.
+- **Delta-quantized routes** (`sim-core/assets.rs`). `TaxiDayLayer.routes` is
+  `Vec<TaxiRoute>` whose polyline is a `QuantPolyline` — exact `f32` origin + per-point
+  grid-index deltas on a `QUANT_M` (1 m) grid, postcard-varint-encoded to ~1 byte/coord.
+  Keeps all routes + shape (error ≤ 0.5 m, invisible for a moving dot); shrinks the
+  citywide asset ~3× (110 MB raw `[f32;2]` → ~38 MB). `Deref`s to `Vec<[f32;2]>`, so
+  load (`Route::from_points`) is unchanged. The legacy `VehicleRoute` /
+  `vehicle_routes.osroutes` pool is left untouched (vestigial — loaded but unrendered).
+
 ## Caveats (keep honest)
 
 - Still **inferred, not GPS.** We reconstruct a *plausible* path from OD + time +

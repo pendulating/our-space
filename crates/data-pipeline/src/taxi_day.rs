@@ -13,7 +13,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use sim_core::assets::{
-    GraphAsset, Provenance, SensingPower, TaxiDayLayer, TaxiOdMinute, TaxiTrip, VehicleRoute,
+    GraphAsset, Provenance, SensingPower, TaxiDayLayer, TaxiOdMinute, TaxiRoute, TaxiTrip,
+    VehicleRoute,
 };
 use sim_core::graph::{Route, StreetGraph};
 use sim_core::math::Vec2;
@@ -27,9 +28,15 @@ const DECIMATE_TOL_M: f64 = 6.0;
 /// instead of all snapping to one centroid node (spreads coverage off the spines).
 const K_ENDPOINTS: usize = 6;
 /// Distinct O-D zone pairs that get a centroid route (breadth + per-trip fallback).
-const MAX_OD_PAIRS: usize = 5000;
-/// Global cap on baked routes (centroid + per-trip route candidates) — bounds size.
-const MAX_ROUTES: usize = 14000;
+/// Citywide has ~35.3k distinct pairs; 40k routes every one (option-1 "all taxis"
+/// experiment — was 5,000, which covered only ~71% of citywide trips).
+const MAX_OD_PAIRS: usize = 40000;
+/// Global cap on baked routes (centroid + per-trip route candidates). Effectively
+/// uncapped for the option-1 experiment: every O-D pair + endpoint-combo candidate is
+/// kept (max ~MAX_OD_PAIRS × (1 + 2·MAX_COMBOS_PER_PAIR) routes), so no trip falls back
+/// to a generic base route. Grows the asset; does NOT affect runtime FPS (that's the
+/// MAX_VEHICLES pool). Re-cap once option 2 lands a leaner route representation.
+const MAX_ROUTES: usize = usize::MAX;
 /// Distinct endpoint combos that get a candidate set, per zone pair.
 const MAX_COMBOS_PER_PAIR: usize = 4;
 /// Highway/ramp cost multiplier for the *surface* alternative candidate.
@@ -579,7 +586,8 @@ pub fn bake(
     let layer = TaxiDayLayer {
         origin: GeoOrigin::MANHATTAN,
         service_date: date,
-        routes,
+        // Compress the route polylines for the wire/asset (delta-quantized; see `TaxiRoute`).
+        routes: routes.into_iter().map(TaxiRoute::from).collect(),
         trips,
         od_per_minute,
         provenance: Provenance {

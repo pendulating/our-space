@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
 use crate::agents::{AgentClass, AgentPool, MobileAgent};
-use crate::{AceVis, BaseMap, BuildingVis, LandmarkVis, OutlineVis, RouteVis};
+use crate::{world, AceVis, BaseMap, BuildingVis, LandmarkVis, OutlineVis, RouteVis, Sim, SimClock};
 
 /// Seconds for the full off-the-map / back-home flight.
 const TRANSITION_SECS: f32 = 1.1;
@@ -25,6 +25,9 @@ const TRANSITION_SECS: f32 = 1.1;
 const STAGGER: f32 = 0.40;
 /// Chip fill factor: a hair under the grid pitch leaves a hairline gutter.
 const CHIP_FILL: f32 = 0.86;
+/// Upper bound on taxi trip duration (min) — seeds the active-window binary search
+/// when building the true-count rideshare column from the full fleet.
+const DATA_COL_MAX_DUR_MIN: f32 = 240.0;
 /// Progress at which a sensor's *appearance* morphs from its on-map mark (the branded
 /// wordmark / moving icon) to the solid bar-graph chip. Keeping the texture for the
 /// first half means the markers fly off the map looking like themselves, then change to
@@ -476,7 +479,10 @@ pub fn operators_layout(
         counts[om.col.index()] += om.homes.len();
     }
     for a in &agents {
-        if a.active {
+        // Rideshare is rendered as a true-count merged mesh (an `OperatorMesh`, counted
+        // above via `homes.len()`), so skip the viewport-culled live taxi pool here —
+        // otherwise the column would both undercount (culled) and double-count.
+        if a.active && a.class != AgentClass::Vehicle {
             if let Some(col) = col_of_class(a.class) {
                 counts[col.index()] += 1;
             }
@@ -577,6 +583,122 @@ pub fn operators_animate_fixed(
     }
 }
 
+/// Tags the dynamic merged-chip mesh built for a *data-backed* mobile column
+/// (rideshare) so it stacks to its TRUE count — every active trip in the baked layer,
+/// not the viewport-culled on-screen pool. Built on enter, despawned when home.
+#[derive(Component)]
+pub struct DataColumnMesh;
+
+/// Build the rideshare column as a true-count merged chip mesh on the view-enter edge.
+///
+/// The on-map taxi pool is viewport-culled + capped (a *rendering* budget), so it would
+/// undercount the operator stack. Here we compute every active trip's current position
+/// straight from the baked fleet (`taxi_day.trips`, same math as `animate_agents`) and
+/// emit one chip per trip — so the column reflects the layer's real magnitude (~13k at
+/// peak), flown by [`operators_animate_fixed`] exactly like the fixed-camera meshes.
+/// `operators_layout` then counts `homes.len()` for the true height + header label.
+pub fn operators_build_data_columns(
+    ov: Res<OperatorsView>,
+    clock: Res<SimClock>,
+    sim: Option<Res<Sim>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    existing: Query<Entity, With<DataColumnMesh>>,
+    mut last_active: Local<bool>,
+) {
+    // Tear down once the chips have flown home (ambient pool takes over again).
+    if ov.idle {
+        for e in &existing {
+            commands.entity(e).despawn();
+        }
+        *last_active = false;
+        return;
+    }
+    if ov.active == *last_active {
+        return; // build only on the enter edge
+    }
+    *last_active = ov.active;
+    if !ov.active || !existing.is_empty() {
+        return;
+    }
+    let Some(sim) = sim.as_ref() else { return };
+
+    // Position every active taxi trip from data (the full fleet) at the frozen minute.
+    let now = (clock.time_of_day * 60.0) as f32;
+    let trips = &sim.taxi_day.trips;
+    let lo = trips.partition_point(|t| t.pu_min < now - DATA_COL_MAX_DUR_MIN);
+    let mut homes_enu: Vec<sim_core::Vec2> = Vec::new();
+    let mut i = lo;
+    while i < trips.len() && trips[i].pu_min <= now {
+        let t = &trips[i];
+        i += 1;
+        if t.dur_min <= 0.0 || now < t.pu_min || now >= t.pu_min + t.dur_min {
+            continue;
+        }
+        let route = &sim.taxi_routes[t.route_idx as usize];
+        let frac = ((now - t.pu_min) / t.dur_min).clamp(0.0, 1.0) as f64;
+        let d = match sim.taxi_paces.get(t.route_idx as usize) {
+            Some(pace) => pace.arc_at(route, frac),
+            None => frac * route.total_m,
+        };
+        homes_enu.push(route.position_at(d));
+    }
+    if homes_enu.is_empty() {
+        return;
+    }
+
+    let size = agent_base_size(AgentClass::Vehicle);
+    let mesh = meshes.add(world::merged_icon_quads(&homes_enu, size));
+    // Solid rideshare-clay chips throughout (these are excluded from the branded
+    // wordmark swap in `operators_chip_material`), matching the on-map taxi triangles.
+    let material = materials.add(ColorMaterial {
+        color: OperatorCol::Rideshare.color(),
+        ..default()
+    });
+    let homes: Vec<Vec2> = homes_enu.iter().map(|p| Vec2::new(p.x as f32, p.y as f32)).collect();
+    commands.spawn((
+        Mesh2d(mesh.clone()),
+        MeshMaterial2d(material.clone()),
+        Transform::from_xyz(0.0, 0.0, 1.0),
+        OperatorMesh {
+            col: OperatorCol::Rideshare,
+            mesh,
+            home_half: size * 0.5,
+            base_half: size * 0.5,
+            homes,
+            material,
+            branded: Handle::default(), // unused: excluded from the branded swap
+            maker_colors: None,
+        },
+        DataColumnMesh,
+    ));
+}
+
+/// While a data-backed merged mesh stands in for the rideshare column, hide the live
+/// on-screen taxi entities so they don't double-render. `replay_agents` restores their
+/// visibility on exit (its wrap/scrub rebuild re-admits + re-shows the active set once
+/// `ov.t` hits 0 and it runs again).
+pub fn operators_hide_taxis(
+    ov: Res<OperatorsView>,
+    mut q: Query<(&MobileAgent, &mut Visibility)>,
+    mut hidden: Local<bool>,
+) {
+    let want = ov.active || ov.t > 0.0;
+    if want == *hidden {
+        return;
+    }
+    *hidden = want;
+    if !want {
+        return; // exit: leave restoration to replay_agents' rebuild
+    }
+    for (a, mut vis) in &mut q {
+        if a.class == AgentClass::Vehicle {
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
 /// On entering the view, snapshot the currently-active agents and assign each a
 /// column slot (its current map position is the home for the return flight). The
 /// ambient sim is frozen while active (see the guards in `agents.rs`), so this
@@ -600,9 +722,14 @@ pub fn operators_snapshot(
             slot.assigned = false;
             continue;
         }
-        let Some(col) = col_of_class(agent.class) else {
-            slot.assigned = false; // robots are excluded from the operator tower
-            continue;
+        // Robots are excluded from the tower; rideshare flies as a true-count merged
+        // mesh (`operators_build_data_columns`), so its live entities don't fly here.
+        let col = match col_of_class(agent.class) {
+            Some(c) if agent.class != AgentClass::Vehicle => c,
+            _ => {
+                slot.assigned = false;
+                continue;
+            }
         };
         let Some(cl) = layout.get(col) else { continue };
         let i = cursor[col.index()];
@@ -739,7 +866,9 @@ pub fn operators_chip_material(
     ov: Res<OperatorsView>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    q: Query<&OperatorMesh>,
+    // Data-backed columns (rideshare) carry their own solid clay material and no branded
+    // wordmark, so they're excluded from the texture↔chip swap.
+    q: Query<&OperatorMesh, Without<DataColumnMesh>>,
     // (last solid state, last dissolve alpha) — so we act on the texture edge *and* on
     // every frame the dissolve is mid-fade.
     mut last: Local<(Option<bool>, f32)>,

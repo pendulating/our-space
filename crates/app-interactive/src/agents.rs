@@ -22,15 +22,24 @@ use crate::operators::{OperatorSlot, OperatorsView};
 use crate::{world, ExposureMode, Mode, Params, RouteState, Sim, SimClock, Walker, WalkLive};
 
 // Fixed caps → provable worst-case per-frame cost on single-threaded WASM.
-// Raised for real-day replay: a real Manhattan weekday has thousands of trips
-// concurrently active at peak; these caps bound the on-screen sample (the active
-// set beyond the cap is deterministically subsampled in `replay_agents`).
-// 4000 covers the dataset's true peak concurrency (3,823 rideshare trips at 18:20),
-// so the taxi subsample never triggers — effectively uncapped for this day.
-const MAX_VEHICLES: usize = 4000;
+// `replay_agents` viewport-culls: only trips whose route passes through the visible
+// rect are admitted, so this pool bounds the *on-screen* taxi count, not the day's
+// global peak. 6000 covers a full-city zoom-out (where 13k+ trips are concurrent but
+// merge into a blob and subsample harmlessly); zoomed into any neighborhood, every
+// in-view taxi shows. Manhattan's true peak (~3,823) fits with headroom.
+const MAX_VEHICLES: usize = 6000;
 const MAX_PEDS: usize = 400;
 
-const MAX_BUSES: usize = 300;
+// Buses are NOT viewport-culled (the bus loop full-scans the timetable), so this cap is
+// the only limit on the on-screen ACE fleet. Sized above true peak concurrency (~1,074
+// at the evening rush) with headroom, so every active bus renders and the operator
+// stack / neighborhood / coverage tallies show the true layer — not a 300-cap sample.
+const MAX_BUSES: usize = 2500;
+/// Upper bound on taxi trip duration (minutes). Used to seek the start of the
+/// currently-active window via binary search on a viewport/scrub rebuild, so the
+/// re-scan is O(active) rather than O(whole day). Generous — real FHV trips are well
+/// under this.
+const MAX_TRIP_DUR_MIN: f32 = 240.0;
 /// Speculative sidewalk delivery robots; modest on-screen cap (rare even at peak).
 const MAX_ROBOTS: usize = 200;
 /// Teslas on-screen cap (NYC has ~29k private Teslas; this bounds the sample).
@@ -188,6 +197,8 @@ pub struct ReplayState {
     veh_slot_trip: Vec<i32>, // vehicle slot -> taxi trip idx (-1 = free)
     veh_cursor: usize,       // next taxi trip (start-sorted) to consider
     veh_last_now: f32,       // last frame's minute-of-day (wrap/scrub detection)
+    veh_vp: [f64; 3],        // viewport (cx, cy, width) the taxi slots are synced to
+    veh_vp_prev: [f64; 3],   // last frame's viewport, for motion-settle detection
     bus_slot_trip: Vec<i32>, // bus slot -> bus trip idx (-1 = free)
     bus_mapped: Vec<bool>,   // bus trip -> currently occupies a slot
 }
@@ -198,6 +209,8 @@ impl ReplayState {
             veh_slot_trip: vec![-1; MAX_VEHICLES],
             veh_cursor: 0,
             veh_last_now: -1.0,
+            veh_vp: [0.0; 3],
+            veh_vp_prev: [0.0; 3],
             bus_slot_trip: vec![-1; MAX_BUSES],
             bus_mapped: vec![false; n_bus],
         }
@@ -696,11 +709,18 @@ pub fn replay_agents(
     pool: Res<AgentPool>,
     mut rs: ResMut<ReplayState>,
     mut q: Query<&mut MobileAgent>,
+    cam: Query<(&Camera, &Transform), With<Camera2d>>,
+    cov: Option<Res<crate::coverage::CoverageView>>,
 ) {
     let Some(sim) = sim else { return };
     if ov.active || ov.t > 0.0 {
         return; // Operators view owns the agents
     }
+    // The roving-coverage overlay is a downstream *statistic* (which streets the fleet
+    // covers over a day), so it must see the unbiased active set, not the viewport-culled
+    // on-screen subset. While it runs, admit by start order only (cull off) — the pool
+    // then samples the true fleet uniformly as it cycles, instead of whatever's on camera.
+    let cull_off = cov.as_ref().map(|c| c.active).unwrap_or(false);
     // Runs whether playing or paused: it only *reads* `clock.time_of_day`, so a
     // scrub-and-pause still shows exactly the trips active at that minute.
     if pool.vehicles.len() != rs.veh_slot_trip.len() || pool.buses.len() != rs.bus_slot_trip.len() {
@@ -713,9 +733,62 @@ pub fn replay_agents(
     let taxi_on = params.show_agents && params.dashcam_on && !params.heatmap_on;
     let taxi_active = |t: &TaxiTrip| now >= t.pu_min && now < t.pu_min + t.dur_min;
 
-    // Wrap / scrub / toggled-off → drop all taxi slots and rebuild from the cursor.
+    // ---------- Viewport cull ----------
+    // Rendering is in ENU metres (1 world unit = 1 m), so the camera translation/scale
+    // map straight onto route bboxes. Visible rect (+ margin); `None` (no camera) admits
+    // everything. A taxi is admitted only if its whole route's bbox overlaps the rect —
+    // a cheap rect test, no `position_at` to decide visibility. The pool then bounds the
+    // *on-screen* count, letting every trip be routable without a day-sized pool.
+    let viewport: Option<[f64; 4]> = cam.single().ok().and_then(|(c, t)| {
+        c.logical_viewport_size().map(|v| {
+            let s = t.scale.x as f64;
+            let (cx, cy) = (t.translation.x as f64, t.translation.y as f64);
+            let (hx, hy) = (v.x as f64 * s * 0.6, v.y as f64 * s * 0.6); // half-frame + 20% margin
+            [cx - hx, cy - hy, cx + hx, cy + hy]
+        })
+    });
+    let in_view = |bb: &[f32; 4]| {
+        if cull_off {
+            return true; // coverage stat: admit the unbiased active set, not the on-screen cull
+        }
+        match viewport {
+            None => true,
+            Some(v) => {
+                (bb[0] as f64) <= v[2]
+                    && (bb[2] as f64) >= v[0]
+                    && (bb[1] as f64) <= v[3]
+                    && (bb[3] as f64) >= v[1]
+            }
+        }
+    };
+    // The view has panned/zoomed to a *new resting place* → re-sync the visible taxi set.
+    // We rebuild once motion settles (a frame still vs. the last) rather than every drag
+    // frame, so a gesture costs one rebuild, not dozens. Thresholds are fractions of the
+    // current frame width.
+    let vp_rebuild = match viewport {
+        Some(v) => {
+            let w = (v[2] - v[0]).max(1.0);
+            let cur = [(v[0] + v[2]) * 0.5, (v[1] + v[3]) * 0.5, w];
+            let dist = |a: [f64; 3], b: [f64; 3]| {
+                (a[0] - b[0]).abs().max((a[1] - b[1]).abs()).max((a[2] - b[2]).abs())
+            };
+            let still = dist(cur, rs.veh_vp_prev) < 0.02 * w;
+            let desynced = dist(cur, rs.veh_vp) > 0.10 * w;
+            rs.veh_vp_prev = cur;
+            let go = still && desynced;
+            if go {
+                rs.veh_vp = cur;
+            }
+            go
+        }
+        None => false,
+    };
+
+    // Wrap / scrub / toggled-off / viewport-resync → drop all taxi slots and rebuild,
+    // re-scanning from the start of the currently-active window (binary search keeps the
+    // re-scan O(active), not O(whole day)).
     let jumped = now < rs.veh_last_now - 1.0 || now > rs.veh_last_now + 30.0;
-    if !taxi_on || jumped {
+    if !taxi_on || jumped || vp_rebuild {
         for slot in 0..rs.veh_slot_trip.len() {
             if rs.veh_slot_trip[slot] >= 0 {
                 if let Ok(mut a) = q.get_mut(pool.vehicles[slot]) {
@@ -724,7 +797,7 @@ pub fn replay_agents(
                 rs.veh_slot_trip[slot] = -1;
             }
         }
-        rs.veh_cursor = 0;
+        rs.veh_cursor = trips.partition_point(|t| t.pu_min < now - MAX_TRIP_DUR_MIN);
     }
     if taxi_on {
         // Free slots whose trip has ended.
@@ -744,6 +817,9 @@ pub fn replay_agents(
             rs.veh_cursor += 1;
             if !taxi_active(&trips[ti]) {
                 continue;
+            }
+            if !in_view(&sim.taxi_route_bboxes[trips[ti].route_idx as usize]) {
+                continue; // route never enters the viewport → don't spend a slot on it
             }
             while free < rs.veh_slot_trip.len() && rs.veh_slot_trip[free] >= 0 {
                 free += 1;

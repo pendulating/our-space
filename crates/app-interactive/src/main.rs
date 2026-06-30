@@ -416,6 +416,10 @@ pub struct Sim {
     pub bus_routes: Vec<Route>,
     /// `Route` per taxi O-D pool entry, indexed by `TaxiTrip.route_idx`.
     pub taxi_routes: Vec<Route>,
+    /// ENU bbox `[min_x, min_y, max_x, max_y]` per taxi route (same index), for the
+    /// viewport cull in `replay_agents` — admit a trip only if its route bbox overlaps
+    /// the visible rect (cheap; no per-frame `position_at` to test visibility).
+    pub taxi_route_bboxes: Vec<[f32; 4]>,
     /// Turn-aware, speed-limit-capped pace per taxi route (same index as `taxi_routes`)
     /// so replayed dashcam vehicles brake into turns and cruise on straights instead of
     /// gliding the whole trip at one constant speed.
@@ -984,6 +988,8 @@ fn main() {
             (scale_camera_icons, scale_ace_corridors, scale_markers, scale_leader_lines),
             (
                 operators::operators_drive,
+                operators::operators_build_data_columns,
+                operators::operators_hide_taxis,
                 operators::operators_layout,
                 operators::operators_snapshot,
                 operators::operators_animate_fixed,
@@ -1036,6 +1042,14 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, shot_capture);
     loading::register(&mut app);
+    // Dev-only: `OURSPACE_FPS=1` logs FPS / frame time to the console (~1/s) for
+    // performance measurement (e.g. citywide taxi-pool sizing).
+    if std::env::var("OURSPACE_FPS").is_ok() {
+        app.add_plugins((
+            bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
+            bevy::diagnostic::LogDiagnosticsPlugin::default(),
+        ));
+    }
     app.run();
 }
 
@@ -2244,6 +2258,20 @@ fn build_world(
         .iter()
         .map(|r| sim_core::PaceProfile::for_route(r, NYC_SPEED_LIMIT_MPS, TURN_SPEED_FRAC))
         .collect();
+    // Per-route ENU bbox for the viewport cull (built once; cheap rect test at runtime).
+    let taxi_route_bboxes: Vec<[f32; 4]> = taxi_routes
+        .iter()
+        .map(|r| {
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for p in &r.points {
+                x0 = x0.min(p.x as f32);
+                y0 = y0.min(p.y as f32);
+                x1 = x1.max(p.x as f32);
+                y1 = y1.max(p.y as f32);
+            }
+            [x0, y0, x1, y1]
+        })
+        .collect();
     commands.insert_resource(agents::ReplayState::new(taxi_day.trips.len(), bus_day.trips.len()));
     // Real per-minute service levels for the headline (ACE timetable + TLC volume).
     let real_rates = Some(sim_core::mobile::RealDayRates::from_day(&bus_day, &taxi_day));
@@ -2311,6 +2339,7 @@ fn build_world(
         taxi_paces,
         bus_routes,
         taxi_routes,
+        taxi_route_bboxes,
         real_rates,
         robot_field,
         robot_node_cumulative,
@@ -4466,6 +4495,7 @@ fn rebuild_neighborhoods(
 #[allow(clippy::type_complexity)]
 fn sample_neighborhood_mobile(
     time: Res<Time>,
+    clock: Res<SimClock>,
     params: Res<Params>,
     sim: Option<Res<Sim>>,
     mut live: ResMut<NeighborhoodLive>,
@@ -4496,6 +4526,12 @@ fn sample_neighborhood_mobile(
                 continue;
             }
             use agents::AgentClass::*;
+            // Rideshare is viewport-culled in `replay_agents`, so the on-screen pool would
+            // undercount this neighborhood stat — taxis are tallied from the full baked
+            // fleet below instead. The other classes aren't culled, so count them here.
+            if matches!(a.class, Vehicle) {
+                continue;
+            }
             // Honor the per-class toggles so the count matches the enabled layers.
             let on = match a.class {
                 Vehicle => params.dashcam_on,
@@ -4516,6 +4552,33 @@ fn sample_neighborhood_mobile(
                     Tesla => c.tesla += 1,
                     DeliveryRobot => c.robot += 1,
                     Pedestrian => c.glasses += 1,
+                }
+            }
+        }
+
+        // Rideshare: the TRUE active fleet (from the baked trips), not the viewport-culled
+        // on-screen pool — so "rideshare dashcams here now" reflects the real layer at any
+        // zoom. Same active-window + route/pace math as the renderer; positions only.
+        if params.dashcam_on {
+            let now = (clock.time_of_day * 60.0) as f32;
+            let trips = &sim.taxi_day.trips;
+            let lo = trips.partition_point(|t| t.pu_min < now - 240.0);
+            let mut i = lo;
+            while i < trips.len() && trips[i].pu_min <= now {
+                let t = &trips[i];
+                i += 1;
+                if t.dur_min <= 0.0 || now < t.pu_min || now >= t.pu_min + t.dur_min {
+                    continue;
+                }
+                let route = &sim.taxi_routes[t.route_idx as usize];
+                let frac = ((now - t.pu_min) / t.dur_min).clamp(0.0, 1.0) as f64;
+                let d = match sim.taxi_paces.get(t.route_idx as usize) {
+                    Some(pace) => pace.arc_at(route, frac),
+                    None => frac * route.total_m,
+                };
+                let p = route.position_at(d);
+                if let Some(idx) = sim.neighborhoods.iter().position(|st| st.contains(p)) {
+                    counts[idx].rideshare += 1;
                 }
             }
         }
