@@ -12,7 +12,7 @@ A YAML-ish front-matter block, then a short blurb:
 ```markdown
 ---
 title: The exact title of the work
-source: Authors / publication · venue · year
+source: Authors · venue · year
 kind: paper        # paper | article (drives the small badge)
 url: https://…     # where the card links
 order: 4           # sort order in the panel (lower = higher up)
@@ -22,6 +22,11 @@ One or two sentences on why it's worth reading, ideally tying it to the watched 
 
 `title` and `url` are required; a file missing either is skipped. Filenames are sorted, so
 a `NN-` prefix keeps things tidy, but `order:` is what actually sorts the panel.
+
+**Authors are not displayed on the card** — the build splits `source` on the first `·` into
+`authors` (dropped from the card face) and `venue` (shown: the venue/publication + year). So
+still write the full `Authors · venue · year`; only the venue/year renders. Keep the authors
+in the field for attribution in `reading.json`.
 
 ## Teaser images
 

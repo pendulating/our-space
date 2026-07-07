@@ -6,6 +6,8 @@
     "url": "https://dl.acm.org/doi/full/10.1145/3715275.3732185",
     "order": "1",
     "blurb": "When the sidewalk is photographed at scale, it isn't only individuals who are captured but whole groups. Group privacy is exactly what conventional, person-by-person protections miss.",
+    "authors": "Franchi, Sandhaus, Choksi, Engelmann, Ju & Nissenbaum",
+    "venue": "ACM FAccT 2025",
     "image": "reading-img/01-privacy-of-groups.jpg"
   },
   {
@@ -15,6 +17,8 @@
     "url": "https://dl.acm.org/doi/10.1145/3593013.3594020",
     "order": "2",
     "blurb": "A fleet of rideshare dashcams becomes a city-scale sensing network, here used to measure where police are deployed across New York and surface the disparities in who gets watched.",
+    "authors": "Franchi, Zamfirescu-Pereira, Ju & Pierson",
+    "venue": "ACM FAccT 2023",
     "image": "reading-img/02-police-deployment-dashcams.jpg"
   },
   {
@@ -24,6 +28,8 @@
     "url": "https://www.malwarebytes.com/blog/news/2025/09/nexar-dashcam-video-database-hacked",
     "order": "3",
     "blurb": "A breach exposed 130+ TB of dashcam footage from Nexar's cloud. The dashcam layer in this map is a real, breachable archive of faces and places.",
+    "authors": "Pieter Arntz",
+    "venue": "Malwarebytes Labs · Sept 2025",
     "image": "reading-img/03-nexar-dashcam-breach.jpg"
   },
   {
@@ -33,6 +39,8 @@
     "url": "https://www.pahouse.com/InTheNews/NewsRelease/?id=143905",
     "order": "4",
     "blurb": "Pennsylvania moves to mandate a visible light whenever smart glasses record. A direct policy response to the covert-capture problem the \"In 5 years…\" glasses layer imagines.",
+    "authors": "Rep. Joe Ciresi (H.B. 2603)",
+    "venue": "PA House · June 2026",
     "image": "reading-img/04-smart-glasses-recording-indicator.jpg"
   },
   {
@@ -42,6 +50,52 @@
     "url": "https://www.404media.co/metas-ray-ban-glasses-users-film-and-harass-massage-parlor-workers/",
     "order": "5",
     "blurb": "Instagram accounts with huge followings repost covert Ray-Ban-glasses footage of people at massage parlors. The smart-glasses layer's harm is already here, not five years out.",
+    "authors": "Emanuel Maiberg",
+    "venue": "404 Media · Oct 2025",
     "image": "reading-img/05-rayban-glasses-harassment.jpg"
+  },
+  {
+    "title": "ICE Taps into Nationwide AI-Enabled Camera Network",
+    "source": "Jason Koebler & Joseph Cox · 404 Media · May 2025",
+    "kind": "article",
+    "url": "https://www.404media.co/ice-taps-into-nationwide-ai-enabled-camera-network-data-shows/",
+    "order": "6",
+    "blurb": "Local police quietly run Flock license-plate searches for ICE — 4,000+ lookups with no federal contract. The red plate-reader layer here is a slice of that same network, now national infrastructure.",
+    "authors": "Jason Koebler & Joseph Cox",
+    "venue": "404 Media · May 2025",
+    "image": "reading-img/06-flock-ice-camera-network.svg"
+  },
+  {
+    "title": "The Follower",
+    "source": "Dries Depoorter · surveillance art · 2023–2026",
+    "kind": "art",
+    "url": "https://driesdepoorter.be/thefollower/",
+    "order": "7",
+    "blurb": "A surveillance artist matched influencers' Instagram posts to weeks of footage from the same public cameras. This map's premise made personal: the open camera already holds a version of you.",
+    "authors": "Dries Depoorter",
+    "venue": "surveillance art · 2023–2026",
+    "image": "reading-img/07-the-follower.svg"
+  },
+  {
+    "title": "Waymo's Driverless Cars Revealed to Be Narcs as Cops Use Them to Probe Crimes",
+    "source": "Lucas Ropek · Gizmodo · April 2025",
+    "kind": "article",
+    "url": "https://gizmodo.com/waymos-driverless-cars-revealed-to-be-narcs-as-cops-use-them-to-probe-crimes-2000590426",
+    "order": "8",
+    "blurb": "Police now pull 360° footage from robotaxis to work cases. Every driverless car is a roving camera — the moving-sensor logic of the dashcam and bus layers here, minus the driver.",
+    "authors": "Lucas Ropek",
+    "venue": "Gizmodo · April 2025",
+    "image": "reading-img/08-waymo-police-footage.svg"
+  },
+  {
+    "title": "Inside the NYPD's Surveillance Machine",
+    "source": "Amnesty International · Decode Surveillance NYC · 2021",
+    "kind": "report",
+    "url": "https://banthescan.amnesty.org/decode/",
+    "order": "9",
+    "blurb": "Thousands of volunteers mapped 15,000+ NYPD-reachable cameras wired for facial recognition. It's the crowdsourced census the fixed-CCTV layer in this map is built on.",
+    "authors": "Amnesty International",
+    "venue": "Decode Surveillance NYC · 2021",
+    "image": "reading-img/09-amnesty-decode-nyc.svg"
   }
 ]

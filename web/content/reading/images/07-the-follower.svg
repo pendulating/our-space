@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270" role="img" aria-label="The Follower, surveillance art project">
+  <rect width="480" height="270" fill="#f1e8d8"/>
+  <!-- two matched frames: the camera view and the posted photo -->
+  <rect x="42" y="60" width="176" height="132" fill="#faf5ea" stroke="#c2b291" stroke-width="1.5"/>
+  <rect x="262" y="60" width="176" height="132" fill="#faf5ea" stroke="#c2b291" stroke-width="1.5"/>
+  <!-- figure (left, in the camera frame) -->
+  <g fill="#67563f" opacity="0.7">
+    <circle cx="130" cy="112" r="15"/>
+    <path d="M104 176 q26 -40 52 0 z"/>
+  </g>
+  <!-- crosshair lock on the figure -->
+  <g stroke="#a8541f" stroke-width="2.5" fill="none">
+    <circle cx="130" cy="118" r="34"/>
+    <line x1="130" y1="74" x2="130" y2="90"/>
+    <line x1="130" y1="146" x2="130" y2="162"/>
+    <line x1="86" y1="118" x2="102" y2="118"/>
+    <line x1="158" y1="118" x2="174" y2="118"/>
+  </g>
+  <!-- same figure (right, the Instagram post) -->
+  <g fill="#3a2e21">
+    <circle cx="350" cy="112" r="15"/>
+    <path d="M324 176 q26 -40 52 0 z"/>
+  </g>
+  <!-- the match link -->
+  <line x1="218" y1="126" x2="262" y2="126" stroke="#a8541f" stroke-width="2" stroke-dasharray="5 5"/>
+  <text x="42" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2" fill="#a8541f">DRIES DEPOORTER</text>
+  <text x="42" y="222" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="2" fill="#67563f">OPEN CAMERA → INSTAGRAM</text>
+</svg>

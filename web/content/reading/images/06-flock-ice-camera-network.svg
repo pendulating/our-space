@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270" role="img" aria-label="404 Media 2025 report on ALPR network">
+  <rect width="480" height="270" fill="#f1e8d8"/>
+  <!-- license plate -->
+  <rect x="150" y="86" width="180" height="88" rx="8" fill="#faf5ea" stroke="#c2b291" stroke-width="1.5"/>
+  <rect x="150" y="86" width="180" height="18" rx="8" fill="#67563f" opacity="0.28"/>
+  <!-- plate glyphs -->
+  <g fill="#241c12">
+    <rect x="166" y="120" width="18" height="34" rx="2"/>
+    <rect x="192" y="120" width="18" height="34" rx="2"/>
+    <rect x="218" y="120" width="18" height="34" rx="2"/>
+    <rect x="252" y="120" width="18" height="34" rx="2"/>
+    <rect x="278" y="120" width="18" height="34" rx="2"/>
+    <rect x="304" y="120" width="10" height="34" rx="2" fill="#a8541f"/>
+  </g>
+  <!-- scan brackets -->
+  <g stroke="#a8541f" stroke-width="3" fill="none">
+    <path d="M132 96 L120 96 L120 116"/>
+    <path d="M348 96 L360 96 L360 116"/>
+    <path d="M132 164 L120 164 L120 144"/>
+    <path d="M348 164 L360 164 L360 144"/>
+  </g>
+  <!-- network sharing nodes -->
+  <g fill="#a8541f">
+    <circle cx="80" cy="216" r="5"/>
+    <circle cx="176" cy="222" r="5"/>
+    <circle cx="272" cy="216" r="5"/>
+    <circle cx="368" cy="224" r="5"/>
+  </g>
+  <g stroke="#a8541f" stroke-width="1.4" opacity="0.55">
+    <line x1="80" y1="216" x2="176" y2="222"/>
+    <line x1="176" y1="222" x2="272" y2="216"/>
+    <line x1="272" y1="216" x2="368" y2="224"/>
+  </g>
+  <text x="40" y="52" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2" fill="#a8541f">404 MEDIA · 2025</text>
+</svg>

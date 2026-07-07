@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270" role="img" aria-label="Amnesty International Decode Surveillance NYC camera map">
+  <rect width="480" height="270" fill="#f1e8d8"/>
+  <!-- map panel -->
+  <rect x="40" y="24" width="400" height="222" fill="#faf5ea" stroke="#c2b291" stroke-width="1.5"/>
+  <!-- street grid -->
+  <g stroke="#dabd8f" stroke-width="1">
+    <line x1="40" y1="70"  x2="440" y2="70"/>
+    <line x1="40" y1="116" x2="440" y2="116"/>
+    <line x1="40" y1="162" x2="440" y2="162"/>
+    <line x1="40" y1="208" x2="440" y2="208"/>
+    <line x1="112" y1="24" x2="112" y2="246"/>
+    <line x1="184" y1="24" x2="184" y2="246"/>
+    <line x1="256" y1="24" x2="256" y2="246"/>
+    <line x1="328" y1="24" x2="328" y2="246"/>
+    <line x1="400" y1="24" x2="400" y2="246"/>
+  </g>
+  <!-- camera dots: scattered, clustering toward one corridor -->
+  <g fill="#a8541f">
+    <circle cx="112" cy="70" r="4"/><circle cx="184" cy="70" r="4"/>
+    <circle cx="256" cy="70" r="4"/><circle cx="256" cy="116" r="4"/>
+    <circle cx="184" cy="116" r="4"/><circle cx="328" cy="116" r="4"/>
+    <circle cx="256" cy="162" r="4"/><circle cx="328" cy="162" r="4"/>
+    <circle cx="112" cy="162" r="4"/><circle cx="400" cy="116" r="4"/>
+    <circle cx="184" cy="208" r="4"/><circle cx="328" cy="208" r="4"/>
+    <circle cx="256" cy="208" r="4"/>
+  </g>
+  <!-- a denser cluster (the over-watched corridor) -->
+  <g fill="#7a1d1d">
+    <circle cx="290" cy="93" r="4.5"/><circle cx="300" cy="139" r="4.5"/>
+    <circle cx="292" cy="185" r="4.5"/><circle cx="300" cy="116" r="4.5"/>
+  </g>
+  <text x="52" y="238" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="2" fill="#a8541f">AMNESTY INTL · DECODE NYC · 2021</text>
+</svg>

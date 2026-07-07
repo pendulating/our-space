@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270" role="img" aria-label="Gizmodo 2025 report on robotaxi footage used by police">
+  <rect width="480" height="270" fill="#f1e8d8"/>
+  <!-- street cross -->
+  <g stroke="#dabd8f" stroke-width="16">
+    <line x1="0" y1="135" x2="480" y2="135"/>
+    <line x1="240" y1="0" x2="240" y2="270"/>
+  </g>
+  <g stroke="#faf5ea" stroke-width="2" stroke-dasharray="10 12">
+    <line x1="0" y1="135" x2="480" y2="135"/>
+    <line x1="240" y1="0" x2="240" y2="270"/>
+  </g>
+  <!-- 360 scan rings -->
+  <g stroke="#a8541f" fill="none" opacity="0.85">
+    <circle cx="240" cy="135" r="52" stroke-width="2.5"/>
+    <circle cx="240" cy="135" r="78" stroke-width="1.6" opacity="0.6"/>
+    <circle cx="240" cy="135" r="104" stroke-width="1.2" opacity="0.35"/>
+  </g>
+  <!-- the car (top-down) -->
+  <rect x="222" y="112" width="36" height="46" rx="10" fill="#3a2e21"/>
+  <rect x="228" y="120" width="24" height="14" rx="4" fill="#a8541f"/>
+  <!-- camera dots around the roof -->
+  <g fill="#241c12">
+    <circle cx="240" cy="112" r="3.4"/>
+    <circle cx="258" cy="135" r="3.4"/>
+    <circle cx="240" cy="158" r="3.4"/>
+    <circle cx="222" cy="135" r="3.4"/>
+  </g>
+  <text x="26" y="40" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2" fill="#a8541f">GIZMODO · 2025</text>
+</svg>
