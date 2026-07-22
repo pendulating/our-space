@@ -237,17 +237,22 @@ impl LinkNycLayer {
 }
 
 /// The institution class for the "Institutions" explore view. Kept tiny + `Copy`
-/// so it can tag both the baked record and the runtime pin.
+/// so it can tag both the baked record and the runtime pin. Schools + libraries come
+/// from the NYC Facilities Database as points; parks + plazas are folded in as the
+/// centroids of their polygons (from the Parks Properties / Pedestrian Plazas layers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FacilityKind {
     School,
     Library,
+    Park,
+    Plaza,
 }
 
-/// One civic institution (a school or library) in ENU meters, from the NYC
-/// Facilities Database. A *subject* of surveillance, not a sensor — it carries no
-/// FOV and never enters the exposure model; the app ranks it by how many cameras
-/// sit nearby.
+/// One civic institution (a school, library, park, or plaza) in ENU meters. A
+/// *subject* of surveillance, not a sensor — it carries no FOV and never enters the
+/// exposure model; the app ranks it by how many cameras sit nearby. Point layers
+/// (schools/libraries) use their location; area layers (parks/plazas) use the
+/// polygon centroid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Facility {
     pub x: f64,
@@ -496,6 +501,28 @@ pub struct BuildingFootprints {
 }
 
 impl BuildingFootprints {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(b)
+    }
+}
+
+/// Pre-tessellated building footprints: a triangle-list vertex + index buffer
+/// baked by the data-pipeline (native, multi-threaded earcutr). The app uploads
+/// this directly as a GPU mesh — zero triangulation at load time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TessellatedFootprints {
+    pub origin: GeoOrigin,
+    /// Flat `[x, y, z]` vertex positions (z = 0).
+    pub positions: Vec<[f32; 3]>,
+    /// Triangle indices into `positions`.
+    pub indices: Vec<u32>,
+    pub provenance: Provenance,
+}
+
+impl TessellatedFootprints {
     pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_allocvec(self)
     }

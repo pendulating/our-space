@@ -1,0 +1,18 @@
+{
+  "id": "watching-the-park",
+  "title": "Who's watching the park?",
+  "size": [1080, 1920],
+  "fps": 30,
+  "poster": 9.0,
+  "clock": { "t": 12.0, "rate": 36, "play": true },
+  "steps": [
+    { "action": "Overview", "secs": 2.0,
+      "caption": "Parks are public space. Who's watching them?" },
+    { "action": "Institutions", "parks_only": true, "rank": 0, "secs": 5.0,
+      "caption": "Every park, ranked by the fixed cameras that can see into it." },
+    { "action": "Caption", "secs": 4.0,
+      "caption": "{place}: ~{cameras} fixed cameras within a short walk." },
+    { "action": "Caption", "secs": 2.5,
+      "caption": "A place to sit outside, and the measured count of cameras around it." }
+  ]
+}

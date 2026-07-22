@@ -49,7 +49,7 @@ pub fn movable_panel<R>(
     frame: egui::Frame,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
     let area_id = egui::Id::new(("movable", id));
     // Until the user drags the panel it sits at its default (the seed), recomputed
     // from the *live* screen each frame so it tracks resizes and never freezes at a

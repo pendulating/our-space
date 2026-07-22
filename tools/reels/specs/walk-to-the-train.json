@@ -1,0 +1,18 @@
+{
+  "id": "walk-to-the-train",
+  "title": "The walk to the train",
+  "size": [1080, 1920],
+  "fps": 30,
+  "poster": 12.5,
+  "clock": { "t": 8.0, "rate": 42, "play": true },
+  "steps": [
+    { "action": "Overview", "secs": 2.0,
+      "caption": "An ordinary walk to the train. 8 AM, Midtown." },
+    { "action": "Route", "a": [40.7580, -73.9855], "b": [40.7527, -73.9772], "secs": 10.0,
+      "caption": "Times Square to Grand Central. Every camera that could catch you lights up along the way." },
+    { "action": "Caption", "secs": 3.5,
+      "caption": "~{cameras} cameras could have captured you on this one walk." },
+    { "action": "Caption", "secs": 3.0,
+      "caption": "Fixed cameras are measured. The passing dashcams and buses are a model." }
+  ]
+}

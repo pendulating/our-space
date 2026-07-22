@@ -14,11 +14,45 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-/// The detection recall of the Dahir et al. street-view camera detector
-/// (~63%). Observed fixed-camera density underestimates the truth by this
-/// factor; divide by it for an unbiased estimate. Surfaced as an uncertainty
-/// band in the UI, never as a silent correction.
+/// The detection recall of the **Dahir et al. ML detector** (~63%), as reported by
+/// that paper.
+///
+/// ⚠️ **This is a property of one detector, not of our merged camera census, and it
+/// must not be applied to the merged set.** The merged CCTV layer
+/// (`data-pipeline::amnesty`) is dominated by Amnesty's *human crowdsourced* census
+/// (~14.1k intersections, 3 decoders each); a machine detector's recall says nothing
+/// about what a crowd of humans missed. Applying 0.63 there would be a category error.
+/// Use it only for a Dahir-only bake (`data-pipeline::cameras_dahir`).
+///
+/// For the merged census, use [`CENSUS_RECALL`].
 pub const DAHIR_RECALL: f64 = 0.63;
+
+/// Recall of the **merged street-view CCTV census** (Amnesty ∪ Dahir), estimated
+/// from the data rather than borrowed from a detector spec sheet.
+///
+/// Two independent enumerations of the same physical camera population — Amnesty's
+/// crowdsource and Dahir's ML detector — give a Lincoln–Petersen/Chapman
+/// capture–recapture estimate (`tools/capture_recapture.py`, 50 m match radius):
+///
+/// ```text
+/// N̂ = (n₁+1)(n₂+1)/(m+1) − 1 = 28,643 true sites
+/// observed (union)            = 14,357 sites
+/// recall                      = 14,357 / 28,643 ≈ 0.501   (95% bootstrap [0.458, 0.544])
+/// ```
+///
+/// Detection is close to uniform across boroughs (40.6–53.0%) and shows **no**
+/// demographic gradient (`tools/undercount_spatial.py`: %Hisp p=0.89, %Black p=0.89,
+/// income p=0.42), so the undercount is **non-differential** — it rescales exposure
+/// without manufacturing or hiding a disparity.
+///
+/// **This is a conservative LOWER bound on the undercount.** Both censuses derive from
+/// Google Street View, so they are positively dependent; that inflates the overlap `m`,
+/// which biases N̂ *down* and recall *up*. True recall is likely below 0.50.
+///
+/// Site-level, not camera-level: it is the recall of *sites*, applied to camera counts
+/// under the assumption that missed sites carry the same cameras-per-site distribution
+/// as found sites.
+pub const CENSUS_RECALL: f64 = 0.501;
 
 /// Confidence tier for a sensing layer, governing UI treatment and honesty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +202,19 @@ impl Default for ExposureTally {
 impl ExposureTally {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a tally with pre-sized hash sets for an expected number of
+    /// distinct fixed sensors (avoids rehashing in long simulations).
+    pub fn with_capacity(estimated_sensors: usize) -> Self {
+        ExposureTally {
+            per_source: [SourceTally::default(); 9],
+            fixed_seen: HashSet::with_capacity(estimated_sensors),
+            fixed_groups: HashMap::with_capacity(estimated_sensors),
+            route_length_m: 0.0,
+            covered_length_m: 0.0,
+            recall_factor: 1.0,
+        }
     }
 
     fn idx(kind: SourceKind) -> usize {

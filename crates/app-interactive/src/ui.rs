@@ -36,10 +36,39 @@ const LEGEND: [egui::Color32; 6] = [
 /// paper plate / hero card barely read (~1.3:1), so the headline stat + the
 /// "SIMULATED DAY" eyebrow now use this ~6:1-contrast clay instead. The yellow end of
 /// the warning ramp is kept for the confidence tiers + heat ramp where it sits on ink.
-const TERRACOTTA: egui::Color32 = egui::Color32::from_rgb(0xc2, 0x41, 0x0c);
+/// The one editorial accent — a deep iron-gall rust, matched to the page chrome's
+/// `--accent` (#9a3a16). Serious, not the old hazard-orange. Used sparingly for
+/// datelines, section marks, and the primary call to action.
+const TERRACOTTA: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x3a, 0x16);
+/// Paper white, for text riding on a filled accent/ink surface.
+const PAPER: egui::Color32 = egui::Color32::from_rgb(0xff, 0xff, 0xff);
 
 /// Right side-panel width (CSS px); the citywide nudge keeps clear of it.
 const PANEL_WIDTH_PX: f32 = 316.0;
+
+/// Below this screen width (egui points ≈ CSS px) the whole in-canvas UI reflows
+/// for a phone: the control panel docks to the bottom edge as a collapsible sheet,
+/// the floating chrome (date plate, tour launcher, story caption) tightens, and
+/// every window clamps to the viewport. Chosen so a 316-px docked panel never eats
+/// more than ~60% of the map; small tablets and up keep the desktop layout.
+const COMPACT_MAX_PT: f32 = 560.0;
+
+/// Phone-class viewport? (One breakpoint, derived from egui's own logical size, so
+/// it tracks rotation/resize frame by frame.) Landscape phones are wide but short —
+/// the height test catches them, since a docked 316-px panel + floating clock would
+/// bury what little map they have. Note the rect is the *canvas*, not the browser
+/// window — the page's header/footer bands are already subtracted, so a landscape
+/// phone's canvas is ~320 pt tall while a landscape tablet's is ~420.
+pub(crate) fn compact_ui(ctx: &egui::Context) -> bool {
+    let r = ctx.content_rect();
+    r.width() < COMPACT_MAX_PT || r.height() < 380.0
+}
+
+/// Width the docked control panel takes from the map — 0 in the compact layout,
+/// where the panel is a bottom sheet and the map keeps the full width.
+pub(crate) fn panel_width(ctx: &egui::Context) -> f32 {
+    if compact_ui(ctx) { 0.0 } else { PANEL_WIDTH_PX }
+}
 
 /// World (ENU metres) anchors for the Manhattan→citywide nudge — one out in each outer
 /// borough's empty space, ringing the island (Brooklyn SE, Queens E, the Bronx N, Staten
@@ -88,8 +117,8 @@ pub fn citywide_nudge(
     }
     let Ok((camera, cam_gt)) = camera_q.single() else { return };
     let Ok(ctx) = contexts.ctx_mut() else { return };
-    let r = ctx.screen_rect();
-    let map_w = r.width() - PANEL_WIDTH_PX;
+    let r = ctx.content_rect();
+    let map_w = r.width() - panel_width(ctx);
     for (borough, ax, ay) in CITYWIDE_NUDGE_ANCHORS {
         let anchor = bevy::prelude::Vec3::new(ax, ay, 0.0);
         let Ok(screen) = camera.world_to_viewport(cam_gt, anchor) else { continue };
@@ -109,7 +138,7 @@ pub fn citywide_nudge(
                     .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235))
                     .stroke(egui::Stroke::new(1.0, pal::ZINC_300))
                     .inner_margin(egui::Margin::symmetric(13, 11))
-                    .corner_radius(8)
+                    .corner_radius(2)
                     .show(ui, |ui| {
                         ui.set_max_width(236.0);
                         ui.spacing_mut().item_spacing.y = 5.0;
@@ -153,13 +182,103 @@ pub fn citywide_nudge(
     }
 }
 
-/// Short label + ink color for a confidence tier — a warning ramp from the bright,
-/// mapped certainty (yellow) down to the gray "machine" of pure speculation.
+/// Phase-0 perf HUD (`docs/SCALING.md`): a small on-canvas overlay with smoothed FPS /
+/// frame time + the live on-screen agent counts (the cull/pool budget) + zoom + build
+/// scope. Registered only when `debug_perf_enabled()` (web `?debug=perf`, native
+/// `OURSPACE_DEBUG_PERF`/`OURSPACE_FPS`), so it never costs anything in normal use.
+pub fn perf_hud(
+    mut contexts: EguiContexts,
+    diagnostics: Option<bevy::prelude::Res<bevy::diagnostic::DiagnosticsStore>>,
+    agents: bevy::prelude::Query<&crate::agents::MobileAgent>,
+    cam: bevy::prelude::Query<&bevy::prelude::Transform, bevy::prelude::With<bevy::prelude::Camera2d>>,
+    city: Option<bevy::prelude::Res<crate::CityScope>>,
+    theme_ready: bevy::prelude::Res<crate::ThemeReady>,
+) {
+    use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
+    if !theme_ready.0 {
+        return; // fonts not baked until `setup_theme` runs in the first egui pass
+    }
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let (fps, ms) = diagnostics
+        .as_ref()
+        .map(|d| {
+            (
+                d.get(&FrameTimeDiagnosticsPlugin::FPS).and_then(|x| x.smoothed()).unwrap_or(0.0),
+                d.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME).and_then(|x| x.smoothed()).unwrap_or(0.0),
+            )
+        })
+        .unwrap_or((0.0, 0.0));
+    let (mut taxi, mut bus, mut ped, mut tesla, mut robot) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    for a in &agents {
+        if !a.active {
+            continue;
+        }
+        use crate::agents::AgentClass::*;
+        match a.class {
+            Vehicle => taxi += 1,
+            Bus => bus += 1,
+            Pedestrian => ped += 1,
+            Tesla => tesla += 1,
+            DeliveryRobot => robot += 1,
+        }
+    }
+    let scale = cam.single().map(|t| t.scale.x).unwrap_or(0.0);
+    let scope = if city.map(|c| c.citywide).unwrap_or(false) { "nyc" } else { "manhattan" };
+    let fps_color = if fps >= 55.0 {
+        egui::Color32::from_rgb(0x6e, 0xe7, 0x7b)
+    } else if fps >= 30.0 {
+        egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
+    } else {
+        egui::Color32::from_rgb(0xf8, 0x71, 0x71)
+    };
+    // Top-left, below the SIMULATED DAY plate so neither occludes the other.
+    egui::Area::new(egui::Id::new("perf_hud"))
+        .fixed_pos(egui::pos2(12.0, 112.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 20, 220))
+                .inner_margin(egui::Margin::symmetric(9, 7))
+                .corner_radius(2)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        egui::RichText::new(format!("{fps:5.1} fps · {ms:4.1} ms"))
+                            .monospace()
+                            .strong()
+                            .color(fps_color),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("taxi {taxi}  bus {bus}"))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(220)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("ped {ped}  tesla {tesla}  robot {robot}"))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{scope} · {scale:.1} m/px"))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                });
+        });
+}
+
+/// Short label + ink color for a confidence tier — a warning ramp from mapped
+/// certainty (deep amber) down to the gray "machine" of pure speculation. These are
+/// the *on-light* inks: the bright YELLOW/AMBER/ORANGE data tokens wash out to
+/// ~1.5:1 as small text on the light hero card (#e4e4e7), so the ramp is darkened to
+/// legible siblings while the yellow→amber→orange hue steps still carry the meaning.
 fn tier_style(tier: ConfidenceTier) -> (&'static str, egui::Color32) {
     match tier {
-        ConfidenceTier::A => ("A · mapped", pal::YELLOW),
-        ConfidenceTier::B => ("B · estimated", pal::AMBER),
-        ConfidenceTier::C => ("C · modeled", pal::ORANGE),
+        ConfidenceTier::A => ("A · mapped", egui::Color32::from_rgb(0x7c, 0x5a, 0x12)), // gold ≥4.9:1
+        ConfidenceTier::B => ("B · estimated", egui::Color32::from_rgb(0x9a, 0x54, 0x07)), // amber ≥4.5:1
+        ConfidenceTier::C => ("C · modeled", egui::Color32::from_rgb(0xa5, 0x38, 0x0a)), // orange ≥5:1
         ConfidenceTier::D => ("D · speculative", pal::ZINC_400),
     }
 }
@@ -192,37 +311,82 @@ fn apply_theme(ctx: &egui::Context) {
     v.faint_bg_color = pal::ZINC_800;
     v.extreme_bg_color = pal::ZINC_800;
     v.override_text_color = Some(pal::ZINC_100); // ink
-    v.hyperlink_color = pal::YELLOW;
+    // Deepen secondary (`.weak()`) text so captions/hints read as legible muted ink,
+    // not washed-out gray — editorial secondary text recedes but stays readable.
+    v.weak_text_alpha = 0.74;
+    // The interaction accent is the editorial rust, not a hazard yellow — links,
+    // pressed states and text selection all read as one serious mark. (The YELLOW/
+    // AMBER data tokens stay untouched; they encode confidence + the day-clock heat.)
+    v.hyperlink_color = TERRACOTTA;
     v.window_stroke = stroke(pal::ZINC_700);
     v.widgets.noninteractive.bg_fill = pal::ZINC_900;
     v.widgets.noninteractive.bg_stroke = stroke(pal::ZINC_700);
     v.widgets.noninteractive.fg_stroke = stroke(pal::ZINC_100);
-    v.widgets.inactive.bg_fill = pal::ZINC_800;
-    v.widgets.inactive.weak_bg_fill = pal::ZINC_800;
-    v.widgets.inactive.fg_stroke = stroke(pal::ZINC_300);
-    v.widgets.hovered.bg_fill = pal::ZINC_700;
-    v.widgets.hovered.weak_bg_fill = pal::ZINC_700;
+    // Buttons at rest: flat paper with a hairline rule, the way a printed form reads —
+    // no filled "chips". Hover firms the rule; press inks it in rust.
+    v.widgets.inactive.bg_fill = pal::ZINC_950;
+    v.widgets.inactive.weak_bg_fill = pal::ZINC_950;
+    v.widgets.inactive.bg_stroke = stroke(pal::ZINC_700);
+    v.widgets.inactive.fg_stroke = stroke(pal::ZINC_100);
+    v.widgets.hovered.bg_fill = pal::ZINC_900;
+    v.widgets.hovered.weak_bg_fill = pal::ZINC_900;
+    v.widgets.hovered.bg_stroke = stroke(pal::ZINC_400);
     v.widgets.hovered.fg_stroke = stroke(pal::ZINC_100);
-    // Active / pressed = the hazard yellow, with dark ink riding on top.
-    v.widgets.active.bg_fill = pal::YELLOW;
-    v.widgets.active.weak_bg_fill = pal::YELLOW;
+    // Active / pressed: a light well with a rust hairline + dark ink text.
+    // CRITICAL: egui derives `strong_text_color()` from `widgets.active.fg_stroke`
+    // (style.rs:1077 → `widgets.active.text_color()`), so EVERY `.strong()` label in the
+    // panel takes this color. It MUST be dark ink — a paper/white fg here (for a rust
+    // pressed fill) silently turns all strong text white-on-paper, i.e. unreadable
+    // (the empty-state prompts + the day-clock digits hit exactly that). The one rust
+    // *filled* control, the "Take the tour" CTA, sets its own `.fill()` + PAPER text.
+    v.widgets.active.bg_fill = pal::ZINC_800;
+    v.widgets.active.weak_bg_fill = pal::ZINC_800;
+    v.widgets.active.bg_stroke = stroke(TERRACOTTA);
     v.widgets.active.fg_stroke = stroke(pal::ZINC_100);
-    v.selection.bg_fill = pal::YELLOW.gamma_multiply(0.42);
-    v.selection.stroke = stroke(pal::YELLOW);
+    v.selection.bg_fill = TERRACOTTA.gamma_multiply(0.30);
+    v.selection.stroke = stroke(TERRACOTTA);
+    // Squared, editorial corners system-wide — crisp printed rules, not soft chips.
+    let r = egui::CornerRadius::same(2);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = r;
+    }
+    v.window_corner_radius = r;
+    v.menu_corner_radius = r;
     ctx.set_visuals(v);
+    // A touch more room around button labels — printed-form generosity, not app chips.
+    // (Spacing lives on `Style`, not `Visuals`, so it's set after `set_visuals`.)
+    ctx.style_mut(|s| {
+        s.spacing.button_padding = egui::vec2(9.0, 5.0);
+    });
     theme::install_fonts(ctx);
 }
 
-/// A small all-caps section eyebrow used to break the slim panel into a couple of
-/// scannable groups without a wall of separators.
+/// A section header, styled as a newspaper section break: a hairline rule with a
+/// small tracked-caps eyebrow beneath it. Gives the slim panel editorial rhythm.
 fn section(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(9.0);
+    // The hairline divider.
+    let w = ui.available_width();
+    let (r, p) = ui.allocate_painter(egui::vec2(w, 1.0), egui::Sense::hover());
+    p.rect_filled(
+        egui::Rect::from_min_size(r.rect.left_top(), egui::vec2(w, 1.0)),
+        0.0,
+        pal::ZINC_700,
+    );
+    ui.add_space(6.0);
     ui.label(
         egui::RichText::new(text)
             .strong()
-            .size(12.0)
+            .size(11.0)
             .color(pal::ZINC_400),
     );
-    ui.add_space(3.0);
+    ui.add_space(4.0);
 }
 
 /// One address search box with a debounced GeoSearch autocomplete dropdown. Picking
@@ -273,7 +437,7 @@ fn address_field(
     if !resolved && !results.is_empty() {
         egui::Frame::new()
             .fill(pal::ZINC_800)
-            .corner_radius(6)
+            .corner_radius(2)
             .inner_margin(egui::Margin::symmetric(6, 4))
             .show(ui, |ui| {
                 for r in &results {
@@ -289,7 +453,7 @@ fn address_field(
         ui.label(egui::RichText::new("searching…").weak().size(11.0));
     } else if no_match && !empty && !resolved {
         ui.label(
-            egui::RichText::new("No matches in Manhattan.").size(11.0).color(pal::ORANGE),
+            egui::RichText::new("No matches in Manhattan.").size(11.0).color(pal::ZINC_400),
         );
     }
     if let Some(r) = picked {
@@ -318,13 +482,17 @@ pub fn ui_panel(
     nbhd_live: bevy::prelude::Res<crate::NeighborhoodLive>,
     mut clock: ResMut<crate::SimClock>,
     date: bevy::prelude::Res<crate::SimDate>,
-    (mut more_open, mut advanced_open, alpr_makers, mut cov_view, mut movables, mut inst): (
+    (mut more_open, mut advanced_open, mut about_open, alpr_makers, mut cov_view, mut movables, mut inst, reel, mut sheet_closed, story): (
+        bevy::prelude::Local<bool>,
         bevy::prelude::Local<bool>,
         bevy::prelude::Local<bool>,
         bevy::prelude::Res<crate::AlprMakerBreakdown>,
         ResMut<crate::coverage::CoverageView>,
         ResMut<crate::movable::MovablePanels>,
         ResMut<crate::InstitutionsView>,
+        bevy::prelude::Res<crate::ReelMode>,
+        bevy::prelude::Local<Option<bool>>,
+        bevy::prelude::Res<crate::storymap::StoryMap>,
     ),
     theme_ready: bevy::prelude::Res<crate::ThemeReady>,
     mut geocoder: ResMut<crate::geocode::Geocoder>,
@@ -345,38 +513,134 @@ pub fn ui_panel(
     // The simulated day, parked large at the map's top-left (over the canvas). One baked real
     // day drives the buses + taxis, so this names which day you're watching. Non-interactive,
     // on a faint paper plate so the date reads over the colorful choropleth too.
+    // Reel mode records a 9:16 frame watched on a phone, so the date plate is scaled up for
+    // legibility there; the interactive desktop build keeps the compact sizes.
+    let compact = compact_ui(ctx);
+    let screen = ctx.content_rect();
+    let (plate_margin, plate_kicker, plate_date, plate_time) = if reel.0 {
+        (egui::Margin::symmetric(20, 14), 16.0, 40.0, 34.0)
+    } else if compact {
+        // Phone: the plate must not crowd the map — a slimmer stamp, tucked in tight.
+        (egui::Margin::symmetric(8, 5), 8.5, 15.0, 13.0)
+    } else {
+        (egui::Margin::symmetric(11, 7), 10.0, 24.0, 18.0)
+    };
     egui::Area::new(egui::Id::new("sim_date"))
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(14.0, 12.0))
+        .anchor(
+            egui::Align2::LEFT_TOP,
+            if reel.0 {
+                // Below the platform's top overlay chrome (search/live badges).
+                egui::vec2(24.0, 120.0)
+            } else if compact {
+                egui::vec2(8.0, 8.0)
+            } else {
+                egui::vec2(14.0, 12.0)
+            },
+        )
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
-                .inner_margin(egui::Margin::symmetric(11, 7))
-                .corner_radius(7)
+                // A warm paper stamp with a hairline rule — a dateline pressed onto the map,
+                // matching the page chrome's newsprint band rather than a glassy white chip.
+                .fill(egui::Color32::from_rgba_unmultiplied(244, 241, 233, 236))
+                .stroke(egui::Stroke::new(1.0, pal::ZINC_700))
+                .inner_margin(plate_margin)
+                .corner_radius(if reel.0 { 3 } else { 2 })
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.label(
                         egui::RichText::new("SIMULATED DAY")
-                            .font(theme::display(10.0))
+                            .font(theme::display(plate_kicker))
                             .color(TERRACOTTA),
+                    );
+                    // The dateline rule.
+                    let rule_w = ui.min_rect().width().max(96.0);
+                    let (rr, rp) = ui.allocate_painter(egui::vec2(rule_w, 3.0), egui::Sense::hover());
+                    rp.rect_filled(
+                        egui::Rect::from_min_size(rr.rect.left_top(), egui::vec2(rule_w, 1.0)),
+                        0.0,
+                        pal::ZINC_700,
                     );
                     ui.label(
                         egui::RichText::new(&date.label)
-                            .font(theme::display(24.0))
+                            .font(theme::display(plate_date))
                             .color(pal::ZINC_100),
                     );
+                    // Reel mode hides the interactive time panel, so surface the time of day
+                    // here — this is the readout that climbs during a ClockScrub time-lapse.
+                    if reel.0 {
+                        let t = clock.time_of_day.rem_euclid(24.0);
+                        let h = t.floor() as i32;
+                        let m = ((t - h as f64) * 60.0).floor() as i32;
+                        let (h12, ampm) = (((h + 11) % 12) + 1, if h < 12 { "AM" } else { "PM" });
+                        ui.label(
+                            egui::RichText::new(format!("{h12}:{m:02} {ampm}"))
+                                .font(theme::display(plate_time))
+                                .color(TERRACOTTA),
+                        );
+                    }
                 });
         });
 
     // (The Manhattan→citywide nudge is its own pass, `citywide_nudge`, pinned to a map
     // location in the outer boroughs so it only surfaces when you pan out there.)
 
-    egui::SidePanel::right("panel")
-        // Fixed width: a resizable panel + an `available_width()`-sized child (the
-        // address box) feed back into each other and the panel grows without bound.
-        .resizable(false)
-        .exact_width(PANEL_WIDTH_PX)
-        .show(ctx, |ui| {
+    // Reel/clean-capture mode (`?reel=1`): keep the date plate for context but drop the
+    // whole control panel, so a recorded 9:16 frame is just the map + captions. The story
+    // engine drives the camera/mode, so no interactive controls are needed.
+    if reel.0 {
+        return;
+    }
+
+    // A takeover view (Operators / roving coverage / a running story) needs the map;
+    // in the compact layout the sheet yields to it automatically.
+    let takeover = ov.active || cov_view.active || story.active;
+    // Read out what the sheet's always-visible handle row needs BEFORE the body
+    // closure below mutably captures `params`/`clock`.
+    let mode_word = match params.mode {
+        Mode::None => "pick a mode",
+        Mode::Walkshed => "My area",
+        Mode::DirectCapture => "Direct capture",
+        Mode::Route => "A→B walk",
+        Mode::Neighborhoods => "Neighborhoods",
+    };
+
+    // The panel body: identical content in both layouts — docked right on
+    // desktop/tablet, a collapsible bottom sheet on phones (never hide, adapt).
+    let mut panel_body = |ui: &mut egui::Ui| {
+            // ---- compact-only clock strip (the floating bar is desktop chrome) ----
+            if compact && !ov.active && !cov_view.active {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if clock.playing { "  Pause  " } else { "  Play  " })
+                        .clicked()
+                    {
+                        clock.playing = !clock.playing;
+                    }
+                    let h = clock.time_of_day.floor() as i32;
+                    let m = (clock.time_of_day.fract() * 60.0).floor() as i32;
+                    ui.label(
+                        egui::RichText::new(format!("{:02}:{:02}", h, m))
+                            .monospace()
+                            .strong()
+                            .size(15.0),
+                    );
+                    ui.label(egui::RichText::new("drag the bar to scrub").weak().size(10.0));
+                });
+                let (resp, painter) = ui
+                    .allocate_painter(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
+                paint_time_bar(&painter, resp.rect, clock.time_of_day);
+                if resp.dragged() || resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                        clock.time_of_day = (t as f64 * 24.0).clamp(0.0, 24.0 - 1e-6);
+                        clock.playing = false;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.separator();
+            }
             // ---- masthead ----
             // The page's HTML <header> already carries the "our·space" wordmark and the
             // framing copy, so the panel leads straight into the mode selector.
@@ -392,60 +656,78 @@ pub fn ui_panel(
                     .find(|n| n.name == "Financial District")
                     .map(|n| n.exterior.as_slice())
             });
-            ui.horizontal(|ui| {
-                // Re-clicking the mode you're already in clears its placed area/walk — a
-                // toggle-off affordance (same effect as Reset, scoped to the active mode).
-                // Only when something is actually placed, so an idle re-click is a no-op.
-                let in_walkshed = params.mode == Mode::Walkshed;
-                let in_route = params.mode == Mode::Route;
-                let in_neigh = params.mode == Mode::Neighborhoods;
-                let area_present = walkshed.summary.is_some();
-                let route_present = route.a.is_some() || route.summary.is_some();
+            // Re-clicking the mode you're already in clears its placed area/walk — a
+            // toggle-off affordance (same effect as Reset, scoped to the active mode).
+            // Only when something is actually placed, so an idle re-click is a no-op.
+            let in_walkshed = params.mode == Mode::Walkshed;
+            let in_route = params.mode == Mode::Route;
+            let in_neigh = params.mode == Mode::Neighborhoods;
+            let in_capture = params.mode == Mode::DirectCapture;
+            let area_present = walkshed.summary.is_some();
+            let route_present = route.a.is_some() || route.summary.is_some();
+            let capture_present = walkshed.capture.is_some();
 
-                let gap = 6.0;
-                ui.spacing_mut().item_spacing.x = gap;
-                // `.max(8)` guards against a degenerately-narrow panel producing a
-                // negative width (→ a bad rect + negative icon radius/height downstream).
-                let col_w = ((ui.available_width() - 2.0 * gap) / 3.0).floor().max(8.0);
-
-                let mut r_walk = mode_button(ui, in_walkshed, col_w, "My area", paint_pin_in_circle);
-                let mut r_route = mode_button(ui, in_route, col_w, "A→B walk", paint_walker);
-                let mut r_neigh =
-                    mode_button(ui, in_neigh, col_w, "Neighborhoods", |p, r, c| {
-                        paint_neighborhood_outline(p, r, c, fidi_ring)
-                    });
-
-                if in_walkshed && area_present {
-                    r_walk = r_walk.on_hover_text("Click again to clear your area");
-                }
-                if in_route && route_present {
-                    r_route = r_route.on_hover_text("Click again to clear your A→B walk");
-                }
-                if in_neigh {
-                    r_neigh = r_neigh.on_hover_text("Click again to leave Neighborhoods");
-                }
-
-                // Selection + the re-click affordances. A re-click on My area / A→B clears
-                // its placed visuals (staying in the mode); a re-click on Neighborhoods
-                // leaves to the no-mode start state.
-                if r_walk.clicked() {
-                    if in_walkshed && area_present {
-                        reset.0 = true;
-                    } else {
-                        params.mode = Mode::Walkshed;
-                    }
-                }
-                if r_route.clicked() {
-                    if in_route && route_present {
-                        reset.0 = true;
-                    } else {
-                        params.mode = Mode::Route;
-                    }
-                }
-                if r_neigh.clicked() {
-                    params.mode = if in_neigh { Mode::None } else { Mode::Neighborhoods };
-                }
-            });
+            let gap = 6.0;
+            // Desktop/tablet: a 2×2 grid (a single narrow row of four would clip the
+            // longer labels at panel width). Phone sheet: all four in one row — the
+            // sheet is the full screen width, so four ~85-pt chips fit, and one row
+            // keeps the collapsed sheet shallow. `.max(8)` guards degenerate widths.
+            let per_row: f32 = if compact { 4.0 } else { 2.0 };
+            let col_w = ((ui.available_width() - gap * (per_row - 1.0)) / per_row)
+                .floor()
+                .max(8.0);
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+            let chip_walk = |ui: &mut egui::Ui| {
+                mode_button(ui, in_walkshed, col_w, "My area", paint_pin_in_circle)
+            };
+            let chip_route =
+                |ui: &mut egui::Ui| mode_button(ui, in_route, col_w, "A→B walk", paint_walker);
+            let chip_neigh = |ui: &mut egui::Ui| {
+                mode_button(ui, in_neigh, col_w, "Neighborhoods", |p, r, c| {
+                    paint_neighborhood_outline(p, r, c, fidi_ring)
+                })
+            };
+            let chip_cap = |ui: &mut egui::Ui| {
+                mode_button(ui, in_capture, col_w, "Direct capture", paint_capture_eye)
+            };
+            let (mut r_walk, mut r_route, mut r_neigh, mut r_cap) = if compact {
+                let mut out = None;
+                ui.horizontal(|ui| {
+                    out = Some((chip_walk(ui), chip_route(ui), chip_neigh(ui), chip_cap(ui)));
+                });
+                out.unwrap()
+            } else {
+                let mut top = None;
+                let mut bot = None;
+                ui.horizontal(|ui| top = Some((chip_walk(ui), chip_route(ui))));
+                ui.horizontal(|ui| bot = Some((chip_neigh(ui), chip_cap(ui))));
+                let ((w, r), (n, c)) = (top.unwrap(), bot.unwrap());
+                (w, r, n, c)
+            };
+            if in_walkshed && area_present {
+                r_walk = r_walk.on_hover_text("Click again to clear your area");
+            }
+            if in_route && route_present {
+                r_route = r_route.on_hover_text("Click again to clear your A→B walk");
+            }
+            if in_neigh {
+                r_neigh = r_neigh.on_hover_text("Click again to leave Neighborhoods");
+            }
+            if in_capture && capture_present {
+                r_cap = r_cap.on_hover_text("Click again to clear the address");
+            }
+            if r_walk.clicked() {
+                if in_walkshed && area_present { reset.0 = true } else { params.mode = Mode::Walkshed }
+            }
+            if r_route.clicked() {
+                if in_route && route_present { reset.0 = true } else { params.mode = Mode::Route }
+            }
+            if r_neigh.clicked() {
+                params.mode = if in_neigh { Mode::None } else { Mode::Neighborhoods };
+            }
+            if r_cap.clicked() {
+                if in_capture && capture_present { reset.0 = true } else { params.mode = Mode::DirectCapture }
+            }
             // The neighborhood-density view is a mode now (not an EXPLORE checkbox): keep the
             // layer flag in lockstep with the mode so every choropleth system follows the
             // selector, and the My-area / walk inputs disappear while it's active.
@@ -457,6 +739,9 @@ pub fn ui_panel(
                     }
                     Mode::Walkshed => {
                         "Search an address or click the map. Every camera within a 10-minute walk."
+                    }
+                    Mode::DirectCapture => {
+                        "Search an address or click the map. Which cameras point straight at it."
                     }
                     Mode::Route => "Search a start and destination, or click the map to set A then B.",
                     Mode::Neighborhoods => {
@@ -471,12 +756,24 @@ pub fn ui_panel(
             // ---- address search (type a place; or click the map) ----
             use crate::geocode::Field;
             match params.mode {
-                Mode::None => {} // no mode chosen yet — no inputs; the hero card prompts
+                Mode::None => {} // no mode chosen yet — no inputs; the selector hint above prompts
                 Mode::Walkshed => {
                     address_field(ui, &mut geocoder, Field::Walkshed, "Search an address or place");
                     if ui
                         .add(egui::Button::new(egui::RichText::new("🎲  surprise me").size(12.0)).frame(false))
                         .on_hover_text("Drop the study area on a random Manhattan corner")
+                        .clicked()
+                    {
+                        geocoder.random_walkshed = true;
+                    }
+                }
+                // Direct capture reuses the single-address box (`Field::Walkshed`); the
+                // placement dispatches on the mode (see `place_for_mode`).
+                Mode::DirectCapture => {
+                    address_field(ui, &mut geocoder, Field::Walkshed, "Search an address (e.g. an apartment)");
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("🎲  surprise me").size(12.0)).frame(false))
+                        .on_hover_text("Test a random Manhattan address")
                         .clicked()
                     {
                         geocoder.random_walkshed = true;
@@ -511,26 +808,30 @@ pub fn ui_panel(
             ui.add_space(8.0);
 
             // ---- the result card (the hero) ----
-            egui::Frame::new()
-                .fill(pal::ZINC_800)
-                .stroke(egui::Stroke::new(1.0, pal::ZINC_700))
-                .inner_margin(egui::Margin::same(14))
-                .corner_radius(10)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    match params.mode {
-                        Mode::None => result_none(ui),
-                        Mode::Walkshed => result_walkshed(ui, &route, &walkshed),
-                        Mode::Route => {
-                            result_route(ui, &mut params, &route, &walk_live, clock.time_of_day)
+            // Only once a mode is chosen. At startup (`Mode::None`) there's no hero card at
+            // all — the sidebar leads straight from the mode selector into EXPLORE.
+            if !matches!(params.mode, Mode::None) {
+                egui::Frame::new()
+                    .fill(pal::ZINC_800)
+                    .stroke(egui::Stroke::new(1.0, pal::ZINC_700))
+                    .inner_margin(egui::Margin::same(14))
+                    .corner_radius(2)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        match params.mode {
+                            Mode::None => {} // no card at startup (handled by the guard above)
+                            Mode::Walkshed => result_walkshed(ui, &route, &walkshed),
+                            Mode::DirectCapture => result_direct_capture(ui, &route, &walkshed),
+                            Mode::Route => {
+                                result_route(ui, &mut params, &route, &walk_live, clock.time_of_day)
+                            }
+                            Mode::Neighborhoods => {
+                                result_neighborhoods(ui, sim.as_deref(), &pick, &nbhd_live)
+                            }
                         }
-                        Mode::Neighborhoods => {
-                            result_neighborhoods(ui, sim.as_deref(), &pick, &nbhd_live)
-                        }
-                    }
-                });
-
-            ui.add_space(12.0);
+                    });
+                ui.add_space(12.0);
+            }
 
             // ---- everyday layers (one tap from the main view) ----
             section(ui, "EXPLORE");
@@ -597,12 +898,12 @@ pub fn ui_panel(
                 }
             }
 
-            // Institutions — rank schools & libraries by the cameras watching them.
-            // Opens a sliding ranking panel on the left + marks them on the map.
+            // Institutions — rank schools, libraries, parks & plazas by the cameras
+            // watching them. Opens a sliding ranking panel on the left + marks the map.
             if ui
-                .selectable_label(inst.active, "Institutions (schools & libraries)")
+                .selectable_label(inst.active, "Institutions (schools, libraries, parks, plazas)")
                 .on_hover_text(
-                    "Rank schools and libraries by the cameras nearby. Opens a panel on the left; click an entry to fly there.",
+                    "Rank schools, libraries, parks and plazas by the cameras nearby. Opens a panel on the left; click an entry to fly there.",
                 )
                 .clicked()
             {
@@ -685,28 +986,103 @@ pub fn ui_panel(
             });
             ui.add_space(3.0);
             ui.horizontal(|ui| {
+                if ui
+                    .button("About the data…")
+                    .on_hover_text("Where the data comes from, how sources combine, what's real vs modeled")
+                    .clicked()
+                {
+                    *about_open = !*about_open;
+                }
                 if ui.button("Reset").clicked() {
                     reset.0 = true;
                 }
+            });
+            ui.add_space(3.0);
+            if !compact {
                 ui.label(
                     egui::RichText::new("Drag: pan · Scroll: zoom · WASD: pan")
                         .weak()
                         .small(),
                 );
-            });
+            }
+    };
 
-            ui.add_space(6.0);
-            ui.collapsing("About the data & its limits", |ui| about_data(ui));
-        });
+    if compact {
+        // ---- phone: the panel is a collapsible bottom sheet ----
+        // A slim handle row is always visible (never amputate the controls); the body
+        // scrolls within a capped height so the map keeps most of the screen. Takeover
+        // views (Operators / coverage / a running story) collapse it automatically.
+        // Until the visitor touches the toggle, the sheet starts open on a portrait
+        // phone (the mode selector is the front door) but closed on short landscape
+        // screens, where an open sheet would leave a letterbox of map.
+        let closed = sheet_closed.unwrap_or(screen.height() < 380.0);
+        let open = !closed && !takeover;
+        // Explicit height: a bottom panel sized "by content" and a ScrollArea sized
+        // "by available" are circular — the sheet would collapse to its first block.
+        let sheet_h = if open { (screen.height() * 0.42).min(420.0) + 34.0 } else { 30.0 };
+        egui::TopBottomPanel::bottom("panel")
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                left: 10,
+                right: 10,
+                top: 4,
+                bottom: 8,
+            }))
+            .show_separator_line(true)
+            .exact_height(sheet_h)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let label = if open { "Hide controls" } else { "Show controls" };
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new(label).size(12.0).strong()).frame(false))
+                        .clicked()
+                    {
+                        *sheet_closed = Some(open); // toggling while a takeover holds it shut is a no-op
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(mode_word).weak().size(11.0));
+                    });
+                });
+                if open {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        panel_body(ui);
+                        ui.add_space(6.0);
+                    });
+                }
+            });
+    } else {
+        egui::SidePanel::right("panel")
+            // Fixed width: a resizable panel + an `available_width()`-sized child (the
+            // address box) feed back into each other and the panel grows without bound.
+            .resizable(false)
+            .exact_width(PANEL_WIDTH_PX)
+            // Short canvases (landscape tablets, small desktop windows) can't fit the
+            // whole column — scroll it rather than losing the buttons below the fold.
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| panel_body(ui));
+            });
+    }
 
     // ---- "More layers" window: the citywide / overlay views ----
+    // Desktop: parked just left of the docked panel. Phone: centered under the date
+    // plate, clamped to the viewport, scrolling within ~2/3 of the screen height so
+    // the sheet handle stays reachable underneath.
+    let (win_align, win_off) = if compact {
+        (egui::Align2::CENTER_TOP, egui::vec2(0.0, 56.0))
+    } else {
+        (egui::Align2::RIGHT_TOP, egui::vec2(-340.0, 16.0))
+    };
+    let win_max_w = if compact { screen.width() - 16.0 } else { f32::INFINITY };
+    let win_max_h = if compact { screen.height() * 0.62 } else { f32::INFINITY };
     if *more_open {
         let mut open = true;
         egui::Window::new("More layers")
             .open(&mut open)
             .resizable(false)
-            .default_width(308.0)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-340.0, 16.0))
+            .default_width(308.0f32.min(win_max_w))
+            .max_width(win_max_w)
+            .max_height(win_max_h)
+            .vscroll(compact)
+            .anchor(win_align, win_off)
             .show(ctx, |ui| {
                 section(ui, "CITYWIDE HEATMAP");
                 ui.checkbox(&mut params.heatmap_on, "Show exposure heatmap");
@@ -779,6 +1155,8 @@ pub fn ui_panel(
                     .on_hover_text("NYC DOT pedestrian plazas as a hatched concrete fill (Astor Place, etc.)");
                 ui.checkbox(&mut params.landmarks_on, "Landmark buildings (3D)")
                     .on_hover_text("Notable buildings (Empire State, One WTC, the Cloisters…) as 2.5D massing for orientation");
+                ui.checkbox(&mut params.landmark_labels_on, "Landmark labels")
+                    .on_hover_text("Float each landmark's name over the water on a hairline leader. Off by default — an orientation aid, independent of the 3D massings.");
                 ui.checkbox(&mut params.linknyc_on, "LinkNYC kiosks")
                     .on_hover_text(
                         "1,225 LinkNYC Wi-Fi/phone kiosks (sky-blue). Not cameras, but each \
@@ -798,14 +1176,16 @@ pub fn ui_panel(
                     // it rides the ACE toggle as a narrative stat.
                     egui::Frame::new()
                         .fill(pal::ZINC_800)
-                        .corner_radius(6)
+                        .corner_radius(2)
                         .inner_margin(egui::Margin::same(7))
                         .show(ui, |ui| {
                             ui.label(
                                 egui::RichText::new("⚖ Surveillance evidence")
                                     .strong()
                                     .size(11.5)
-                                    .color(pal::ORANGE),
+                                    // darkened orange (≥5:1 on the light callout) — bright
+                                    // ORANGE washes out to ~2:1 here.
+                                    .color(egui::Color32::from_rgb(0xa5, 0x38, 0x0a)),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -837,8 +1217,11 @@ pub fn ui_panel(
         egui::Window::new("Advanced")
             .open(&mut open)
             .resizable(false)
-            .default_width(330.0)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-340.0, 16.0))
+            .default_width(330.0f32.min(win_max_w))
+            .max_width(win_max_w)
+            .max_height(win_max_h)
+            .vscroll(compact)
+            .anchor(win_align, win_off)
             .show(ctx, |ui| {
                 section(ui, "SENSING CLASSES");
                 ui.label(
@@ -911,8 +1294,9 @@ pub fn ui_panel(
                 ui.checkbox(&mut params.show_agents, "Animate moving sensors on the map");
                 ui.label(
                     egui::RichText::new(
-                        "clay = rideshare · slate = glasses · buses = ACE · violet = robots · \
-                         crimson = Teslas; buses + taxis replay the day's real schedule",
+                        "amber cars = rideshare · orange cars = Teslas · blue buses = ACE · \
+                         violet boxes = robots · slate walkers = glasses; buses + taxis \
+                         replay the day's real schedule",
                     )
                     .weak()
                     .size(11.0),
@@ -961,21 +1345,49 @@ pub fn ui_panel(
         }
     }
 
+    // ---- "About the data & its limits" window (moved out of the old inline dropdown so it
+    // sits in the same button group as More layers / Advanced / Reset) ----
+    if *about_open {
+        let mut open = true;
+        egui::Window::new("About the data & its limits")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(330.0)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-340.0, 16.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(460.0)
+                    .show(ui, |ui| about_data(ui));
+            });
+        if !open {
+            *about_open = false;
+        }
+    }
+
     // ---- live day clock (hidden while a takeover overlay is up) ----
     // Movable: it floats over the map, so it's a `movable_panel` (drag the grip to
     // reposition when it occludes something). Seeds bottom-center, clamps to view.
-    if !ov.active && !cov_view.active {
+    // Compact layout: the clock lives inside the bottom sheet instead (drawn above),
+    // so the floating bar is desktop/tablet chrome only.
+    if !compact && !ov.active && !cov_view.active {
         let frame = egui::Frame::new()
             .fill(pal::ZINC_900)
             .stroke(egui::Stroke::new(1.5, pal::ZINC_700))
             .inner_margin(egui::Margin::symmetric(16, 12))
-            .corner_radius(8);
+            .corner_radius(2);
         crate::movable::movable_panel(
             ctx,
             &mut movables,
             "time_bar",
             440.0,
-            |screen| egui::pos2(screen.center().x - 236.0, screen.bottom() - 122.0),
+            // Centered over the MAP (the area left of the docked panel), not the whole
+            // canvas — on narrower tablets a canvas-centered bar overlaps the panel.
+            |screen| {
+                egui::pos2(
+                    ((screen.width() - PANEL_WIDTH_PX) * 0.5 - 220.0).max(8.0),
+                    screen.bottom() - 122.0,
+                )
+            },
             frame,
             |ui| {
                 ui.horizontal(|ui| {
@@ -1024,23 +1436,6 @@ pub fn ui_panel(
 
 /// The hero card before any mode is chosen: a short prompt pointing at the three
 /// mode buttons above. Keeps the card from reading as broken on first load.
-fn result_none(ui: &mut egui::Ui) {
-    ui.label(
-        egui::RichText::new("Start exploring")
-            .font(theme::display(22.0))
-            .color(pal::ZINC_100),
-    );
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(
-            "Choose a mode above. Map your area, trace an A→B walk, or compare \
-             neighborhoods by camera density.",
-        )
-        .size(13.0)
-        .color(pal::ZINC_300),
-    );
-}
-
 /// One mode chip in the selector: a monochrome ink icon stacked over a label, the
 /// whole `width`×58 column a single click target. `selected` paints the active plate.
 fn mode_button(
@@ -1053,15 +1448,21 @@ fn mode_button(
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 58.0), egui::Sense::click());
     let painter = ui.painter_at(rect);
     if selected {
-        painter.rect_filled(rect, 6.0, pal::ZINC_800);
+        painter.rect_filled(rect, 2.0, pal::ZINC_900);
         painter.rect_stroke(
             rect,
-            6.0,
-            egui::Stroke::new(1.0, pal::ZINC_600),
+            2.0,
+            egui::Stroke::new(1.0, pal::ZINC_700),
             egui::StrokeKind::Inside,
         );
+        // An "active tab" underline in rust — the one mark that says which mode is live.
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - 2.5),
+            egui::pos2(rect.right(), rect.bottom()),
+        );
+        painter.rect_filled(bar, 0.0, TERRACOTTA);
     } else if resp.hovered() {
-        painter.rect_filled(rect, 6.0, pal::ZINC_900);
+        painter.rect_filled(rect, 2.0, pal::ZINC_900);
     }
     // Icons are monochrome ink (no per-mode color), per the design brief.
     let ink = pal::ZINC_100;
@@ -1074,7 +1475,9 @@ fn mode_button(
         egui::pos2(rect.center().x, rect.bottom() - 6.0),
         egui::Align2::CENTER_BOTTOM,
         label,
-        egui::FontId::proportional(11.0),
+        // Narrow chips (the phone sheet's 4-up row) drop a point so "Direct capture"
+        // and "Neighborhoods" still clear the chip edges.
+        egui::FontId::proportional(if width < 110.0 { 9.5 } else { 11.0 }),
         if selected { ink } else { pal::ZINC_300 },
     );
     resp
@@ -1160,6 +1563,30 @@ fn paint_neighborhood_outline(
     painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.6, color)));
 }
 
+/// "Direct capture" icon: an open eye — you are directly *seen*. An almond outline
+/// (two parabolic lids) with a centered iris ring + filled pupil, drawn in the same
+/// monochrome ink as the other mode icons.
+fn paint_capture_eye(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let hw = rect.width() * 0.44; // half eye width
+    let hh = rect.height() * 0.28; // half lid bulge
+    let n = 14;
+    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(2 * (n + 1));
+    // Upper lid, left → right; then lower lid, right → left — a closed almond.
+    for i in 0..=n {
+        let t = -1.0 + 2.0 * i as f32 / n as f32;
+        pts.push(egui::pos2(c.x + t * hw, c.y - hh * (1.0 - t * t)));
+    }
+    for i in 0..=n {
+        let t = 1.0 - 2.0 * i as f32 / n as f32;
+        pts.push(egui::pos2(c.x + t * hw, c.y + hh * (1.0 - t * t)));
+    }
+    painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.5, color)));
+    let iris = hh * 0.95;
+    painter.circle_stroke(c, iris, egui::Stroke::new(1.3, color));
+    painter.circle_filled(c, iris * 0.46, color);
+}
+
 /// The walkshed result inside the hero card.
 fn result_walkshed(ui: &mut egui::Ui, route: &RouteState, walkshed: &WalkshedState) {
     if let Some(w) = &walkshed.summary {
@@ -1191,6 +1618,65 @@ fn result_walkshed(ui: &mut egui::Ui, route: &RouteState, walkshed: &WalkshedSta
         ui.label(
             egui::RichText::new(if route.status.is_empty() {
                 "Click a point to map its 10-minute walkshed."
+            } else {
+                &route.status
+            })
+            .strong(),
+        );
+    }
+}
+
+/// The Direct-capture result inside the hero card: how many mapped cameras have this
+/// exact address inside their field of view (line-of-sight, source-deduped), plus a
+/// modeled count of moving rideshare dashcams that drive past and record it each day.
+fn result_direct_capture(ui: &mut egui::Ui, route: &RouteState, walkshed: &WalkshedState) {
+    if let Some(cap) = &walkshed.capture {
+        let n = cap.cameras_corrected.round().max(0.0) as u32;
+        ui.label(
+            egui::RichText::new(format!("~{} cameras", n))
+                .font(theme::display(30.0))
+                .color(TERRACOTTA),
+        );
+        ui.label(egui::RichText::new("point straight at this address").size(15.0).color(pal::ZINC_300));
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(if cap.cameras_raw == 0 {
+                "No mapped camera's field of view frames this exact spot.".to_string()
+            } else if (cap.cameras_corrected - cap.cameras_raw as f64).abs() > 0.5 {
+                format!("{} with direct line of sight, recall-corrected", cap.cameras_raw)
+            } else {
+                format!(
+                    "{} fixed camera{} with line of sight (deduped across sources)",
+                    cap.cameras_raw,
+                    if cap.cameras_raw == 1 { "" } else { "s" }
+                )
+            })
+            .weak()
+            .size(12.0),
+        );
+        // Moving cameras that pass through the frame: a model estimate from local rideshare
+        // density × dashcam penetration × a per-pass capture probability (see main.rs).
+        let dashcams = walkshed.daily_dashcams.round().max(0.0) as u32;
+        if dashcams > 0 {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "+ ~{} rideshare dashcams drive past & record it / day",
+                    crate::group_thousands(dashcams)
+                ))
+                .font(theme::display(14.0))
+                .color(pal::GOLD),
+            );
+            ui.label(
+                egui::RichText::new("modeled from local traffic × dashcam penetration")
+                    .weak()
+                    .size(11.0),
+            );
+        }
+    } else {
+        ui.label(
+            egui::RichText::new(if route.status.is_empty() {
+                "Search or click an address to see which cameras point straight at it."
             } else {
                 &route.status
             })
@@ -1355,19 +1841,26 @@ fn result_route(
             );
             ui.label(egui::RichText::new("saw you this walk").size(15.0).color(pal::ZINC_300));
             ui.add_space(6.0);
-            let robot_violet = egui::Color32::from_rgb(0x9a, 0x8f, 0xc0);
+            // On-light legible inks for the per-sensor counts: the bright map/agent
+            // tokens (AMBER/STEEL/ORANGE + a pale violet) drop to ~2:1 as small text on
+            // the light card, so each count uses a darkened sibling in the same hue family
+            // (the row label already names the sensor; this keeps the map-color linkage).
+            let robot_violet = egui::Color32::from_rgb(0x5a, 0x4b, 0x9a); // dark violet ≥5.6:1
+            let bus_blue = egui::Color32::from_rgb(0x34, 0x50, 0x6a); // deep steel ≥6.6:1
+            let dashcam_amber = egui::Color32::from_rgb(0x9a, 0x54, 0x07); // dark amber ≥4.5:1
+            let tesla_orange = egui::Color32::from_rgb(0xa5, 0x38, 0x0a); // dark orange ≥5:1
             egui::Grid::new("live_breakdown").num_columns(2).striped(true).show(ui, |ui| {
                 ui.label("fixed cameras");
                 ui.colored_label(pal::ZINC_400, format!("{}", walk_live.count));
                 ui.end_row();
                 ui.label("rideshare dashcams");
-                ui.colored_label(pal::AMBER, format!("{}", walk_live.mobile_vehicle));
+                ui.colored_label(dashcam_amber, format!("{}", walk_live.mobile_vehicle));
                 ui.end_row();
                 ui.label("smart glasses");
                 ui.colored_label(pal::ZINC_300, format!("{}", walk_live.mobile_glasses));
                 ui.end_row();
                 ui.label("ACE buses");
-                ui.colored_label(pal::STEEL, format!("{}", walk_live.mobile_bus));
+                ui.colored_label(bus_blue, format!("{}", walk_live.mobile_bus));
                 ui.end_row();
                 if walk_live.mobile_robot > 0 {
                     ui.label("delivery robots");
@@ -1376,7 +1869,7 @@ fn result_route(
                 }
                 if walk_live.mobile_tesla > 0 {
                     ui.label("Tesla cameras");
-                    ui.colored_label(pal::ORANGE, format!("{}", walk_live.mobile_tesla));
+                    ui.colored_label(tesla_orange, format!("{}", walk_live.mobile_tesla));
                     ui.end_row();
                 }
             });
@@ -1574,32 +2067,109 @@ fn paint_time_bar(painter: &egui::Painter, rect: egui::Rect, time_of_day: f64) {
 /// The StoryMap UI: a "▶ Tutorial" launcher (bottom-left) when idle, and a floating
 /// caption bar with transport controls (bottom-center, clear of the right panel) while
 /// a tour plays. A separate egui pass from `ui_panel` so it owns no shared params.
-pub fn storymap_ui(mut contexts: EguiContexts, mut story: ResMut<crate::storymap::StoryMap>) {
+/// Fill `{cameras}` / `{cameras_raw}` / `{dashcams}` / `{minutes}` tokens in a step caption
+/// from the live result, so a reel caption quotes the real computed number (docs/REELS_PLAN
+/// G4). `{cameras}` prefers the direct-capture / walkshed headline, falling back to the A→B
+/// route count. Unresolved tokens (result not computed yet) render as "…" rather than raw
+/// braces. A caption with no `{` is returned untouched.
+fn fill_caption_tokens(
+    cap: &str,
+    walkshed: &WalkshedState,
+    route: &RouteState,
+    fac_dir: &crate::FacilityDirectory,
+    fac_sel: &crate::SelectedFacility,
+) -> String {
+    if !cap.contains('{') {
+        return cap.to_string();
+    }
+    // The Institutions view's selected place — its nearby-camera count feeds `{cameras}`
+    // (as a last fallback, since a reel is in exactly one mode at a time) and its name
+    // feeds `{place}`.
+    let facility = fac_sel.0.and_then(|i| fac_dir.pins.get(i));
+    let cameras = walkshed
+        .capture
+        .as_ref()
+        .map(|c| c.cameras_corrected)
+        .or_else(|| walkshed.summary.as_ref().map(|s| s.cameras_corrected))
+        .map(|v| v.round() as i64)
+        .or_else(|| route.summary.as_ref().map(|s| s.headline_devices as i64))
+        .or_else(|| facility.map(|f| f.cameras_near as i64));
+    let cameras_raw = walkshed
+        .capture
+        .as_ref()
+        .map(|c| c.cameras_raw)
+        .or_else(|| walkshed.summary.as_ref().map(|s| s.cameras_raw));
+    let dashcams =
+        walkshed.capture.as_ref().map(|_| walkshed.daily_dashcams.round().max(0.0) as u32);
+    let minutes = walkshed.summary.as_ref().map(|s| s.max_minutes);
+
+    let mut out = cap.to_string();
+    let mut sub = |tok: &str, val: Option<String>| {
+        if out.contains(tok) {
+            out = out.replace(tok, val.as_deref().unwrap_or("…"));
+        }
+    };
+    sub("{cameras}", cameras.map(|v| v.to_string()));
+    sub("{cameras_raw}", cameras_raw.map(|v| v.to_string()));
+    sub("{dashcams}", dashcams.map(crate::group_thousands));
+    sub("{minutes}", minutes.map(|v| format!("{v:.0}")));
+    sub("{place}", facility.map(|f| f.name.clone()));
+    out
+}
+
+pub fn storymap_ui(
+    mut contexts: EguiContexts,
+    mut story: ResMut<crate::storymap::StoryMap>,
+    reel: bevy::prelude::Res<crate::ReelMode>,
+    walkshed: bevy::prelude::Res<WalkshedState>,
+    route: bevy::prelude::Res<RouteState>,
+    ov: bevy::prelude::Res<OperatorsView>,
+    fac_dir: bevy::prelude::Res<crate::FacilityDirectory>,
+    fac_sel: bevy::prelude::Res<crate::SelectedFacility>,
+) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
     if !story.active {
+        // Reel mode auto-starts a story via ?story=; suppress the launch chrome so the
+        // pre-start frames stay clean.
+        if reel.0 {
+            return;
+        }
+        // Phone: the bottom edge belongs to the control sheet, so the launcher tucks
+        // under the date plate instead; desktop keeps it bottom-left over the map.
+        let (launch_align, launch_off) = if compact_ui(ctx) {
+            (egui::Align2::LEFT_TOP, egui::vec2(8.0, 60.0))
+        } else {
+            (egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+        };
         egui::Area::new(egui::Id::new("storymap-launch"))
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+            .anchor(launch_align, launch_off)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Primary CTA: inked in the editorial rust, paper text, squared — the
+                    // one filled button on the page.
                     let tut = ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("▶  Tutorial")
+                                egui::RichText::new("▶  Take the tour")
                                     .size(13.0)
                                     .strong()
-                                    .color(pal::ZINC_950),
+                                    .color(PAPER),
                             )
-                            .fill(pal::ORANGE),
+                            .fill(TERRACOTTA)
+                            .stroke(egui::Stroke::new(1.0, TERRACOTTA)),
                         )
                         .on_hover_text("Play a guided tour of the map");
                     if tut.clicked() {
                         story.start("Tutorial", crate::storymap::tutorial());
                     }
+                    // Secondary: a flat ghost button (the themed inactive style — paper + hairline).
                     let longi = ui
                         .add(egui::Button::new(
-                            egui::RichText::new("🕰  10 years").size(13.0).strong(),
+                            egui::RichText::new("A decade of watching")
+                                .size(13.0)
+                                .color(pal::ZINC_100),
                         ))
                         .on_hover_text(
                             "A longitudinal story: sparse 2015 → saturated today → the \
@@ -1614,42 +2184,96 @@ pub fn storymap_ui(mut contexts: EguiContexts, mut story: ResMut<crate::storymap
     }
     // Read the display values out before the mutating transport controls borrow `story`.
     let (idx, n, title) = (story.idx, story.steps.len(), story.title);
-    let caption = story.current().map(|s| s.caption).unwrap_or("");
+    let caption = fill_caption_tokens(
+        story.current().map(|s| s.caption).unwrap_or(""),
+        &walkshed,
+        &route,
+        &fac_dir,
+        &fac_sel,
+    );
     let paused = story.paused;
-    // Floating, anchored bottom-center but shifted left to clear the right panel.
+    // Floating, anchored bottom-center but shifted left to clear the right panel (no shift
+    // in reel mode, where the panel is hidden and the caption should sit dead-center).
+    // Exception: the Operators takeover bottom-anchors its per-column count labels, which
+    // would collide with a bottom caption — so in reel mode while that overlay is active the
+    // caption sits top-center instead (clear of the left-anchored date plate).
+    // Reel mode records a 9:16 frame watched on a phone, so the caption card is scaled up
+    // for legibility (bigger text, wider card, more padding). When the Operators takeover is
+    // up the card sits top-centre; the top offset clears the (also-enlarged) date plate.
+    let compact = compact_ui(ctx);
+    let (anchor_align, anchor_off) = if reel.0 && ov.active {
+        (egui::Align2::CENTER_TOP, egui::vec2(0.0, 150.0))
+    } else if reel.0 {
+        // Reel frames are watched inside Instagram/TikTok chrome, which overlays
+        // the bottom ~250 px (caption zone) and the right rail — lift the card
+        // well into the vertical safe area.
+        (egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -250.0))
+    } else if compact {
+        // Phone: no docked side panel to clear (x = 0), and the collapsed control
+        // sheet (~34 pt) owns the very bottom — float the caption just above it.
+        (egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -44.0))
+    } else {
+        (egui::Align2::CENTER_BOTTOM, egui::vec2(-170.0, -24.0))
+    };
+    // Reel type is sized for a phone held at arm's length: ~46 px body on the
+    // 1080-px frame (≈4.3% of frame width), not the desktop card's 14 px.
+    let (card_margin, card_radius, card_w, title_sz, gap, body_sz) = if reel.0 {
+        (egui::Margin::symmetric(30, 24), 3, 940.0, 24.0, 8.0, 46.0)
+    } else if compact {
+        let w = ctx.content_rect().width() - 16.0;
+        (egui::Margin::symmetric(12, 9), 2, w, 12.0, 2.0, 13.0)
+    } else {
+        (egui::Margin::symmetric(14, 10), 2, 560.0, 12.0, 2.0, 14.0)
+    };
+    // Reels get the dateline-stamp treatment (warm paper + firm ink hairline) so
+    // the card separates from the white map; interactive keeps the flat white card.
+    let (card_fill, card_stroke) = if reel.0 {
+        (
+            egui::Color32::from_rgba_unmultiplied(244, 241, 233, 248),
+            egui::Stroke::new(1.5, pal::ZINC_300),
+        )
+    } else {
+        (pal::ZINC_950, egui::Stroke::new(1.0, pal::ZINC_800))
+    };
     egui::Area::new(egui::Id::new("storymap-bar"))
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(-170.0, -18.0))
+        .anchor(anchor_align, anchor_off)
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(pal::ZINC_950)
-                .stroke(egui::Stroke::new(1.0, pal::ZINC_800))
-                .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(14, 10))
+                .fill(card_fill)
+                .stroke(card_stroke)
+                .corner_radius(card_radius)
+                .inner_margin(card_margin)
                 .show(ui, |ui| {
-                    ui.set_max_width(560.0);
+                    ui.set_max_width(card_w);
                     ui.label(
                         egui::RichText::new(format!("{title}  ·  {} / {n}", idx + 1))
                             .strong()
-                            .size(12.0)
-                            .color(pal::ORANGE),
+                            .size(title_sz)
+                            .color(TERRACOTTA),
                     );
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new(caption).size(14.0));
-                    ui.add_space(7.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(if paused { "▶  Play" } else { "⏸  Pause" }).clicked() {
-                            story.paused = !paused;
-                        }
-                        if ui.add_enabled(idx > 0, egui::Button::new("‹  Back")).clicked() {
-                            story.prev();
-                        }
-                        if ui.button("Next  ›").clicked() {
-                            story.next();
-                        }
-                        if ui.button("✕  Exit").clicked() {
-                            story.stop();
-                        }
-                    });
+                    ui.add_space(gap);
+                    // Reels: darkest ink, explicitly — the caption must read at a
+                    // glance on a phone; interactive keeps the theme's body color.
+                    let body = egui::RichText::new(caption).size(body_sz);
+                    ui.label(if reel.0 { body.color(pal::ZINC_100) } else { body });
+                    // Reel mode: caption only — no transport buttons in the recorded frame.
+                    if !reel.0 {
+                        ui.add_space(7.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(if paused { "▶  Play" } else { "⏸  Pause" }).clicked() {
+                                story.paused = !paused;
+                            }
+                            if ui.add_enabled(idx > 0, egui::Button::new("‹  Back")).clicked() {
+                                story.prev();
+                            }
+                            if ui.button("Next  ›").clicked() {
+                                story.next();
+                            }
+                            if ui.button("✕  Exit").clicked() {
+                                story.stop();
+                            }
+                        });
+                    }
                 });
         });
 }
@@ -1705,7 +2329,13 @@ pub fn institutions_panel(
     mut sel: ResMut<crate::SelectedFacility>,
     mut fly: ResMut<crate::CameraFly>,
     mut wants: ResMut<EguiWants>,
+    reel: Res<crate::ReelMode>,
 ) {
+    // Reel/clean-capture mode: the on-map markers + highlight + story caption carry the
+    // story, so suppress the left ranking panel (it would cover a third of the 9:16 frame).
+    if reel.0 {
+        return;
+    }
     if inst.t <= 0.001 {
         return;
     }
@@ -1713,13 +2343,21 @@ pub fn institutions_panel(
         return;
     };
     use sim_core::assets::FacilityKind;
-    const W: f32 = 292.0;
-    // Kind accent dots, matching the on-map markers (indigo school / teal library).
+    // Phone: the ranking panel takes (nearly) the full width under the date plate;
+    // desktop keeps the fixed 292-pt rail docked left.
+    #[allow(non_snake_case)]
+    let W: f32 = if compact_ui(ctx) { ctx.content_rect().width() - 32.0 } else { 292.0 };
+    // Kind accent dots, matching the on-map markers (indigo school / teal library /
+    // deep-green park / deep-rose plaza).
     let school_c = egui::Color32::from_rgb(0x43, 0x37, 0x8a);
     let library_c = egui::Color32::from_rgb(0x0d, 0x6b, 0x66);
+    let park_c = egui::Color32::from_rgb(0x16, 0x65, 0x34);
+    let plaza_c = egui::Color32::from_rgb(0x9d, 0x17, 0x4d);
     let kind_color = |k: FacilityKind| match k {
         FacilityKind::School => school_c,
         FacilityKind::Library => library_c,
+        FacilityKind::Park => park_c,
+        FacilityKind::Plaza => plaza_c,
     };
 
     // Slide in from off-screen-left to docked at x=16 (smoothstep on the view's `t`).
@@ -1727,13 +2365,16 @@ pub fn institutions_panel(
     let x = 16.0 - (1.0 - e) * (W + 28.0);
 
     egui::Area::new(egui::Id::new("institutions_panel"))
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(x, 92.0))
+        .anchor(
+            egui::Align2::LEFT_TOP,
+            egui::vec2(x, if compact_ui(ctx) { 56.0 } else { 92.0 }),
+        )
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(pal::ZINC_950)
                 .stroke(egui::Stroke::new(1.0, pal::ZINC_700))
                 .inner_margin(egui::Margin::same(14))
-                .corner_radius(10)
+                .corner_radius(2)
                 .show(ui, |ui| {
                     ui.set_width(W);
                     ui.horizontal(|ui| {
@@ -1749,9 +2390,12 @@ pub fn institutions_panel(
                         });
                     });
                     ui.label(
-                        egui::RichText::new("Schools & libraries, ranked by cameras within 200 m.")
-                            .size(12.0)
-                            .weak(),
+                        egui::RichText::new(
+                            "Schools, libraries, parks & plazas, ranked by cameras within 200 m \
+                             (parks/plazas measured at their centroid).",
+                        )
+                        .size(12.0)
+                        .weak(),
                     );
                     ui.add_space(6.0);
 
@@ -1760,6 +2404,8 @@ pub fn institutions_panel(
                     let mut types: Vec<(FacilityKind, &str, u32, f64)> = [
                         (FacilityKind::School, "Schools"),
                         (FacilityKind::Library, "Libraries"),
+                        (FacilityKind::Park, "Parks"),
+                        (FacilityKind::Plaza, "Plazas"),
                     ]
                     .iter()
                     .map(|&(k, label)| {
@@ -1793,7 +2439,8 @@ pub fn institutions_panel(
                     }
                     ui.add_space(4.0);
 
-                    // Per-class filter chips (also gate the on-map markers).
+                    // Per-class filter chips (also gate the on-map markers). Four short
+                    // labels fit one row at the panel width.
                     ui.horizontal(|ui| {
                         if ui.selectable_label(inst.show_schools, "Schools").clicked() {
                             inst.show_schools = !inst.show_schools;
@@ -1801,18 +2448,29 @@ pub fn institutions_panel(
                         if ui.selectable_label(inst.show_libraries, "Libraries").clicked() {
                             inst.show_libraries = !inst.show_libraries;
                         }
+                        if ui.selectable_label(inst.show_parks, "Parks").clicked() {
+                            inst.show_parks = !inst.show_parks;
+                        }
+                        if ui.selectable_label(inst.show_plazas, "Plazas").clicked() {
+                            inst.show_plazas = !inst.show_plazas;
+                        }
                     });
                     ui.add_space(4.0);
                     ui.separator();
 
                     // The ranked, filtered list — click a row to fly + highlight.
-                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    // Capped to the viewport too, so short/landscape phones keep the
+                    // header and the map peeking behind the panel.
+                    let list_h = (ui.ctx().content_rect().height() * 0.45).min(360.0);
+                    egui::ScrollArea::vertical().max_height(list_h).show(ui, |ui| {
                         let mut rank = 0u32;
                         for &i in &dir.ranked {
                             let Some(p) = dir.pins.get(i) else { continue };
                             let shown = match p.kind {
                                 FacilityKind::School => inst.show_schools,
                                 FacilityKind::Library => inst.show_libraries,
+                                FacilityKind::Park => inst.show_parks,
+                                FacilityKind::Plaza => inst.show_plazas,
                             };
                             if !shown {
                                 continue;
@@ -1892,12 +2550,14 @@ pub fn alpr_modal(
     };
     let Ok(ctx) = contexts.ctx_mut() else { return };
     let mut open = true;
+    let (m_align, m_off, m_max_w) = sensor_modal_geom(ctx);
     egui::Window::new("ALPR · license-plate reader")
         .open(&mut open)
         .resizable(false)
         .collapsible(false)
-        .default_width(284.0)
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(16.0, 92.0))
+        .default_width(284.0f32.min(m_max_w))
+        .max_width(m_max_w)
+        .anchor(m_align, m_off)
         .show(ctx, |ui| {
             // Maker headline (the stratify-by-operator key).
             let maker = pin.manufacturer.as_deref().unwrap_or("Unknown maker");
@@ -1941,6 +2601,16 @@ pub fn alpr_modal(
     }
 }
 
+/// Where a clicked-sensor provenance modal sits: docked top-left over the map on
+/// desktop; on a phone it centers under the date plate and clamps to the viewport.
+fn sensor_modal_geom(ctx: &egui::Context) -> (egui::Align2, egui::Vec2, f32) {
+    if compact_ui(ctx) {
+        (egui::Align2::CENTER_TOP, egui::vec2(0.0, 56.0), ctx.content_rect().width() - 16.0)
+    } else {
+        (egui::Align2::LEFT_TOP, egui::vec2(16.0, 92.0), f32::INFINITY)
+    }
+}
+
 /// Per-camera provenance modal for a clicked fixed CCTV — its census source (Amnesty
 /// crowdsource vs Dahir ML detection) plus a Google Street View deep-link (the exact
 /// Dahir panorama where it was detected, or the location otherwise). `SelectedCctv` is
@@ -1958,12 +2628,14 @@ pub fn cctv_modal(
     };
     let Ok(ctx) = contexts.ctx_mut() else { return };
     let mut open = true;
+    let (m_align, m_off, m_max_w) = sensor_modal_geom(ctx);
     egui::Window::new("CCTV · fixed camera")
         .open(&mut open)
         .resizable(false)
         .collapsible(false)
-        .default_width(284.0)
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(16.0, 92.0))
+        .default_width(284.0f32.min(m_max_w))
+        .max_width(m_max_w)
+        .anchor(m_align, m_off)
         .show(ctx, |ui| {
             let (title, gloss) = match pin.source {
                 CctvSource::Amnesty => (
@@ -2042,15 +2714,19 @@ pub fn coverage_overlay(
     let finished = cov_view.finished;
     let covered = cov.covered;
 
+    // Phone: clear the collapsed control sheet at the bottom edge; clamp the card.
+    let compact = compact_ui(ctx);
+    let hud_off = if compact { egui::vec2(0.0, -44.0) } else { egui::vec2(0.0, -24.0) };
+    let hud_w = if compact { ctx.content_rect().width() - 16.0 } else { 360.0 };
     egui::Area::new(egui::Id::new("coverage_hud"))
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+        .anchor(egui::Align2::CENTER_BOTTOM, hud_off)
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 236))
                 .inner_margin(egui::Margin::symmetric(16, 12))
-                .corner_radius(10)
+                .corner_radius(2)
                 .show(ui, |ui| {
-                    ui.set_max_width(360.0);
+                    ui.set_max_width(hud_w.min(360.0));
                     ui.spacing_mut().item_spacing.y = 5.0;
                     ui.label(
                         egui::RichText::new("ROVING COVERAGE")

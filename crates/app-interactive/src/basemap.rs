@@ -42,34 +42,35 @@ pub fn prefers_reduced_motion() -> bool {
 /// but only while the basemap is toggled on (`Params.basemap_on`). Visibility is
 /// pushed to the DOM only on change (idempotent, avoids per-frame DOM writes); when
 /// off we skip the view sync entirely so a hidden map does no work.
+///
+/// Throttled to ≤30 Hz during continuous motion: MapLibre's render loop is 60 Hz
+/// but feeding it every other frame is visually indistinguishable for a top-down
+/// ortho sync, and halves the JS interop + tile-fetch cost during gestures.
 pub fn sync_basemap(
     params: Res<crate::Params>,
     cam: Query<&Transform, With<Camera2d>>,
     mut last_visible: Local<Option<bool>>,
     mut last_view: Local<Option<(f32, f32, f32)>>,
+    mut frame_toggle: Local<bool>,
 ) {
-    // Hidden under the heatmap and the neighborhood choropleth too — both are density
-    // overviews that want a clean ground, and a translucent fill over the street basemap
-    // shows its building footprints through (the same artifact the Bevy footprints had).
     let want_visible = params.basemap_on
         && !params.heatmap_on
         && !(params.neighborhoods_on && params.choropleth_on);
     if *last_visible != Some(want_visible) {
         set_basemap_visible(want_visible);
         *last_visible = Some(want_visible);
-        *last_view = None; // force one push when (re)shown
+        *last_view = None;
     }
     if !want_visible {
         return;
     }
     let Ok(t) = cam.single() else { return };
-    // Only push to MapLibre when the camera actually moved. The clock-driven
-    // time-lapse moves agents, not the camera, so a viewer just watching the sim
-    // holds a static view — without this guard we'd call `map.jumpTo` every frame
-    // (a fresh JS object + a full MapLibre re-render each time), churning the JS heap
-    // and keeping the basemap busy forever. Gated, a static map goes idle.
     let view = (t.translation.x, t.translation.y, t.scale.x);
     if *last_view == Some(view) {
+        return;
+    }
+    *frame_toggle = !*frame_toggle;
+    if *frame_toggle {
         return;
     }
     *last_view = Some(view);

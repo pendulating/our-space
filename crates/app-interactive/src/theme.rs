@@ -113,37 +113,42 @@ pub mod map {
 /// The egui font family used for poster-weight headlines + the big "~N" number.
 pub const DISPLAY: &str = "display";
 
-/// Install Host Grotesk as egui's body face (Regular) and a separate `display`
-/// family (ExtraBold) — matching the web shell's `host-grotesk` Adobe Fonts set, so
-/// the in-canvas UI and the page chrome share one typographic voice. Call once,
-/// after the visuals are set.
+/// Install Parabolica as egui's body face (the Text optical cut, Regular) and a
+/// separate `display` family (the display cut, Bold) — matching the web shell's
+/// `parabolica-text` / `parabolica` Adobe Fonts set, so the in-canvas UI and the page
+/// chrome share one typographic voice. The TTF/OTF must be bundled (egui rasterizes its
+/// own glyphs and can't use the served web kit); these OTFs were extracted from the
+/// licensed desktop font. Call once, after the visuals are set.
 pub fn install_fonts(ctx: &egui::Context) {
     use std::sync::Arc;
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "host_grotesk".to_owned(),
+        "parabolica_text".to_owned(),
         Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/HostGrotesk-Regular.ttf"
+            "../assets/fonts/Parabolica-Text-Regular.otf"
         ))),
     );
     fonts.font_data.insert(
-        "host_grotesk_bold".to_owned(),
+        "parabolica_display".to_owned(),
         Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/HostGrotesk-ExtraBold.ttf"
+            "../assets/fonts/Parabolica-Bold.otf"
         ))),
     );
-    // Body: Host Grotesk Regular first in the proportional family (egui defaults
+    // Body: Parabolica Text Regular first in the proportional family (egui defaults
     // remain as fallback for any missing glyph).
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "host_grotesk".to_owned());
-    // Display: Host Grotesk ExtraBold, falling back to the regular cut for any
-    // missing glyph.
+        .insert(0, "parabolica_text".to_owned());
+    // Display: Parabolica Bold (the display optical cut), falling back to the text cut
+    // for any missing glyph.
     fonts.families.insert(
         egui::FontFamily::Name(DISPLAY.into()),
-        vec!["host_grotesk_bold".to_owned(), "host_grotesk".to_owned()],
+        vec![
+            "parabolica_display".to_owned(),
+            "parabolica_text".to_owned(),
+        ],
     );
     ctx.set_fonts(fonts);
 }

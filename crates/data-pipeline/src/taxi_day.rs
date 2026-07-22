@@ -45,6 +45,12 @@ const HW_PENALTY: f64 = 8.0;
 const SIG_D: f64 = 0.35;
 /// Surface free-flow speed (25 mph) — reference for calibrating the slowdown prior.
 const SURF_SPEED_MPS: f64 = 11.176;
+/// Surface-plausibility floor for the slowdown calibration. A long trip whose slowdown
+/// (`t_obs / (d/SURF_SPEED)`) is below this averaged faster than surface free-flow and
+/// almost certainly used a grade-separated road, so it's excluded from the *surface*
+/// congestion prior (otherwise it biases s0 low → over-attribution to highways). 0.9 ≈
+/// door-to-door average speed ≤ ~28 mph.
+const SURFACE_SLOWDOWN_FLOOR: f64 = 0.9;
 
 /// Shoelace area magnitude of a ring (to pick a zone's largest part).
 fn ring_area2(ring: &[[f64; 2]]) -> f64 {
@@ -100,6 +106,21 @@ fn route_vr(graph: &StreetGraph, a: u32, b: u32) -> Option<(VehicleRoute, Vec<u3
     }
     let (route, _t, edges) = graph.route_timed_pen(a, b, 1.0).ok()?;
     Some((route_to_vr(&route)?, edges))
+}
+
+/// The two farthest-apart endpoints (by node position) — a representative span for an
+/// intra-zone route. O(k²) over the ≤ `K_ENDPOINTS` reps; the ids are distinct nodes.
+fn farthest_pair(graph: &StreetGraph, eps: &[(u32, f64)]) -> (u32, u32) {
+    let mut best = (eps[0].0, eps[1].0, -1.0);
+    for i in 0..eps.len() {
+        for j in (i + 1)..eps.len() {
+            let d = graph.node_pos(eps[i].0).distance(graph.node_pos(eps[j].0));
+            if d > best.2 {
+                best = (eps[i].0, eps[j].0, d);
+            }
+        }
+    }
+    (best.0, best.1)
 }
 
 /// Per-node building mass: sum of nearby footprint areas (m²). This is the
@@ -298,15 +319,20 @@ pub fn bake(
         zone_bbox.insert(*loc, [x0, y0, x1, y1]);
     }
     // Assign each node to the (non-overlapping) zone whose largest ring contains it.
+    // Iterate zones in a fixed (sorted-by-id) order, not `HashMap` order: zones *should*
+    // partition space, but a rare overlap sliver in the real TLC geometry would otherwise
+    // resolve to whichever zone hashing visited first, making the bake non-reproducible.
+    let mut zone_bbox_sorted: Vec<(i64, [f64; 4])> = zone_bbox.iter().map(|(&l, &b)| (l, b)).collect();
+    zone_bbox_sorted.sort_by_key(|(l, _)| *l);
     let mut zone_node_list: HashMap<i64, Vec<u32>> = HashMap::new();
     for nid in 0..n_nodes as u32 {
         let p = graph.node_pos(nid);
-        for (loc, bb) in &zone_bbox {
+        for &(loc, bb) in &zone_bbox_sorted {
             if p.x < bb[0] || p.x > bb[2] || p.y < bb[1] || p.y > bb[3] {
                 continue;
             }
-            if point_in_ring(p, zone_ring[loc]) {
-                zone_node_list.entry(*loc).or_default().push(nid);
+            if point_in_ring(p, zone_ring[&loc]) {
+                zone_node_list.entry(loc).or_default().push(nid);
                 break;
             }
         }
@@ -357,14 +383,32 @@ pub fn bake(
     //    + a per-trip fallback). Phase B (trip assignment) builds per-combo
     //    candidate sets and infers each trip's route from its time + distance.
     let mut pairs: Vec<((i64, i64), u32)> = od_freq.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    // Frequency desc, then by O-D id as a total, deterministic tiebreak — otherwise
+    // equal-frequency pairs keep `HashMap` order, which (only) matters at the
+    // `MAX_OD_PAIRS` cut but makes route-index assignment non-reproducible regardless.
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut routes: Vec<VehicleRoute> = Vec::new();
     let mut route_edges: Vec<Vec<u32>> = Vec::new(); // edges per route, for sensing power
     let mut pair_centroid: HashMap<(i64, i64), u32> = HashMap::new();
     let (mut tried, mut no_path) = (0usize, 0usize);
     for ((pu, dolc), _freq) in pairs.iter().take(MAX_OD_PAIRS) {
-        let (Some(&from), Some(&to)) = (centroid_node.get(pu), centroid_node.get(dolc)) else {
-            continue;
+        // From/to for this pair's representative ("centroid") route. Inter-zone pairs use
+        // the two zones' centroid nodes. An INTRA-zone pair (pu == dolc) would route a
+        // centroid to itself — degenerate (from == to → no route) — which silently drops
+        // *every* within-zone trip (they're short, dense-core, and bias the neighborhood
+        // + coverage stats). Instead route between the zone's two farthest-apart sampled
+        // endpoints; Stage-4 per-trip endpoint sampling then gives most such trips their
+        // own within-zone route, with this as the fallback.
+        let (from, to) = if pu == dolc {
+            match endpoints.get(pu) {
+                Some(eps) if eps.len() >= 2 => farthest_pair(&graph, eps),
+                _ => continue, // zone has < 2 drive nodes — can't route within it
+            }
+        } else {
+            match (centroid_node.get(pu), centroid_node.get(dolc)) {
+                (Some(&f), Some(&t)) => (f, t),
+                _ => continue,
+            }
         };
         tried += 1;
         let Some((vr, edges)) = route_vr(&graph, from, to) else {
@@ -384,11 +428,21 @@ pub fn bake(
     // **long trips (> 2 mi)** — the only regime with a real highway alternative;
     // short trips are stop-start-dominated and would bias s0 far too high, pushing
     // the highway-vs-surface boundary out of the relevant range.
+    // Gated to long trips (> 2 mi — the highway-relevant regime) whose slowdown is at
+    // least SURFACE_SLOWDOWN_FLOOR, i.e. that plausibly stayed on surface streets. A long
+    // trip averaging faster than surface free-flow used a grade-separated road; including
+    // it would drag s0 below the true surface-congestion factor and push the
+    // highway/surface boundary toward over-attributing trips to highways. The reference
+    // (d / SURF_SPEED) matches how these surface trips actually travelled, so the prior
+    // and the g(s) likelihood in `infer_score` share a reference.
     let mut logs: Vec<f64> = Vec::new();
     for (_, _, _, _, miles, time_s) in &trips_raw {
         let (d, t) = (*miles as f64 * 1609.344, *time_s as f64);
         if d > 3200.0 && t > 120.0 {
-            logs.push((t / (d / SURF_SPEED_MPS)).clamp(0.3, 8.0).ln());
+            let slowdown = t / (d / SURF_SPEED_MPS);
+            if slowdown >= SURFACE_SLOWDOWN_FLOOR {
+                logs.push(slowdown.clamp(SURFACE_SLOWDOWN_FLOOR, 8.0).ln());
+            }
         }
     }
     let (ln_s0, tau) = if logs.len() > 100 {
@@ -400,7 +454,7 @@ pub fn bake(
         ((1.8f64).ln(), 0.55) // fallback prior when the CSV lacks miles/time
     };
     eprintln!(
-        "  congestion prior: s0={:.2}× typical slowdown, tau={:.2} (from {} trips)",
+        "  congestion prior: s0={:.2}× typical slowdown, tau={:.2} (from {} surface-plausible trips)",
         ln_s0.exp(),
         tau,
         logs.len()
@@ -464,27 +518,30 @@ pub fn bake(
                 match combo_cands.get(&(a, b)) {
                     Some(cands) if !cands.is_empty() => {
                         if d_m > 0.0 && t_obs > 0.0 {
-                            let best = cands.iter().max_by(|x, y| {
-                                infer_score(x.length_m, x.time_s, d_m, t_obs, ln_s0, tau).total_cmp(
-                                    &infer_score(y.length_m, y.time_s, d_m, t_obs, ln_s0, tau),
-                                )
-                            });
-                            match best {
-                                Some(c) => {
-                                    if cands.len() >= 2 {
-                                        let mph = d_m / t_obs * 2.2369;
-                                        if c.route_idx == cands[0].route_idx {
-                                            hw_n += 1;
-                                            hw_mph += mph;
-                                        } else {
-                                            surf_n += 1;
-                                            surf_mph += mph;
-                                        }
-                                    }
-                                    c.route_idx
+                            // Argmax of the inference score, keeping the *earlier* (faster)
+                            // candidate on a tie via strict `>`. `max_by` returns the last
+                            // element on ties, which would silently prefer the surface alt
+                            // when both candidates score equally (e.g. both underflow to 0).
+                            // cands[0] is the fastest (pen = 1.0).
+                            let mut best: Option<(&Cand, f64)> = None;
+                            for c in cands {
+                                let s = infer_score(c.length_m, c.time_s, d_m, t_obs, ln_s0, tau);
+                                if best.map_or(true, |(_, bs)| s > bs) {
+                                    best = Some((c, s));
                                 }
-                                None => centroid_ri,
                             }
+                            let c = best.expect("cands is non-empty").0;
+                            if cands.len() >= 2 {
+                                let mph = d_m / t_obs * 2.2369;
+                                if c.route_idx == cands[0].route_idx {
+                                    hw_n += 1;
+                                    hw_mph += mph;
+                                } else {
+                                    surf_n += 1;
+                                    surf_mph += mph;
+                                }
+                            }
+                            c.route_idx
                         } else {
                             cands[0].route_idx // no inference data → fastest
                         }
@@ -533,10 +590,21 @@ pub fn bake(
             .sum::<f64>()
             / s_total
     };
-    let n_for = |target: f64| -> f64 {
+    let covered = edge_trips.iter().filter(|&&c| c > 0).count();
+    // Coverage saturates at `covered/S` (the fraction of drive edges any route touches).
+    // A target above that ceiling is never reached, so `n_for` returns `None` rather than
+    // running the bisection out to its ~1e7 bound and reporting a fabricated trip count.
+    let ceiling = covered as f64 / s_total;
+    let n_for = |target: f64| -> Option<f64> {
+        if ceiling <= target {
+            return None;
+        }
         let (mut lo, mut hi) = (1.0f64, 2.0f64);
         while cov(hi) < target && hi < 1e7 {
             hi *= 2.0;
+        }
+        if cov(hi) < target {
+            return None; // didn't reach the target within the search bound
         }
         for _ in 0..40 {
             let mid = (lo + hi) / 2.0;
@@ -546,24 +614,26 @@ pub fn bake(
                 hi = mid;
             }
         }
-        (lo + hi) / 2.0
+        Some((lo + hi) / 2.0)
     };
-    let covered = edge_trips.iter().filter(|&&c| c > 0).count();
     eprintln!(
         "  sensing power (O'Keeffe) over {} drive segments (full fleet of {} trips senses \
          {covered} = {:.0}% — the asymptotic ceiling):",
         graph.edge_count(),
         trips.len(),
-        100.0 * covered as f64 / s_total
+        100.0 * ceiling
     );
     for n in [1u32, 5, 10, 30, 100, 300, 1000, 3000] {
         eprintln!("    N={n:>4} random trips → {:.1}% of streets sensed/day", cov(n as f64) * 100.0);
     }
     let (n13, n12) = (n_for(1.0 / 3.0), n_for(0.5));
     eprintln!(
-        "    ⅓ at ~{n13:.0} trips (~{:.0} FHV-days @27 trips/day); ½ at ~{n12:.0} trips \
-         [O'Keeffe anchor: ~10 random taxis ≈ ⅓]",
-        n13 / 27.0
+        "    ⅓ at {}; ½ at {} [O'Keeffe anchor: ~10 random taxis ≈ ⅓]",
+        n13.map_or_else(
+            || "not reached (coverage plateaus below ⅓)".to_string(),
+            |v| format!("~{v:.0} trips (~{:.0} FHV-days @27 trips/day)", v / 27.0),
+        ),
+        n12.map_or_else(|| "not reached".to_string(), |v| format!("~{v:.0} trips")),
     );
 
     trips.sort_by(|a, b| a.pu_min.total_cmp(&b.pu_min));
@@ -607,8 +677,10 @@ pub fn bake(
             segments_total: graph.edge_count() as u32,
             segments_sensed: covered as u32,
             trips_total: m as u32,
-            n_third: n13.round() as u32,
-            n_half: n12.round() as u32,
+            // 0 = target unreachable (coverage plateaus below it); the UI treats
+            // `n_third == 0` as "hide the sensing-power headline".
+            n_third: n13.map_or(0, |v| v.round() as u32),
+            n_half: n12.map_or(0, |v| v.round() as u32),
             trips_per_vehicle_day: 27,
         },
     };
@@ -618,4 +690,44 @@ pub fn bake(
         "taxi day {date}: {nt} trips, {nr} routes ({no_path}/{tried} no-path), {no} od-minute rows -> {out_path}"
     );
     Ok(nt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_score_guards_return_zero() {
+        // Degenerate candidate / trip inputs → zero likelihood (no NaN, no divide blow-up).
+        assert_eq!(infer_score(1000.0, 0.5, 1000.0, 100.0, 0.47, 0.5), 0.0); // t_r ≤ 1
+        assert_eq!(infer_score(1000.0, 90.0, 0.0, 100.0, 0.47, 0.5), 0.0); // d_m ≤ 0
+        assert_eq!(infer_score(1000.0, 90.0, 1000.0, 0.0, 0.47, 0.5), 0.0); // t_obs ≤ 0
+    }
+
+    // The load-bearing property of the route inference: the slowdown term must attribute a
+    // trip that's too fast for surface streets to the highway candidate, and a congested
+    // trip to the surface candidate. Same 5 km O-D, two travel times.
+    const LN_S0: f64 = 0.470_003_6; // ln(1.6): a typical ~1.6× congestion slowdown
+    const TAU: f64 = 0.5;
+    // Surface candidate: ~same length, 25 mph free-flow. Highway: slightly longer, ~56 mph.
+    fn surf_score(d: f64, t: f64) -> f64 {
+        infer_score(5000.0, 5000.0 / SURF_SPEED_MPS, d, t, LN_S0, TAU)
+    }
+    fn hw_score(d: f64, t: f64) -> f64 {
+        infer_score(5200.0, 5200.0 / 25.0, d, t, LN_S0, TAU)
+    }
+
+    #[test]
+    fn fast_trip_prefers_highway_candidate() {
+        // 5 km in 300 s ≈ 37 mph — impossible on surface streets.
+        let (surf, hw) = (surf_score(5000.0, 300.0), hw_score(5000.0, 300.0));
+        assert!(hw > surf, "fast trip should favor highway: hw={hw}, surf={surf}");
+    }
+
+    #[test]
+    fn slow_trip_prefers_surface_candidate() {
+        // Same O-D in 600 s ≈ 19 mph — congested surface, not a highway.
+        let (surf, hw) = (surf_score(5000.0, 600.0), hw_score(5000.0, 600.0));
+        assert!(surf > hw, "slow trip should favor surface: surf={surf}, hw={hw}");
+    }
 }

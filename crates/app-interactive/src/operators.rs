@@ -29,9 +29,11 @@ const CHIP_FILL: f32 = 0.86;
 /// when building the true-count rideshare column from the full fleet.
 const DATA_COL_MAX_DUR_MIN: f32 = 240.0;
 /// Progress at which a sensor's *appearance* morphs from its on-map mark (the branded
-/// wordmark / moving icon) to the solid bar-graph chip. Keeping the texture for the
-/// first half means the markers fly off the map looking like themselves, then change to
-/// the stacked-chart shape mid-flight (rather than turning into squares on click).
+/// wordmark / moving icon) to the solid bar-graph chip, on the *forward* flight only.
+/// Keeping the texture for the first half means the markers fly off the map looking like
+/// themselves, then change to the stacked-chart shape mid-flight (rather than turning into
+/// squares on click). The *reverse* flight ignores this and reverts to the branded mark at
+/// the start of the return (see `operators_chip_material`), so chips fly home as themselves.
 const CHIP_MORPH_T: f32 = 0.5;
 /// Half-width (in progress units) of the dissolve window around `CHIP_MORPH_T`, and the
 /// dimmest alpha at the swap instant. The mark briefly fades as it crosses the swap so
@@ -297,11 +299,18 @@ impl ColLayout {
     }
 }
 
-/// The current column layout. Rebuilt on enter and on window resize while active.
+/// The current column layout. Rebuilt on enter, on window resize while active, and when
+/// the set of `OperatorMesh` entities changes — the last case matters because the
+/// true-count rideshare column is spawned via deferred `Commands` and only becomes
+/// queryable a frame or two after the takeover opens; without re-checking, a layout latched
+/// before it arrives would leave RIDESHARE with no lane (a flaky, timing-dependent drop).
 #[derive(Resource, Default)]
 pub struct OperatorsLayout {
     pub built: bool,
     pub win: Vec2,
+    /// Number of `OperatorMesh` entities the current layout was built from (fixed-camera
+    /// meshes + the rideshare data column); a change forces a rebuild.
+    pub meshes_seen: usize,
     /// Shared chip half-size in the tower (world meters).
     pub chip_half: f32,
     /// Meters per CSS pixel of the frozen camera (sizes world-space header text).
@@ -467,8 +476,11 @@ pub fn operators_layout(
     }
     let Ok(win) = windows.single() else { return };
     let size = Vec2::new(win.width(), win.height());
-    // Keep the existing layout while flying home; rebuild on resize only while active.
-    if layout.built && (!ov.active || layout.win == size) {
+    let mesh_count = fixed.iter().count();
+    // Keep the existing layout while flying home; rebuild on resize, or when the
+    // `OperatorMesh` set changes while active (the deferred-spawned rideshare column
+    // arriving a frame late — otherwise its lane would be silently dropped).
+    if layout.built && (!ov.active || (layout.win == size && layout.meshes_seen == mesh_count)) {
         return;
     }
     let Ok(cam_t) = cam.single() else { return };
@@ -546,6 +558,7 @@ pub fn operators_layout(
 
     layout.built = true;
     layout.win = size;
+    layout.meshes_seen = mesh_count;
 }
 
 /// Fly the fixed-camera chips between their map homes and column slots by
@@ -615,14 +628,15 @@ pub fn operators_build_data_columns(
         *last_active = false;
         return;
     }
-    if ov.active == *last_active {
-        return; // build only on the enter edge
-    }
-    *last_active = ov.active;
-    if !ov.active || !existing.is_empty() {
+    if !ov.active {
+        *last_active = false; // reset so the next activation rebuilds
         return;
     }
-    let Some(sim) = sim.as_ref() else { return };
+    if *last_active || !existing.is_empty() {
+        return; // this activation already built its column
+    }
+    let Some(sim) = sim.as_ref() else { return }; // world not ready — retry next frame
+    *last_active = true; // this activation is now handled
 
     // Position every active taxi trip from data (the full fleet) at the frozen minute.
     let now = (clock.time_of_day * 60.0) as f32;
@@ -873,12 +887,16 @@ pub fn operators_chip_material(
     // every frame the dissolve is mid-fade.
     mut last: Local<(Option<bool>, f32)>,
 ) {
-    // Drive the icon→chip morph off animation *progress*: the marks keep their map
-    // appearance through the first half of the flight, then swap to solid chips at the
-    // midpoint (`CHIP_MORPH_T`) — with a brief alpha dissolve around that instant so the
-    // wordmark→square change cross-fades instead of popping.
-    let solid = ov.t >= CHIP_MORPH_T;
-    let dim = morph_dissolve(ov.t);
+    // Drive the icon→chip morph off animation *progress*: on the *forward* flight the
+    // marks keep their map appearance through the first half, then swap to solid chips at
+    // the midpoint (`CHIP_MORPH_T`) — with a brief alpha dissolve around that instant so
+    // the wordmark→square change cross-fades instead of popping. On the *reverse* flight
+    // we snap the chips straight back to their branded labels at the *start* of the
+    // return (no in-flight morph, no dissolve), so they fly home already looking like
+    // themselves rather than turning back into wordmarks mid-air.
+    let reverse = ov.dir < 0.0;
+    let solid = !reverse && ov.t >= CHIP_MORPH_T;
+    let dim = if reverse { 1.0 } else { morph_dissolve(ov.t) };
     let (last_solid, last_dim) = *last;
     // Outside the dissolve window `dim` is a constant 1.0, so this still no-ops every
     // frame except the swap edge; inside it we update per-frame to run the fade.
@@ -923,9 +941,10 @@ pub fn operators_chip_material(
     }
 }
 
-/// Same idea for the mobile chips: peds (glasses) → solid META slate and buses →
-/// solid MTA steel in the tower, restoring their moving-icon texture on the map.
-/// (Vehicles are already a solid clay that matches RIDESHARE, so they're left be.)
+/// Same idea for the mobile chips: each icon-textured mobile class cross-dissolves
+/// to its solid operator ink in the tower (glasses → META, buses → MTA, rideshare
+/// cars → RIDESHARE, Teslas → TESLA), restoring the moving icon on the map.
+/// (Robots never fly to a tower — they're excluded from the Operators view.)
 pub fn operators_mobile_material(
     ov: Res<OperatorsView>,
     pool: Res<AgentPool>,
@@ -933,10 +952,12 @@ pub fn operators_mobile_material(
     mut last: Local<(Option<bool>, f32)>,
 ) {
     // Same midpoint morph + dissolve as the fixed chips (see `operators_chip_material`):
-    // peds and buses keep their moving icons through the first half of the flight, then
-    // cross-dissolve to solid META/MTA chips around `CHIP_MORPH_T`.
-    let solid = ov.t >= CHIP_MORPH_T;
-    let dim = morph_dissolve(ov.t);
+    // forward, peds and buses keep their moving icons through the first half of the
+    // flight, then cross-dissolve to solid META/MTA chips around `CHIP_MORPH_T`. Reverse
+    // snaps them straight back to their moving icons at the start of the return flight.
+    let reverse = ov.dir < 0.0;
+    let solid = !reverse && ov.t >= CHIP_MORPH_T;
+    let dim = if reverse { 1.0 } else { morph_dissolve(ov.t) };
     let (last_solid, last_dim) = *last;
     if last_solid == Some(solid) && (dim - last_dim).abs() < 1e-3 {
         return;
@@ -945,6 +966,8 @@ pub fn operators_mobile_material(
     for (mat_handle, icon, chip) in [
         (&pool.ped_mat, &pool.glasses_icon, OperatorCol::Meta),
         (&pool.bus_mat, &pool.bus_icon, OperatorCol::Mta),
+        (&pool.veh_mat, &pool.taxi_icon, OperatorCol::Rideshare),
+        (&pool.tesla_mat, &pool.tesla_icon, OperatorCol::Tesla),
     ] {
         if let Some(m) = materials.get_mut(mat_handle) {
             if solid {

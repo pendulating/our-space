@@ -8,13 +8,15 @@
 
 use crate::assets::{DashcamFieldLayer, RobotabilityField, TeslaField};
 use crate::exposure::{ExposureTally, SourceKind};
-use crate::geometry::{captures, FrustumWedge, OccluderEdge};
+use crate::geometry::FrustumWedge;
+use crate::occlusion::OccluderIndex;
 use crate::graph::Route;
 use crate::math::{point_segment_distance, Vec2};
 use crate::mobile::{
     bus_headway_minutes, pedestrian_multiplier, robot_activity_multiplier, traffic_multiplier,
     MobileScenario, RealDayRates,
 };
+use crate::spatial::{AceGrid, SensorIndex};
 
 /// A placed fixed sensor ready for capture testing.
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +35,15 @@ pub struct SensorInstance {
     /// — confirmed groups count at face value; street-view-CCTV-only groups keep the
     /// recall inflation.
     pub confirmed: bool,
+    /// The building footprint this camera's apex sits **inside**, if any
+    /// ([`crate::occlusion::OccluderIndex::containing_polygon`]).
+    ///
+    /// A facade-mounted camera looks **out** from its host building, so that building must not
+    /// occlude it. Without this, every ray from such a camera crosses its own walls and it is
+    /// silently blind in all directions. `None` for the overwhelming majority (measured: 27 of
+    /// 31,108 sensors, 0.09%) — but the failure is invisible when it happens, which is exactly
+    /// why it is carried explicitly rather than assumed away.
+    pub host_poly: Option<u32>,
 }
 
 /// Parameters for a simulation run.
@@ -57,16 +68,16 @@ impl Default for SimParams {
 
 /// Simulate fixed-sensor exposure only (mobile classes disabled).
 ///
-/// `occluders` should be pre-filtered to walls near the route (e.g. via an
-/// R-tree) by the caller; passing the full set is fine for small scenes.
+/// `occ` is the citywide building-footprint occlusion index; pass
+/// [`OccluderIndex::empty`] for a free-space (no-occlusion) run.
 pub fn simulate_fixed(
     route: &Route,
     sensors: &[SensorInstance],
-    occluders: &[OccluderEdge],
+    occ: &OccluderIndex,
     params: SimParams,
 ) -> ExposureTally {
     simulate_full(
-        route, sensors, occluders, &MobileScenario::default(), params, 12.0, None, None, None, None,
+        route, sensors, occ, &MobileScenario::default(), params, 12.0, None, None, None, None, None, None,
     )
 }
 
@@ -77,11 +88,18 @@ pub fn simulate_fixed(
 /// each tick, accumulate fixed captures (in-FOV + line-of-sight) and mobile
 /// encounter intensities (ACE corridor proximity, dashcam/glasses fields), with
 /// the hour-of-day scaling bus headways, traffic, and foot traffic.
+///
+/// `sensor_index` (when provided) spatially culls the fixed-camera inner loop to
+/// only sensors within range of the walker, giving 100–500× fewer wedge tests on
+/// typical routes. Pass `None` for the unindexed (linear-scan) path.
+///
+/// `ace_grid` (when provided) spatially culls the ACE corridor distance check to
+/// only segments near the walker, avoiding a linear scan over all segments per tick.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_full(
     route: &Route,
     fixed: &[SensorInstance],
-    occluders: &[OccluderEdge],
+    occ: &OccluderIndex,
     mobile: &MobileScenario,
     params: SimParams,
     departure_hour: f64,
@@ -89,6 +107,8 @@ pub fn simulate_full(
     robot_field: Option<&RobotabilityField>,
     tesla_field: Option<&TeslaField>,
     real: Option<&RealDayRates>,
+    sensor_index: Option<&SensorIndex>,
+    ace_grid: Option<&AceGrid>,
 ) -> ExposureTally {
     let mut tally = ExposureTally::new();
     tally.recall_factor = params.recall_factor;
@@ -108,20 +128,40 @@ pub fn simulate_full(
 
         // --- fixed cameras ---
         let mut covered_here = false;
-        for s in fixed {
-            if captures(&s.wedge, *pos, occluders) {
-                tally.record_fixed_capture(s.kind, s.id, s.group, s.confirmed, s.frame_rate, tick_dt);
-                covered_here = true;
+        if let Some(idx) = sensor_index {
+            for si in idx.candidates(*pos) {
+                let s = &fixed[si];
+                if s.wedge.covers_unoccluded(*pos) && !occ.blocked(s.wedge.apex, *pos, s.host_poly) {
+                    tally.record_fixed_capture(s.kind, s.id, s.group, s.confirmed, s.frame_rate, tick_dt);
+                    covered_here = true;
+                }
+            }
+        } else {
+            for s in fixed {
+                if s.wedge.covers_unoccluded(*pos) && !occ.blocked(s.wedge.apex, *pos, s.host_poly) {
+                    tally.record_fixed_capture(s.kind, s.id, s.group, s.confirmed, s.frame_rate, tick_dt);
+                    covered_here = true;
+                }
             }
         }
 
         // --- ACE buses: encounter only while within a corridor's curb reach ---
         if let Some(ace) = &mobile.ace {
-            let nearest = ace
-                .segments
-                .iter()
-                .map(|[a, b]| point_segment_distance(*pos, *a, *b))
-                .fold(f64::INFINITY, f64::min);
+            let nearest = match ace_grid {
+                Some(grid) => grid
+                    .candidates_at(*pos)
+                    .iter()
+                    .map(|&si| {
+                        let [a, b] = ace.segments[si];
+                        point_segment_distance(*pos, a, b)
+                    })
+                    .fold(f64::INFINITY, f64::min),
+                None => ace
+                    .segments
+                    .iter()
+                    .map(|[a, b]| point_segment_distance(*pos, *a, *b))
+                    .fold(f64::INFINITY, f64::min),
+            };
             if nearest <= ace.capture_range_m {
                 // Real timetable headway for this minute when available, else synthetic.
                 let headway_min = real.map_or_else(|| bus_headway_minutes(hour), |r| r.ace_headway_at(hour));
@@ -210,7 +250,7 @@ pub fn exposure_rates_per_minute(
     point: Vec2,
     hour: f64,
     nearby_fixed: &[SensorInstance],
-    occluders: &[OccluderEdge],
+    occ: &OccluderIndex,
     near_ace: bool,
     mobile: &MobileScenario,
     recall_factor: f64,
@@ -225,7 +265,7 @@ pub fn exposure_rates_per_minute(
     // once), recall-inflating only CCTV-census-only (unconfirmed) groups.
     let mut groups: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
     for s in nearby_fixed {
-        if captures(&s.wedge, point, occluders) {
+        if s.wedge.covers_unoccluded(point) && !occ.blocked(s.wedge.apex, point, s.host_poly) {
             let e = groups.entry(s.group).or_insert(false);
             *e = *e || s.confirmed;
         }
@@ -283,6 +323,7 @@ mod tests {
             kind: SourceKind::FixedCctv,
             group: 1,
             confirmed: false,
+            host_poly: None,
         }
     }
 
@@ -291,7 +332,7 @@ mod tests {
         let route = straight_route();
         // Camera 5 m north of the path at x=10, looking south (heading 180).
         let cam = cam_at(10.0, 5.0, 180.0);
-        let t = simulate_fixed(&route, &[cam], &[], SimParams::default());
+        let t = simulate_fixed(&route, &[cam], &OccluderIndex::empty(), SimParams::default());
         let s = t.source(SourceKind::FixedCctv);
         assert_eq!(s.devices, 1.0);
         assert!(s.frames > 0.0);
@@ -309,7 +350,7 @@ mod tests {
             a: Vec2::new(0.0, 2.5),
             b: Vec2::new(20.0, 2.5),
         }];
-        let t = simulate_fixed(&route, &[cam], &wall, SimParams::default());
+        let t = simulate_fixed(&route, &[cam], &OccluderIndex::from_edges(&wall, crate::occlusion::DEFAULT_CELL_M), SimParams::default());
         let s = t.source(SourceKind::FixedCctv);
         assert_eq!(s.devices, 0.0);
         assert_eq!(s.frames, 0.0);
@@ -325,7 +366,7 @@ mod tests {
             SensorInstance { id: 2, group: 2, ..cam_at(13.0, -5.0, 0.0) },
         ];
         let params = SimParams { recall_factor: 1.0 / DAHIR_RECALL, ..SimParams::default() };
-        let t = simulate_fixed(&route, &cams, &[], params);
+        let t = simulate_fixed(&route, &cams, &OccluderIndex::empty(), params);
         assert_eq!(t.source(SourceKind::FixedCctv).devices, 2.0);
         // 2 detected -> ~3 with recall correction (2 * 1.587 = 3.17 -> 3).
         assert_eq!(t.headline_device_count(), 3);
@@ -338,7 +379,7 @@ mod tests {
         let ace = AceConfig::new(vec![[Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0)]]);
         let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None, robots: None, tesla: None };
         let dev = |hour| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, None)
+            simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), hour, None, None, None, None, None, None)
                 .source(SourceKind::AceBus)
                 .devices
         };
@@ -354,7 +395,7 @@ mod tests {
         // Corridor 100 m away — beyond the 20 m capture range.
         let ace = AceConfig::new(vec![[Vec2::new(0.0, 100.0), Vec2::new(20.0, 100.0)]]);
         let mobile = MobileScenario { ace: Some(ace), dashcam: None, glasses: None, robots: None, tesla: None };
-        let t = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.0, None, None, None, None);
+        let t = simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), 8.0, None, None, None, None, None, None);
         assert_eq!(t.source(SourceKind::AceBus).devices, 0.0);
     }
 
@@ -368,10 +409,10 @@ mod tests {
             robots: None,
             tesla: None,
         };
-        let peak = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 8.5, None, None, None, None)
+        let peak = simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), 8.5, None, None, None, None, None, None)
             .source(SourceKind::Dashcam)
             .devices;
-        let night = simulate_full(&route, &[], &[], &mobile, SimParams::default(), 3.0, None, None, None, None)
+        let night = simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), 3.0, None, None, None, None, None, None)
             .source(SourceKind::Dashcam)
             .devices;
         assert!(night > 0.0);
@@ -383,7 +424,7 @@ mod tests {
         // Camera at (0,5) looking south covers the origin (5 m away, in range).
         let cam = cam_at(0.0, 5.0, 180.0);
         let fixed_only =
-            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &[], false, &MobileScenario::default(), 1.0, None, None, None, None);
+            exposure_rates_per_minute(Vec2::ZERO, 12.0, &[cam], &OccluderIndex::empty(), false, &MobileScenario::default(), 1.0, None, None, None, None);
         assert!((fixed_only.fixed - 1.0).abs() < 1e-9, "one covering camera, got {}", fixed_only.fixed);
         assert_eq!(fixed_only.ace, 0.0);
 
@@ -395,7 +436,7 @@ mod tests {
             tesla: None,
         };
         let with_mobile =
-            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &[], true, &mobile, 1.0, None, None, None, None);
+            exposure_rates_per_minute(Vec2::ZERO, 8.0, &[cam], &OccluderIndex::empty(), true, &mobile, 1.0, None, None, None, None);
         assert!(with_mobile.ace > 0.0 && with_mobile.dashcam > 0.0);
         assert!(with_mobile.total() > fixed_only.total());
     }
@@ -411,7 +452,7 @@ mod tests {
         ace_headway_min[3 * 60] = 40.0;
         let real = RealDayRates { ace_headway_min, taxi_traffic_mult: Vec::new() };
         let dev = |hour: f64| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, Some(&real))
+            simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), hour, None, None, None, Some(&real), None, None)
                 .source(SourceKind::AceBus)
                 .devices
         };
@@ -430,7 +471,7 @@ mod tests {
             tesla: None,
         };
         let dev = |hour: f64| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, None)
+            simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), hour, None, None, None, None, None, None)
                 .source(SourceKind::DeliveryRobot)
                 .devices
         };
@@ -450,7 +491,7 @@ mod tests {
             tesla: Some(TeslaConfig::default()),
         };
         let dev = |hour: f64| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, None)
+            simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), hour, None, None, None, None, None, None)
                 .source(SourceKind::TeslaCamera)
                 .devices
         };
@@ -469,7 +510,7 @@ mod tests {
         taxi_traffic_mult[4 * 60] = 0.05;
         let real = RealDayRates { ace_headway_min: Vec::new(), taxi_traffic_mult };
         let dev = |hour: f64| {
-            simulate_full(&route, &[], &[], &mobile, SimParams::default(), hour, None, None, None, Some(&real))
+            simulate_full(&route, &[], &OccluderIndex::empty(), &mobile, SimParams::default(), hour, None, None, None, Some(&real), None, None)
                 .source(SourceKind::Dashcam)
                 .devices
         };

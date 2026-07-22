@@ -50,7 +50,10 @@ struct AmnestyRow {
 #[derive(Deserialize)]
 struct DahirRow {
     panoid: String,
-    heading: f64,
+    // NOTE: the CSV's `heading` column (the GSV capture bearing) is intentionally
+    // not read -- it is the car->camera view direction, not the camera's own facing,
+    // so it is not a usable FOV heading (see the push site below). Extra CSV columns
+    // are ignored by the deserializer.
     lat: f64,
     lon: f64,
     city: String,
@@ -127,7 +130,15 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str, extent: Extent) 
         cameras.push(CctvCamera {
             x: p.x,
             y: p.y,
-            heading_deg: Some(row.heading), // Dahir carries a GSV capture bearing
+            // Dahir's `heading` is the GSV CAPTURE bearing -- the direction the Street
+            // View car looked to see the camera (car->camera view direction), NOT the
+            // camera's own facing. A facade camera faces roughly the opposite way, so
+            // treating it as the FOV heading points ~260 wedges into their host
+            // buildings. The camera's true facing is unknown, so we omit it: an unknown
+            // heading renders an omnidirectional disc, consistent with the rest of the
+            // CCTV layer (Amnesty is also headingless) and the paper's disclosure that a
+            // street-view census does not recover per-camera bearing.
+            heading_deg: None,
             source: CctvSource::Dahir,
             panoid: Some(row.panoid),
             year: row.year,
@@ -148,8 +159,10 @@ pub fn bake(amnesty_csv: &str, dahir_csv: &str, out_path: &str, extent: Extent) 
             license: "Amnesty data CC BY-NC-ND 4.0 (non-commercial use, attributed); Dahir et al. CC BY 4.0".into(),
             as_of: "Amnesty 2021–22 survey (GSV 2019–20) · Dahir 2025".into(),
             notes: "Per-intersection median camera counts (Amnesty) placed omnidirectional at the \
-                    panorama point, plus Dahir detections >50 m from any Amnesty camera-bearing \
-                    intersection. Sample-point estimates, not surveyed device coordinates."
+                    panorama point, plus Dahir detections >50 m from any Amnesty camera-reporting \
+                    intersection -- also omnidirectional, as Dahir's Street-View capture bearing is \
+                    the car->camera view direction, not the camera's own facing. Sample-point \
+                    estimates, not surveyed device coordinates."
                 .into(),
         },
     };

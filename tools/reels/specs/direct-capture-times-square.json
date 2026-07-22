@@ -1,0 +1,17 @@
+{
+  "id": "direct-capture-times-square",
+  "title": "The cameras pointed straight at Times Square",
+  "size": [1080, 1920],
+  "fps": 30,
+  "poster": 6.5,
+  "steps": [
+    { "action": "Overview", "secs": 1.5,
+      "caption": "These are the cameras aimed straight at one spot, not just the ones nearby." },
+    { "action": "FlyTo", "lat": 40.7580, "lon": -73.9855, "zoom": 2.0, "secs": 2.5,
+      "caption": "Times Square. A public plaza, densely watched." },
+    { "action": "DirectCapture", "lat": 40.7580, "lon": -73.9855, "secs": 5.0,
+      "caption": "Each cone is a fixed camera whose field of view frames this exact spot." },
+    { "action": "Caption", "secs": 3.5,
+      "caption": "~{dashcams} rideshare dashcams also pass and record it every day, far more than the fixed cameras. (A model estimate.)" }
+  ]
+}

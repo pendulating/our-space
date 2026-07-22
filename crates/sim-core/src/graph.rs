@@ -8,6 +8,7 @@ use crate::rng::RngLike;
 use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
+use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -56,7 +57,11 @@ pub fn unpack_class(segment_id: Option<i64>) -> (i64, i64) {
 /// graph without road classes. Always capped at [`MAX_DRIVE_SPEED_MPS`].
 pub fn class_speed_mps(segment_id: Option<i64>) -> f64 {
     let (rw, posted_mph) = unpack_class(segment_id);
-    let mph = if posted_mph > 0 {
+    // Trust the packed posted limit only in a plausible NYC range. The OSM builder path
+    // historically stored raw way-ids in `segment_id`, which this decoder would otherwise
+    // read as a garbage 1–99 mph "posted limit" on every edge; out-of-range values fall
+    // back to the per-class default instead.
+    let mph = if (15..=65).contains(&posted_mph) {
         posted_mph as f64 // segment's own posted limit
     } else {
         match rw {
@@ -77,6 +82,30 @@ pub struct StreetGraph {
     asset: GraphAsset,
     /// Undirected graph; edge weight = index into `asset.edges`.
     g: UnGraph<(), usize>,
+    /// R-tree over node positions for O(log n) nearest-node queries.
+    node_tree: RTree<NodePoint2D>,
+    /// CSR graph for fast distance-based A* routing (5–10× faster than petgraph).
+    fast_graph: fast_paths::FastGraph,
+}
+
+struct NodePoint2D {
+    pos: [f64; 2],
+    id: u32,
+}
+
+impl RTreeObject for NodePoint2D {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_point(self.pos)
+    }
+}
+
+impl PointDistance for NodePoint2D {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        let dx = self.pos[0] - point[0];
+        let dy = self.pos[1] - point[1];
+        dx * dx + dy * dy
+    }
 }
 
 impl StreetGraph {
@@ -89,11 +118,28 @@ impl StreetGraph {
         for (i, e) in asset.edges.iter().enumerate() {
             g.add_edge(NodeIndex::new(e.from as usize), NodeIndex::new(e.to as usize), i);
         }
+        let node_tree = RTree::bulk_load(
+            positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| NodePoint2D { pos: [p.x, p.y], id: i as u32 })
+                .collect(),
+        );
+        let mut input_graph = fast_paths::InputGraph::new();
+        for e in &asset.edges {
+            let w = ((e.length_m * 1000.0).round() as usize).max(1);
+            input_graph.add_edge(e.from as usize, e.to as usize, w);
+            input_graph.add_edge(e.to as usize, e.from as usize, w);
+        }
+        input_graph.freeze();
+        let fast_graph = fast_paths::prepare(&input_graph);
         StreetGraph {
             origin: asset.origin,
             positions,
             asset,
             g,
+            node_tree,
+            fast_graph,
         }
     }
 
@@ -115,40 +161,33 @@ impl StreetGraph {
         self.positions[id as usize]
     }
 
-    /// Nearest graph node to a point (linear scan; fine for one interactive
-    /// query over a borough-scale graph).
+    /// Nearest graph node to a point (R-tree nearest-neighbor, O(log n)).
     pub fn snap_nearest(&self, p: Vec2) -> Option<u32> {
-        self.positions
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                a.distance(p)
-                    .partial_cmp(&b.distance(p))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i as u32)
+        self.node_tree
+            .nearest_neighbor(&[p.x, p.y])
+            .map(|n| n.id)
     }
 
-    /// Route between two graph node ids using A* with a Euclidean heuristic
-    /// (admissible: straight-line distance never overestimates path length).
+    /// Route between two graph node ids using fast_paths CSR A* (distance-weighted).
     pub fn route(&self, start: u32, goal: u32) -> Result<Route, RouteError> {
         if self.positions.is_empty() {
             return Err(RouteError::Empty);
         }
-        let start_ix = NodeIndex::new(start as usize);
-        let goal_ix = NodeIndex::new(goal as usize);
-        let goal_pos = self.positions[goal as usize];
-
-        let result = astar(
-            &self.g,
-            start_ix,
-            |n| n == goal_ix,
-            |e| self.asset.edges[*e.weight()].length_m,
-            |n| self.positions[n.index()].distance(goal_pos),
-        );
-
-        let (_cost, path) = result.ok_or(RouteError::NoPath)?;
-        Ok(self.build_route(&path))
+        if start as usize >= self.positions.len() || goal as usize >= self.positions.len() {
+            return Err(RouteError::NoPath);
+        }
+        if start == goal {
+            return Ok(self.build_route(&[NodeIndex::new(start as usize)]));
+        }
+        let si = NodeIndex::new(start as usize);
+        let gi = NodeIndex::new(goal as usize);
+        if self.g.edges(si).next().is_none() || self.g.edges(gi).next().is_none() {
+            return Err(RouteError::NoPath);
+        }
+        let sp = fast_paths::calc_path(&self.fast_graph, start as usize, goal as usize)
+            .ok_or(RouteError::NoPath)?;
+        let nodes: Vec<NodeIndex> = sp.get_nodes().iter().map(|&n| NodeIndex::new(n)).collect();
+        Ok(self.build_route(&nodes))
     }
 
     /// Convenience: snap two ENU points to the nearest nodes, validate they are
@@ -166,6 +205,11 @@ impl StreetGraph {
     pub fn route_timed(&self, start: u32, goal: u32) -> Result<Route, RouteError> {
         if self.positions.is_empty() {
             return Err(RouteError::Empty);
+        }
+        // Guard against out-of-range node ids so a bad caller gets an error, not a panic
+        // on the `positions[goal]` index / petgraph lookups below.
+        if start as usize >= self.positions.len() || goal as usize >= self.positions.len() {
+            return Err(RouteError::NoPath);
         }
         let start_ix = NodeIndex::new(start as usize);
         let goal_ix = NodeIndex::new(goal as usize);
@@ -207,6 +251,11 @@ impl StreetGraph {
     ) -> Result<(Route, f64, Vec<u32>), RouteError> {
         if self.positions.is_empty() {
             return Err(RouteError::Empty);
+        }
+        // Guard against out-of-range node ids so a bad caller gets an error, not a panic
+        // on the `positions[goal]` index / petgraph lookups below.
+        if start as usize >= self.positions.len() || goal as usize >= self.positions.len() {
+            return Err(RouteError::NoPath);
         }
         let start_ix = NodeIndex::new(start as usize);
         let goal_ix = NodeIndex::new(goal as usize);
@@ -252,36 +301,56 @@ impl StreetGraph {
             |e| self.asset.edges[*e.weight()].length_m / speed_mps,
         );
         let node_time: HashMap<u32, f64> = costs
-            .into_iter()
-            .filter(|(_, c)| *c <= max_seconds)
-            .map(|(n, c)| (n.index() as u32, c))
+            .iter()
+            .filter(|(_, c)| **c <= max_seconds)
+            .map(|(n, c)| (n.index() as u32, *c))
             .collect();
-        // An edge is in the walkshed when both endpoints are reachable in time.
-        let edges: Vec<u32> = (0..self.asset.edges.len() as u32)
-            .filter(|&i| {
-                let e = &self.asset.edges[i as usize];
-                node_time.contains_key(&e.from) && node_time.contains_key(&e.to)
-            })
-            .collect();
+        let mut dense = vec![f64::INFINITY; self.positions.len()];
+        for (&nid, &t) in &node_time {
+            dense[nid as usize] = t;
+        }
+        let mut edges: Vec<u32> = Vec::new();
+        let mut partial: Vec<(u32, u32, f64)> = Vec::new();
+        for (i, e) in self.asset.edges.iter().enumerate() {
+            let (tf, tt) = (dense[e.from as usize], dense[e.to as usize]);
+            match (tf.is_finite(), tt.is_finite()) {
+                (true, true) => edges.push(i as u32),
+                (true, false) | (false, true) if e.length_m > 0.0 => {
+                    let t = tf.min(tt);
+                    let frac = ((max_seconds - t) * speed_mps / e.length_m).clamp(0.0, 1.0);
+                    if frac > 0.0 {
+                        let entry = if tf.is_finite() { e.from } else { e.to };
+                        partial.push((i as u32, entry, frac));
+                    }
+                }
+                _ => {}
+            }
+        }
         Walkshed {
             start,
             max_seconds,
             node_time,
             edges,
+            partial,
         }
     }
 
     /// Incident edges of `node` as `(other_node_id, edge_index)` pairs. Used by
     /// the ambient pedestrian agents' random walk (no routing).
     pub fn neighbors(&self, node: u32) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        self.neighbors_into(node, &mut out);
+        out
+    }
+
+    /// Fill `out` with the incident edges of `node` (clear-and-reuse pattern).
+    pub fn neighbors_into(&self, node: u32, out: &mut Vec<(u32, u32)>) {
+        out.clear();
         let ni = NodeIndex::new(node as usize);
-        self.g
-            .edges(ni)
-            .map(|e| {
-                let other = if e.source() == ni { e.target() } else { e.source() };
-                (other.index() as u32, *e.weight() as u32)
-            })
-            .collect()
+        for e in self.g.edges(ni) {
+            let other = if e.source() == ni { e.target() } else { e.source() };
+            out.push((other.index() as u32, *e.weight() as u32));
+        }
     }
 
     /// One random-walk step from `node`: pick a uniform random incident edge,
@@ -293,14 +362,13 @@ impl StreetGraph {
         prev: Option<u32>,
         rng: &mut impl RngLike,
     ) -> Option<(u32, u32)> {
-        let mut opts = self.neighbors(node);
+        let mut opts: Vec<(u32, u32)> = Vec::with_capacity(6);
+        self.neighbors_into(node, &mut opts);
         if opts.is_empty() {
             return None;
         }
         if opts.len() > 1 {
             if let Some(p) = prev {
-                // Avoid an immediate U-turn — but only if it leaves a choice
-                // (parallel edges can all lead back to `prev`).
                 let filtered: Vec<(u32, u32)> = opts.iter().copied().filter(|&(n, _)| n != p).collect();
                 if !filtered.is_empty() {
                     opts = filtered;
@@ -453,17 +521,67 @@ impl Route {
         b.sub(a).normalize()
     }
 
+    /// Position **and** unit heading at arc-length `d`, walking forward from a
+    /// caller-owned segment cursor (`hint`). Amortized O(1) per call when `d`
+    /// advances monotonically (the agent case). The heading is the current
+    /// segment's direction — exact, no finite-difference second lookup.
+    pub fn position_and_heading_at(&self, d: f64, hint: &mut usize) -> (Vec2, Vec2) {
+        if self.points.is_empty() {
+            return (Vec2::ZERO, Vec2::new(1.0, 0.0));
+        }
+        if self.points.len() == 1 || d <= 0.0 {
+            let h = if self.points.len() >= 2 {
+                self.points[1].sub(self.points[0]).normalize()
+            } else {
+                Vec2::new(1.0, 0.0)
+            };
+            return (self.points[0], h);
+        }
+        if d >= self.total_m {
+            let n = self.points.len();
+            let h = if n >= 2 {
+                self.points[n - 1].sub(self.points[n - 2]).normalize()
+            } else {
+                Vec2::new(1.0, 0.0)
+            };
+            return (*self.points.last().unwrap(), h);
+        }
+        while *hint + 2 < self.points.len() && self.cumulative_m[*hint + 1] < d {
+            *hint += 1;
+        }
+        let i1 = (*hint + 1).min(self.points.len() - 1);
+        let i0 = i1.saturating_sub(1);
+        let seg_len = self.cumulative_m[i1] - self.cumulative_m[i0];
+        let t = if seg_len > 0.0 { (d - self.cumulative_m[i0]) / seg_len } else { 0.0 };
+        let pos = self.points[i0].lerp(self.points[i1], t);
+        let dir = self.points[i1].sub(self.points[i0]);
+        let heading = if dir.length() > 1e-12 { dir.normalize() } else { Vec2::new(1.0, 0.0) };
+        (pos, heading)
+    }
+
     /// Sample (elapsed_seconds, position) at a fixed time step `dt` while
     /// walking at `speed` m/s. The final sample lands exactly on the endpoint.
+    /// Uses a single linear pass over segments (O(n) total) instead of a
+    /// binary search per sample.
     pub fn sample_over_time(&self, speed: f64, dt: f64) -> Vec<(f64, Vec2)> {
         let mut out = Vec::new();
         if self.points.is_empty() || speed <= 0.0 || dt <= 0.0 {
             return out;
         }
         let duration = self.total_m / speed;
+        let n_pts = self.points.len();
+        let mut seg = 0usize;
         let mut t = 0.0;
         while t < duration {
-            out.push((t, self.position_at(t * speed)));
+            let d = t * speed;
+            while seg + 2 < n_pts && self.cumulative_m[seg + 1] < d {
+                seg += 1;
+            }
+            let i1 = (seg + 1).min(n_pts - 1);
+            let i0 = i1.saturating_sub(1);
+            let seg_len = self.cumulative_m[i1] - self.cumulative_m[i0];
+            let frac = if seg_len > 0.0 { (d - self.cumulative_m[i0]) / seg_len } else { 0.0 };
+            out.push((t, self.points[i0].lerp(self.points[i1], frac)));
             t += dt;
         }
         out.push((duration, *self.points.last().unwrap()));
@@ -566,6 +684,12 @@ pub struct Walkshed {
     pub node_time: HashMap<u32, f64>,
     /// Indices into the graph's edges for edges fully inside the walkshed.
     pub edges: Vec<u32>,
+    /// Boundary edges reachable from exactly one endpoint, walkable up to the remaining
+    /// time budget from that end: `(edge index, entry node id, walkable fraction of the
+    /// edge's length)`. Dropping these truncated every isochrone short of its true rim —
+    /// by up to a whole block, and by more where blocks are long — so exposure queries
+    /// must sample them (up to the cut) alongside `edges`.
+    pub partial: Vec<(u32, u32, f64)>,
 }
 
 #[cfg(test)]
@@ -648,11 +772,19 @@ mod tests {
         assert!(!ws.node_time.contains_key(&2));
         // Reachable edges: 0-1 and 3-0 (both endpoints reachable); not 1-2 or 2-3.
         assert_eq!(ws.edges.len(), 2);
+        // Boundary edges 1-2 and 2-3 are each walkable 5 s past their reachable endpoint:
+        // (15 - 10) s * 1 m/s / 10 m = fraction 0.5, entered from node 1 resp. node 3.
+        assert_eq!(ws.partial.len(), 2);
+        for &(ei, entry, frac) in &ws.partial {
+            assert!(matches!((ei, entry), (1, 1) | (2, 3)), "unexpected partial ({ei},{entry})");
+            assert!((frac - 0.5).abs() < 1e-9, "frac {frac}");
+        }
 
-        // A generous budget reaches everything.
+        // A generous budget reaches everything, leaving nothing partial.
         let all = g.walkshed(0, 1000.0, 1.0);
         assert_eq!(all.node_time.len(), 4);
         assert_eq!(all.edges.len(), 4);
+        assert!(all.partial.is_empty());
     }
 
     #[test]

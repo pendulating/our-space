@@ -1,0 +1,142 @@
+
+ACM FAccT Conference
+
+    2027
+    2026
+    2025
+    2024
+    2023
+    2022
+    2018-2021
+
+    Blog
+    Network
+    Connect
+    Organization
+
+2027 Call For Papers
+
+We invite submissions for the 2027 ACM Conference on Fairness, Accountability, and Transparency (FAccT). FAccT is an interdisciplinary conference dedicated to bringing together a diverse community of scholars and practitioners advancing impactful research in responsible, safe, ethical, and trustworthy computing. Research from all fields is welcome, including algorithmic, critical, human-centered, legal, philosophical, sociological, statistical, and theoretical research.
+Key Dates
+
+Abstract submission deadline:
+    October 27, 2026
+Paper submission deadline:
+    November 3, 2026
+Reviews and first round decisions released to authors (accept/revise* major or minor/reject):
+    December 22, 2026
+Revision and rebuttal due:
+    January 28, 2027
+Final notification of accept/reject decisions:
+    March 23, 2027
+Camera-ready deadline:
+    TBD
+Conference dates:
+    June 21-24 2027
+
+All deadlines are at 11:59 PM Anywhere On Earth on the given date.
+
+* See below for more details on the revision process.
+
+Focus Areas
+
+FAccT welcomes papers that advance all areas related to the sociotechnical nature of computing, inviting work from computer science, engineering, humanities, law, and the social sciences (see below for a list of relevant topics). We ask submitting authors to select one or more focus areas that best describe their papers. These focus areas are used to match submissions with Reviewers and Area Chairs who have the most relevant expertise.
+
+We are currently looking for reviewers and Area Chairs! Please sign up to review for this year!
+
+    Evaluations and evaluation practices. This includes papers that describe audits or evaluations of data, algorithms, models, systems, and applications to assess issues related to fairness, justice, safety, privacy, accountability, transparency, explainability, inclusiveness, ethics, or any risks or adverse impacts of existing computational systems on individuals, groups, and society. Papers that evaluate the cultural, environmental, social, or economic impact of computational systems may also be submitted to this focus area. It also includes papers that introduce or examine evaluation metrics, measurements, or other risk identification or evaluation practices, both quantitative and qualitative.
+
+    Experiences and interactions. This includes work examining human experiences, needs, perceptions, and interactions with real or envisioned computational systems to understand their impact and inform policy and practice. It includes work on human-computer interaction, decision support and human-in-the-loop systems, visualization, design theories and methods (e.g., co-design, speculative or critical design), participatory and deliberative methods, and studies of organizational and institutional practices.
+
+    Law and policy. This includes work examining, proposing, or discussing both public and private regulation, governance, and legal doctrines concerning the development, deployment, and use of computational systems. It also includes work interrogating the impact and effectiveness of these frameworks.
+
+    Normative foundations and implications. This includes work examining normative questions about data, computational systems, and related design, evaluation, and governance practices by drawing insights from philosophy of science, epistemology, moral and political philosophy, science and technology studies, and related fields.
+
+    Power and practice. This includes work that interrogates norms, practices, and power relations around data, computational systems, and related design, evaluation, and governance approaches by drawing insights from history, anthropology and sociology, cultural studies, and related fields.
+
+    System development and deployment. This includes work concerned with the design, development, deployment, and/or theoretical analysis of data, algorithms, models, systems, and applications, with the goal of making them, for example, more fair, just, safe, privacy preserving, accountable, transparent, explainable, inclusive, or ethical, including in specialized domains such as natural language processing, computer vision,, and information retrieval.
+
+Submission Instructions
+
+We require all submitters of papers to fully read the Author Guide, which provides details on the reviewing process, policies that must be adhered to, and other relevant instructions.
+
+Submission System. The submission system will open in October 2026. We will release more information about the submission system in the Author Guide and the FAccT blog in the coming months.
+
+Paper Length. Submissions must be no longer than 14 pages, excluding references (most papers are between 12 and 14 pages). An additional page of content is allowed for ethics, adverse impacts, and other statements (see the Author Guide section on “Endmatter Sections”). Submissions sent to the Revision stage and accepted submissions will be allowed to include an additional content page (i.e., 15 pages, excluding references).
+
+Anonymity Policy. Submissions must be anonymized and may not contain any identifying information. Authors must omit their names and affiliations from the submission, as well as acknowledgements, positionality statements, competing interests statements, or other potentially identifying information. Citations to prior work from the authors should be made in the third person. Submissions that do not comply with this policy will be rejected without review.
+
+Revision. Since 2026, there is a process for revision and re-review. In the initial decision notification, papers will be assigned Accept, Revise (major or minor), or Reject. The papers with the Revise decision will have time to revise their submission to address the reviewers' feedback and concerns. Authors will also submit a rebuttal with their revised paper. Revised papers will receive a re-review from reviewers and Area chairs before a final decision is made. An extra page (up to 15 pages excluding references) will be allowed for papers in this stage.
+
+Archival vs. Non-archival Submissions. To help support authors from communities outside of computer science (e.g., law, policy, humanities, social sciences), FAccT offers authors the choice of archival and non-archival paper submissions.
+
+    Archival papers will appear in the published conference proceedings in the ACM Digital Library, if they are accepted. In the computer science field, peer-reviewed conference proceedings such as these are considered of equivalent rigor as journal publications.
+
+    Non-archival papers will only appear as abstracts in the proceedings, if they are accepted, but authors will be invited to present the work at the conference in the same fashion as with archival papers. Non-archival submissions should meet the same formatting requirements as archival ones, and will go through the same reviewing process.
+
+    Historically, most authors chose the archival option; the non-archival option is offered to avoid precluding the future submission of these papers to discipline-specific journals or law reviews. Authors must indicate at the submission time whether they are submitting an archival or non-archival paper, and switching category after submission is not possible. See the Author Guide for more detail.
+
+Concurrent/Dual Submission Policy. You may not submit papers that are identical or substantially similar to papers that are currently under review at another peer-reviewed conference or journal, have been previously published, or have been accepted for publication. Such submissions violate our concurrent submission policy and will be removed from submission. See the Author Guide for exceptions.
+
+Style Files and Templates. We use the ACM TAPS workflow for formatting manuscripts. Please note that this allows for submissions in LaTeX and Microsoft Word. See the formatting instructions section of the Author Guide for more detail.
+
+Reviewing. Due to the increasing number of submissions to FAccT, we need your help to ensure a rigorous review process! We require all authors of every paper to sign up to review for the conference using this sign-up form (though please note that not all who sign up will be selected to review). We require that reviewers and Area Chairs have prior experience reviewing or Area Chairing for either FAccT or other conferences or journals in your primary discipline(s). Failure to sign up for the review process and follow through can lead to (desk) rejections.
+
+Conference Attendance. At least one author of each accepted paper must register for, attend, and present the work at the conference for the paper to appear in the conference proceedings. The expectation is to present the work in-person, but an option for virtual presentation will be available for authors who cannot attend in person, with details available after paper acceptance notifications.
+Topics of Interest
+
+Listed alphabetically, topics of interest include, but are not limited to:
+
+    AI red teaming and adversarial testing
+    Algorithmic fairness and bias
+    Algorithmic recourse
+    (In)appropriate reliance and (over)trust in computational systems
+    Assurance testing and deployment policies
+    Audits of data, algorithms, models, systems, and applications
+    Critical and sociotechnical foresight studies of technologies, and related policies and practices
+    Cultural impacts of computational systems
+    Diversity in design and development (i.e., diversity as defined along many possible dimensions, such as sociocultural, demographic, ability-based, and more)
+    Environmental impacts of computational systems
+    Fairness, accountability, and transparency in industry, government, or civil society
+    Historical, humanistic, social scientific, and cultural perspectives on topics in this list
+    Human-centered approaches to factors in fairness, accountability, and transparency
+    Interdisciplinarity and cross-functional teaming in fairness, accountability, and transparency work
+    Interpretability/explainability
+    Justice, power, and inequality in computational systems
+    Labor and economic impacts of computational systems
+    Legal topics in AI (e.g., antitrust, bias and discrimination, data protection, intellectual property, mis/disinformation, and privacy)
+    Licensing and liability with AI
+    Moral, legal, and political philosophy of data and computational systems
+    Organizational factors in fairness, accountability, and transparency
+    Participatory and deliberative methods in fairness, accountability, and transparency
+    Regulation and governance of computational systems
+    Resistance, refusal, and contestation of computational systems
+    Responsible data management and data engineering
+    Risks, harms, and failures of computational systems
+    Science of responsible, safe, ethical, and trustworthy AI evaluation and governance
+    Social epistemology of AI
+    Sociotechnical design and development of data, models, and systems
+    Sociotechnical evaluations of data, models, and systems
+    Sociotechnical approaches to AI safety
+    Threat models and mitigations
+    Transparency documentation of data, models, systems, processes, and outcomes
+    Value alignment and human feedback
+    Value-sensitive design of computational systems
+    Values in scientific inquiry and technology design as related to FAccT issues
+
+Topics out of scope: FAccT is an interdisciplinary conference striving to impact and shape real-world socio-technical issues. We welcome submissions with varying methodologies, epistemologies, and disciplinary orientations that all seek to address that aim. ​However, work that does not have deep engagement with the social components of computational systems or that is focused on purely hypothetical concerns is considered outside the scope of the conference.
+Program Chairs
+
+    Remi Denton, Google Research, USA
+    David Leslie, Queen Mary University of London, UK
+    Aurelia Tamò-Larrieux, University of St. Gallen, Switzerland
+    Isabel Valera, Saarland University, Germany
+
+Further questions can be directed to program-chairs@facctconference.org
+
+For updates, follow us on social media (BlueSky(@facct.bsky.social), LinkedIn(ACM-FAccT), Mastodon(@FAccT)), join our mailing list, or check for updates on the FAccT Blog.
+Sponsored by: Association of Computing Machinery
+
+CC-BY 2026 ACM FAccT Conference.
+
+Updated Sat, 27 Jun 2026 21:56:16 +0000.

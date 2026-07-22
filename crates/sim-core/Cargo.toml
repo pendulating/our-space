@@ -18,6 +18,8 @@ serde = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
 petgraph = { workspace = true }
+rstar = { workspace = true }
+fast_paths = { workspace = true }
 
 # ECS layer (optional). Only bevy_ecs is needed; positions use our own ENU Vec2.
 bevy_ecs = { workspace = true, optional = true }

@@ -10,3 +10,4 @@ description = "Native headless batch: citywide exposure heatmap (coverage aggreg
 sim-core = { workspace = true }
 rstar = { workspace = true }
 anyhow = { workspace = true }
+rayon = "1"

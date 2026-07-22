@@ -24,6 +24,20 @@ pub enum StepAction {
     Route { a: (f64, f64), b: (f64, f64) },
     /// My-area: a 10-minute walkshed centered on a point (lat/lon).
     Walkshed { lat: f64, lon: f64 },
+    /// Direct-capture: the cameras whose field of view points straight at a point (lat/lon).
+    DirectCapture { lat: f64, lon: f64 },
+    /// Neighborhood-density choropleth; optional camera target (`at = None` = island overview).
+    Neighborhoods { at: Option<(f64, f64, f32)> },
+    /// Institutions explore view (subjects of surveillance, ranked by nearby cameras).
+    /// `parks_only` filters the on-map markers to parks (else all classes show); `rank`
+    /// selects + flies to the rank-th most-watched matching institution (0 = the most
+    /// watched). Applied by a dedicated system (`crate::story_apply_institutions`), not
+    /// `storymap_tick`, since the view's resources aren't in the tick's param set.
+    Institutions { parks_only: bool, rank: usize },
+    /// Sweep the simulated clock from `from` (or the hour at entry) to `to` across the
+    /// step's dwell — the "a day in N seconds" time-lapse. Runs every frame (not once);
+    /// `to` may exceed 24 to scrub past midnight (the value wraps mod 24 for display).
+    ClockScrub { from: Option<f64>, to: f64 },
     /// Raise the Operators view (every sensor sorted by who runs it).
     Operators,
     /// Enter the "In 5 years…" speculative future (glasses + robots).
@@ -50,6 +64,127 @@ pub struct StoryStep {
     /// Seconds to dwell before auto-advancing.
     pub secs: f32,
     pub action: StepAction,
+}
+
+// ---- data-driven reel specs (docs/REELS_PLAN.md G2) --------------------
+// A reel is authored as a JSON "spec" (a title + a list of steps) and handed to the app
+// via `?reelspec=<base64url(json)>` (see `crate::url_reelspec`), so a new tour needs no
+// recompile. `ReelSpec`/`ReelStep` are the wire format; `from_spec_json` turns them into
+// the same `StoryStep`s the hardcoded tours produce. This is the mechanism behind
+// `tools/reels/render.mjs --spec`.
+
+/// The JSON reel spec: a human title + ordered steps.
+#[derive(serde::Deserialize)]
+pub struct ReelSpec {
+    #[serde(default)]
+    pub title: String,
+    pub steps: Vec<ReelStep>,
+}
+
+/// One JSON step. `action` is the tag (matching `StepAction`); the rest are the fields
+/// that action needs (validated in `to_action`). All geometry is lat/lon degrees; `at` is
+/// `[lat, lon, zoom]`.
+#[derive(serde::Deserialize)]
+pub struct ReelStep {
+    pub action: String,
+    pub secs: f32,
+    #[serde(default)]
+    pub caption: String,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub zoom: Option<f32>,
+    pub a: Option<[f64; 2]>,
+    pub b: Option<[f64; 2]>,
+    pub at: Option<[f64; 3]>,
+    pub from: Option<f64>,
+    pub to: Option<f64>,
+    /// `Institutions`: filter markers to parks (default true) and which ranked match to
+    /// select+fly to (default 0 = the most-watched).
+    pub parks_only: Option<bool>,
+    pub rank: Option<usize>,
+    #[serde(default)]
+    pub linknyc: bool,
+    #[serde(default)]
+    pub future: bool,
+    #[serde(default)]
+    pub operators: bool,
+    #[serde(default)]
+    pub heatmap: bool,
+}
+
+impl ReelStep {
+    fn to_action(&self) -> Result<StepAction, String> {
+        let need = |o: Option<f64>, f: &str| o.ok_or_else(|| format!("`{}` needs `{f}`", self.action));
+        let at = self.at.map(|[la, lo, z]| (la, lo, z as f32));
+        Ok(match self.action.as_str() {
+            "Caption" => StepAction::Caption,
+            "Overview" => StepAction::Overview,
+            "FlyTo" => StepAction::FlyTo {
+                lat: need(self.lat, "lat")?,
+                lon: need(self.lon, "lon")?,
+                zoom: self.zoom.unwrap_or(1.6),
+            },
+            "Route" => StepAction::Route {
+                a: self.a.map(|p| (p[0], p[1])).ok_or("`Route` needs `a`")?,
+                b: self.b.map(|p| (p[0], p[1])).ok_or("`Route` needs `b`")?,
+            },
+            "Walkshed" => StepAction::Walkshed {
+                lat: need(self.lat, "lat")?,
+                lon: need(self.lon, "lon")?,
+            },
+            "DirectCapture" => StepAction::DirectCapture {
+                lat: need(self.lat, "lat")?,
+                lon: need(self.lon, "lon")?,
+            },
+            "Neighborhoods" => StepAction::Neighborhoods { at },
+            "Institutions" => StepAction::Institutions {
+                parks_only: self.parks_only.unwrap_or(true),
+                rank: self.rank.unwrap_or(0),
+            },
+            "ClockScrub" => StepAction::ClockScrub {
+                from: self.from,
+                to: self.to.ok_or("`ClockScrub` needs `to`")?,
+            },
+            "Operators" => StepAction::Operators,
+            "Future" => StepAction::Future,
+            "Heatmap" => StepAction::Heatmap,
+            "Scene" => StepAction::Scene {
+                at,
+                linknyc: self.linknyc,
+                future: self.future,
+                operators: self.operators,
+                heatmap: self.heatmap,
+            },
+            other => return Err(format!("unknown action `{other}`")),
+        })
+    }
+}
+
+/// Parse a JSON reel spec into a `(title, steps)` ready for [`StoryMap::start`]. Captions
+/// and the title are leaked to `'static` (the tours are hardcoded `&'static str`); a reel
+/// capture is a one-shot session, so leaking a handful of short strings is inconsequential.
+pub fn from_spec_json(json: &str) -> Result<(&'static str, Vec<StoryStep>), String> {
+    let spec: ReelSpec = serde_json::from_str(json).map_err(|e| format!("bad reel spec: {e}"))?;
+    if spec.steps.is_empty() {
+        return Err("reel spec has no steps".into());
+    }
+    let steps = spec
+        .steps
+        .iter()
+        .map(|s| {
+            Ok(StoryStep {
+                caption: &*Box::leak(s.caption.clone().into_boxed_str()),
+                secs: s.secs,
+                action: s.to_action()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let title: &'static str = if spec.title.is_empty() {
+        "Reel"
+    } else {
+        &*Box::leak(spec.title.into_boxed_str())
+    };
+    Ok((title, steps))
 }
 
 /// Playback state for the active StoryMap. A resource so the tick system + UI share it.
@@ -158,8 +293,8 @@ pub fn tutorial() -> Vec<StoryStep> {
             action: Walkshed { lat: 40.7233, lon: -74.0030 },
         },
         StoryStep {
-            caption: "Meet the operators: the same sensors, regrouped by who runs them. \
-                      The towers show how lopsided the watching is.",
+            caption: "The same sensors, regrouped by who runs them. A few operators \
+                      account for most of the towers.",
             secs: 7.0,
             action: Operators,
         },
@@ -176,8 +311,7 @@ pub fn tutorial() -> Vec<StoryStep> {
             action: Heatmap,
         },
         StoryStep {
-            caption: "That's the tour. Click anywhere to start exploring your own corner \
-                      of the surveilled city.",
+            caption: "That's the tour. Click anywhere on the map to check your own block.",
             secs: 6.0,
             action: Overview,
         },
@@ -193,9 +327,9 @@ pub fn longitudinal() -> Vec<StoryStep> {
     let midtown = |z: f32| Some((40.7549, -73.9840, z));
     vec![
         StoryStep {
-            caption: "Rewind ten years. In 2015 the city's eye was real but sparse: NYPD \
-                      domes, DOT traffic cams. No plate-readers on the avenues, no Wi-Fi \
-                      kiosks logging your phone.",
+            caption: "Rewind ten years. In 2015 the cameras were real but sparse: NYPD \
+                      domes and DOT traffic cams. No plate readers on the avenues, no \
+                      Wi-Fi kiosks logging phones.",
             secs: 8.0,
             action: Scene {
                 at: None,
@@ -206,9 +340,9 @@ pub fn longitudinal() -> Vec<StoryStep> {
             },
         },
         StoryStep {
-            caption: "By today, the lens is everywhere. Thousands of fixed cameras, \
-                      license-plate readers, and a LinkNYC kiosk on every other block. \
-                      Watch the kiosks switch on as we reach the present.",
+            caption: "Today: thousands of fixed cameras, license-plate readers, and a \
+                      LinkNYC kiosk every few blocks. The kiosks switch on as the story \
+                      reaches the present.",
             secs: 8.0,
             action: Scene {
                 at: midtown(1.6),
@@ -219,8 +353,8 @@ pub fn longitudinal() -> Vec<StoryStep> {
             },
         },
         StoryStep {
-            caption: "The density makes it plain: most of Manhattan is now seen from many \
-                      angles at once. The darkest blocks are watched the most.",
+            caption: "Most of Manhattan is now seen from several angles at once. The \
+                      darkest blocks are watched the most.",
             secs: 7.5,
             action: Scene {
                 at: None,
@@ -231,8 +365,7 @@ pub fn longitudinal() -> Vec<StoryStep> {
             },
         },
         StoryStep {
-            caption: "And the watching is concentrated: a handful of operators run the \
-                      overwhelming majority of the city's cameras.",
+            caption: "A handful of operators run most of the city's cameras.",
             secs: 7.0,
             action: Scene {
                 at: None,
@@ -243,9 +376,9 @@ pub fn longitudinal() -> Vec<StoryStep> {
             },
         },
         StoryStep {
-            caption: "Five years on: AI smart glasses on commuters and sidewalk delivery \
-                      robots add cameras that move with the crowd. That's the 'In 5 years…' \
-                      layer. Same streets, watched more every year.",
+            caption: "Five years out, a scenario: smart glasses and sidewalk delivery \
+                      robots add cameras that move with the crowd. Same streets, more \
+                      watching every year.",
             secs: 8.5,
             action: Scene {
                 at: midtown(1.8),
@@ -319,6 +452,46 @@ mod tests {
         assert!(has(StepAction::Heatmap));
         assert!(t.iter().any(|s| matches!(s.action, StepAction::Route { .. })));
         assert!(t.iter().any(|s| matches!(s.action, StepAction::Walkshed { .. })));
+    }
+
+    #[test]
+    fn parses_a_reel_spec_and_maps_actions() {
+        let json = r#"{
+            "title": "Watch Astor Place",
+            "steps": [
+                { "action": "Overview", "secs": 1.5, "caption": "New York City" },
+                { "action": "FlyTo", "lat": 40.73, "lon": -73.99, "zoom": 2.6, "secs": 2, "caption": "Astor Place" },
+                { "action": "Walkshed", "lat": 40.73, "lon": -73.99, "secs": 4, "caption": "10-minute walk" },
+                { "action": "DirectCapture", "lat": 40.73, "lon": -73.99, "secs": 3, "caption": "pointed at you" },
+                { "action": "Neighborhoods", "at": [40.75, -73.98, 9.0], "secs": 3, "caption": "density" },
+                { "action": "Institutions", "parks_only": true, "rank": 2, "secs": 4, "caption": "parks" },
+                { "action": "ClockScrub", "from": 6.0, "to": 22.0, "secs": 14, "caption": "a day" }
+            ]
+        }"#;
+        let (title, steps) = from_spec_json(json).unwrap();
+        assert_eq!(title, "Watch Astor Place");
+        assert_eq!(steps.len(), 7);
+        assert!(matches!(steps[1].action, StepAction::FlyTo { zoom, .. } if (zoom - 2.6).abs() < 1e-6));
+        assert!(matches!(steps[3].action, StepAction::DirectCapture { .. }));
+        assert!(matches!(steps[4].action, StepAction::Neighborhoods { at: Some(_) }));
+        assert!(matches!(steps[5].action, StepAction::Institutions { parks_only: true, rank: 2 }));
+        assert!(matches!(steps[6].action, StepAction::ClockScrub { from: Some(_), to } if (to - 22.0).abs() < 1e-6));
+        assert!((steps[0].secs - 1.5).abs() < 1e-6);
+        // `Institutions` defaults: parks_only=true, rank=0 when the fields are omitted.
+        let dflt = from_spec_json(r#"{"steps":[{"action":"Institutions","secs":3}]}"#).unwrap().1;
+        assert!(matches!(dflt[0].action, StepAction::Institutions { parks_only: true, rank: 0 }));
+    }
+
+    #[test]
+    fn reel_spec_rejects_missing_fields_and_empty() {
+        // FlyTo without lat/lon is an error, not a silent default.
+        let bad = r#"{"steps":[{"action":"FlyTo","secs":2}]}"#;
+        assert!(from_spec_json(bad).is_err());
+        // Empty step list is rejected.
+        assert!(from_spec_json(r#"{"steps":[]}"#).is_err());
+        // Unknown action is named in the error.
+        let unk = r#"{"steps":[{"action":"Teleport","secs":1}]}"#;
+        assert!(from_spec_json(unk).unwrap_err().contains("Teleport"));
     }
 
     #[test]

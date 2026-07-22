@@ -14,11 +14,17 @@ rstar = { workspace = true }
 earcutr = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
+# Decode the `?reelspec=<base64url>` reel spec (docs/REELS_PLAN.md G2). URL-safe, no-pad.
+base64 = "0.22"
 postcard = { workspace = true }
 anyhow = { workspace = true }
 # Cross-platform non-blocking HTTP (native threads / browser fetch) for the NYC
 # GeoSearch address geocoder — works on both the native dev build and the WASM build.
 ehttp = "0.5"
+# Decompress the baked layers, which `web/build.sh` brotli-compresses for the web
+# deploy (an `OSZ1` magic marks compressed files; raw native assets decode straight
+# through). Decompressed bytes are byte-identical, so no layer/statistic changes.
+brotli = { version = "8.0.4", default-features = false, features = ["std"] }
 
 # Base Bevy feature set, shared by native + web. Declared in [dependencies] (not
 # only in target tables) so Bevy's derive macros resolve crate paths correctly.
@@ -41,7 +47,6 @@ features = [
     # rather than relying on bevy_prototype_lyon transitively pulling the bevy
     # umbrella's defaults — a future dep bump could otherwise drop them.
     "bevy_text",
-    "default_font",
 ]
 
 # Native extras (desktop windowing + parallelism). x11/wayland are Linux-only and

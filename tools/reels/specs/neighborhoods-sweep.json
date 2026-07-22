@@ -1,0 +1,14 @@
+{
+  "id": "neighborhoods-sweep",
+  "title": "Surveillance deserts & hotspots",
+  "size": [1080, 1920],
+  "fps": 30,
+  "steps": [
+    { "action": "Overview", "secs": 1.5,
+      "caption": "Camera density, neighborhood by neighborhood." },
+    { "action": "Neighborhoods", "secs": 4.0,
+      "caption": "The darker the block, the more cameras can see it." },
+    { "action": "Neighborhoods", "at": [40.7549, -73.9840, 5.0], "secs": 4.0,
+      "caption": "Midtown has the most cameras. Coverage is far from even." }
+  ]
+}

@@ -642,6 +642,9 @@
   </script>
 
   <script type="module">
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js').catch(() => {});
+    }
     const overlay = document.getElementById('overlay');
     const title = document.getElementById('ov-title');
     const msg = document.getElementById('ov-msg');

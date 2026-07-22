@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fetch NYC automated photo-enforcement camera locations from the Street Sign Work
 Orders dataset (qt6m-xctn): Current speed / bus-lane / red-light 'PHOTO ENFORCED' /
-'CAMERA' signs in Manhattan. Converts state-plane coords (EPSG:2263, ftUS) to WGS84
-via an inline Lambert-Conformal-Conic inverse (no pyproj dependency), dedups
-co-located signs to distinct locations, and writes a lon,lat,subtype CSV for
-`data-pipeline bake-enforcement`. Stdlib only.
+'CAMERA' signs citywide (all five boroughs). Converts state-plane coords
+(EPSG:2263, ftUS) to WGS84 via an inline Lambert-Conformal-Conic inverse (no pyproj
+dependency), dedups co-located signs to distinct locations, and writes a
+lon,lat,subtype CSV for `data-pipeline bake-enforcement`. Stdlib only.
 
 Out: data/snapshots/enforcement/enforcement_signs.csv
 """
@@ -29,12 +29,16 @@ def to_lonlat(xf, yf):
 
 print("sanity Broadway@9th (989791,224853) ->", to_lonlat(989791,224853))
 
-where = ("borough='Manhattan' AND record_type='Current' AND "
+# Citywide (all five boroughs). Until 2026-07-14 this filtered borough='Manhattan', which
+# put a Manhattan-only layer into a citywide R_i and contaminated the confirmed flag's
+# geography -- the paper had to disclose it as a known spatial bias.
+where = ("record_type='Current' AND "
          "(upper(sign_description) like '%PHOTO ENFORCED%' OR upper(sign_description) like '%CAMERA%')")
 url = "https://data.cityofnewyork.us/resource/qt6m-xctn.json?" + urllib.parse.urlencode(
     {"$select":"sign_description,sign_x_coord,sign_y_coord", "$where":where, "$limit":"50000"})
 rows = json.load(urllib.request.urlopen(url, timeout=120))
 print("fetched", len(rows), "rows")
+assert len(rows) < 50000, "hit the $limit -- page the query or raise the limit; results are truncated"
 
 def subtype(d):
     d = d.upper()
@@ -52,7 +56,10 @@ for r in rows:
     lon, lat = to_lonlat(xf, yf)
     seen[key] = (lon, lat, subtype(r.get("sign_description","")))
 
-out = "/Users/mattfranchi/Repos/our-space/data/snapshots/enforcement/enforcement_signs.csv"
+import os
+out = os.path.join(os.path.dirname(__file__), "..", "data", "snapshots",
+                   "enforcement", "enforcement_signs.csv")
+os.makedirs(os.path.dirname(out), exist_ok=True)
 with open(out, "w") as fh:
     fh.write("lon,lat,subtype\n")
     for lon,lat,st in seen.values():

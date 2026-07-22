@@ -41,6 +41,7 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
     let resp: OverpassResp = serde_json::from_slice(&bytes).context("parsing ALPR Overpass JSON")?;
 
     let mut readers = Vec::new();
+    let mut devices = 0usize; // OSM elements that produced >=1 sensor (a gantry may emit several)
     for el in resp.elements {
         let (lat, lon) = match (el.lat, el.lon) {
             (Some(a), Some(b)) => (a, b),
@@ -49,14 +50,6 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
                 None => continue,
             },
         };
-        // OSM `direction` is the compass bearing the reader faces (matches our
-        // FrustumWedge heading). Many gantries carry several semicolon-separated
-        // bearings (e.g. "28;209") for their multiple units — take the first as the
-        // primary heading so these still render a directional FOV (not omnidirectional).
-        let heading_deg = el
-            .tags
-            .get("direction")
-            .and_then(|d| d.split(';').find_map(|p| p.trim().parse::<f64>().ok()));
         // Crowdsourced metadata for the modal + maker stratification. Trim and drop
         // empties so the UI can rely on `Some` meaning "actually labeled".
         let tag = |k: &str| {
@@ -66,15 +59,42 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
         };
+        let manufacturer = tag("manufacturer").or_else(|| tag("brand"));
+        let operator = tag("operator").or_else(|| tag("operator:short"));
+        // OSM `direction` is the compass bearing the reader faces (matches our
+        // FrustumWedge heading). A gantry often carries several semicolon-separated
+        // bearings (e.g. "28;209") -- one physical reader unit per direction. Emit ONE
+        // SENSOR PER DISTINCT BEARING at the shared coordinate, so a two-way gantry
+        // renders both wedges instead of one. (Numeric bearings only; a cardinal token
+        // this parser doesn't read falls through to omnidirectional, as before.)
+        let mut bearings: Vec<f64> = Vec::new();
+        if let Some(dir) = el.tags.get("direction") {
+            for tok in dir.split(';') {
+                if let Ok(b) = tok.trim().parse::<f64>() {
+                    if !bearings.contains(&b) {
+                        bearings.push(b); // distinct, order-preserving
+                    }
+                }
+            }
+        }
         let p = proj.to_enu(lat, lon);
-        readers.push(AlprReader {
-            x: p.x,
-            y: p.y,
-            heading_deg,
-            osm_id: el.id,
-            manufacturer: tag("manufacturer").or_else(|| tag("brand")),
-            operator: tag("operator").or_else(|| tag("operator:short")),
-        });
+        devices += 1;
+        // No numeric bearing -> a single omnidirectional sensor (unchanged behavior).
+        let headings: Vec<Option<f64>> = if bearings.is_empty() {
+            vec![None]
+        } else {
+            bearings.into_iter().map(Some).collect()
+        };
+        for heading_deg in headings {
+            readers.push(AlprReader {
+                x: p.x,
+                y: p.y,
+                heading_deg,
+                osm_id: el.id,
+                manufacturer: manufacturer.clone(),
+                operator: operator.clone(),
+            });
+        }
     }
     anyhow::ensure!(!readers.is_empty(), "no ALPR points parsed");
 
@@ -93,6 +113,9 @@ pub fn bake(json_path: &str, out_path: &str) -> Result<usize> {
     };
     let n = layer.readers.len();
     std::fs::write(out_path, layer.to_bytes()?).with_context(|| format!("writing {out_path}"))?;
-    eprintln!("ALPR layer: {n} readers ({directional} with a heading, {with_maker} with a maker) -> {out_path}");
+    eprintln!(
+        "ALPR layer: {n} sensors from {devices} devices ({directional} directional, \
+         {with_maker} with a maker) -> {out_path}"
+    );
     Ok(n)
 }

@@ -33,7 +33,9 @@
 # NOT baked here (still Manhattan / pending data acquisition; see docs/SCALING.md):
 #   - landmarks (3D building massing) → Manhattan-only curated set (bridges, below,
 #     ARE baked here — they span boroughs and load in both builds)
-#   - ALPR / enforcement / LinkNYC → Manhattan-only raw snapshots (re-fetch for citywide)
+#   - LinkNYC → Manhattan-only raw snapshot (re-fetch for citywide). Enforcement is now citywide
+#     (4,182 DOT sign locations, refetched 2026-07-14); the DeFlock ALPR snapshot (444 devices) already
+#     spans four boroughs (Manhattan-concentrated, no Staten Island) -- neither needs a citywide re-fetch.
 #   - the OSM street graph     → only needed for routing/walkshed/robotability/taxi (deferred)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -105,8 +107,22 @@ if [ ! -f "$OPENST_GEOJSON" ]; then
   curl -sS --compressed -o "$OPENST_GEOJSON" \
     "https://data.cityofnewyork.us/resource/uiay-nctu.geojson?\$select=the_geom,appronstre,reviewstat,boroughname,apprdayswe&\$limit=2000"
 fi
+# TWO citywide networks, and they are not interchangeable — see graph_osm::CsclNetwork.
+#
+#   graph_nyc.osgraph       DRIVE. Keeps highways + ramps; drops trafdir=NV (pedestrian malls,
+#                           bridge promenades), park interiors, and car-free Open Streets.
+#                           → commute routing, taxi/bus baking, roving-camera coverage.
+#
+#   graph_nyc_walk.osgraph  WALK. Keeps park paths, boardwalks, steps, bridge promenades, park
+#                           interiors and Open Streets; drops highways, ramps and nonped=V.
+#                           → EVERY walkshed: R_i, the destination walkshed R_j inside A_i, the
+#                             access/egress legs, the counterfactual, and the covariate densities.
+#
+# Flooding a walkshed on the drive graph lets a "10-minute walk" run 724 km of limited-access
+# highway nobody may walk on, while unable to reach 564 km of park path and boardwalk they do.
 # `-` = no borough clip (keep all five boroughs); then parks + Open Streets masks.
 "$BIN" bake-graph --cscl "$CSCL_GEOJSON" "$OUT/graph_nyc.osgraph" - "$PARKS_GEOJSON" "$OPENST_GEOJSON"
+"$BIN" bake-graph --cscl-walk "$CSCL_GEOJSON" "$OUT/graph_nyc_walk.osgraph"
 
 echo "==> iconic 3D bridges (decks + towers + cables) from named CSCL bridge segments"
 # A second, name-carrying CSCL pull (the graph query drops stname_label): every
@@ -160,8 +176,10 @@ if [ ! -f "$FACILITIES_JSON" ]; then
   curl -sS --compressed -o "$FACILITIES_JSON" \
     "https://data.cityofnewyork.us/resource/ji82-xba5.json?\$select=facname,latitude,longitude,boro,facgroup,facsubgrp,factype,address&\$where=facgroup%20in('SCHOOLS%20(K-12)','LIBRARIES')&\$limit=5000"
 fi
-"$BIN" bake-facilities "$FACILITIES_JSON" "$OUT/facilities.osfac" MANHATTAN
-"$BIN" bake-facilities "$FACILITIES_JSON" "$OUT/facilities_nyc.osfac"
+# Parks (>=1 acre) + pedestrian plazas fold in as polygon centroids, so the Institutions
+# view ranks them beside schools + libraries. Borough-filtered to match each build.
+"$BIN" bake-facilities "$FACILITIES_JSON" "$OUT/facilities.osfac" MANHATTAN "$PARKS_GEOJSON" "$PLAZAS_GEOJSON"
+"$BIN" bake-facilities "$FACILITIES_JSON" "$OUT/facilities_nyc.osfac" all "$PARKS_GEOJSON" "$PLAZAS_GEOJSON"
 
 echo "==> citywide rideshare/taxi (all-borough TLC HVFHV, routed on the citywide graph)"
 # The Manhattan taxi_day filtered HVFHV to Manhattan↔Manhattan; the citywide build
@@ -207,6 +225,11 @@ if [ -n "$GTFS_NYC_DIR" ] && [ -d "$GTFS_NYC_DIR" ]; then
 else
   echo "==> citywide ACE buses SKIPPED (set GTFS_NYC_DIR to the merged 5-borough GTFS dir)"
 fi
+
+# Subway-graph router matrix for the OD-exposure transit legs (analysis asset, not
+# shipped to the app). Weekday AM peak; includes SIR + the SI Ferry pseudo-link.
+echo "==> subway all-pairs router matrix (tools/fetch_gtfs.py fetches the feed)"
+"$BIN" bake-subway "$SNAP/gtfs/subway" data/derived/subway_nyc.ossub
 
 echo
 echo "==> citywide asset sizes (footprints_* are lazy, NOT in first-load):"

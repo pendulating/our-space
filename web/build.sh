@@ -31,6 +31,7 @@ mv "$OUT/app-interactive_bg.opt.wasm" "$OUT/app-interactive_bg.wasm"
 
 echo "==> copy page + assets"
 cp web/index.html "$OUT/index.html"
+cp web/sw.js "$OUT/sw.js"
 rm -rf "$OUT/assets"
 cp -r crates/app-interactive/assets "$OUT/assets"
 # Serve the bundle verbatim on GitHub Pages (no Jekyll processing).

@@ -38,6 +38,16 @@ def parse(path: pathlib.Path) -> dict:
                     key, value = line.split(":", 1)
                     meta[key.strip()] = value.strip()
     meta["blurb"] = " ".join(blurb.split())  # collapse newlines/indentation into one line
+    # Authors vs. venue: the `source` field is written "Authors · venue · year". The cards
+    # show only the venue/year (authors are hidden), so peel the leading authors segment
+    # (everything before the first "·") into `authors` and keep the remainder as `venue`.
+    # With no "·" there's no delimited author list, so the whole line is treated as venue.
+    src = meta.get("source", "")
+    if "·" in src:
+        authors, venue = src.split("·", 1)
+        meta["authors"], meta["venue"] = authors.strip(), venue.strip()
+    elif src:
+        meta["venue"] = src.strip()
     return meta
 
 

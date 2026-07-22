@@ -9,9 +9,10 @@
 //! mesh+material per class (draw-call batching), O(log n) `position_at` per agent
 //! per frame, no runtime A* (vehicles replay baked polylines; peds random-walk).
 
-use bevy::math::primitives::{Rectangle, RegularPolygon};
 use bevy::prelude::*;
 use std::f64::consts::FRAC_PI_2;
+
+use std::sync::Arc;
 
 use sim_core::assets::{BusTrip, TaxiTrip};
 use sim_core::math::point_segment_distance;
@@ -111,7 +112,7 @@ pub enum AgentClass {
 #[derive(Component)]
 pub struct MobileAgent {
     pub class: AgentClass,
-    pub route: Route,
+    pub route: Arc<Route>,
     pub progress_m: f64,
     pub speed_mps: f64,
     pub active: bool,
@@ -121,19 +122,22 @@ pub struct MobileAgent {
     /// World position one capture-frame ago, for the swept closest-approach test
     /// (so a fast agent can't tunnel past the capture radius between frames).
     pub prev_pos: Vec2,
+    /// Monotone segment cursor for O(1) amortized position+heading lookups.
+    pub seg_hint: usize,
 }
 
 impl MobileAgent {
     fn idle(class: AgentClass) -> Self {
         MobileAgent {
             class,
-            route: Route::from_points(Vec::new()),
+            route: Arc::new(Route::from_points(Vec::new())),
             progress_m: 0.0,
             speed_mps: 0.0,
             active: false,
             flash: 0.0,
             counted: false,
             prev_pos: Vec2::ZERO,
+            seg_hint: 0,
         }
     }
 }
@@ -156,12 +160,16 @@ pub struct AgentPool {
     active_robots: usize,
     active_teslas: usize,
     // Shared per-class materials + icon textures, exposed so the Operators view can
-    // swap the pedestrian/bus chips to a solid operator fill in the tower (and
-    // restore the icon on the map). Vehicles are already a solid clay = RIDESHARE.
+    // swap the mobile chips to a solid operator fill in the tower (and restore the
+    // moving icon on the map). Robots never fly to a tower, so theirs isn't kept.
     pub ped_mat: Handle<ColorMaterial>,
     pub bus_mat: Handle<ColorMaterial>,
+    pub veh_mat: Handle<ColorMaterial>,
+    pub tesla_mat: Handle<ColorMaterial>,
     pub glasses_icon: Handle<Image>,
     pub bus_icon: Handle<Image>,
+    pub taxi_icon: Handle<Image>,
+    pub tesla_icon: Handle<Image>,
 }
 
 impl AgentPool {
@@ -183,15 +191,30 @@ impl AgentPool {
             active_teslas: 0,
             ped_mat: Handle::default(),
             bus_mat: Handle::default(),
+            veh_mat: Handle::default(),
+            tesla_mat: Handle::default(),
             glasses_icon: Handle::default(),
             bus_icon: Handle::default(),
+            taxi_icon: Handle::default(),
+            tesla_icon: Handle::default(),
         }
     }
 }
 
+/// The five top-down agent icons (drawn nose-up; `position_agents` rotates each
+/// along its travel heading), loaded once in `setup` and handed to [`spawn_pool`].
+pub struct AgentIcons {
+    pub taxi: Handle<Image>,
+    pub tesla: Handle<Image>,
+    pub bus: Handle<Image>,
+    pub glasses: Handle<Image>,
+    pub robot: Handle<Image>,
+}
+
 /// Schedule-driven replay bookkeeping: which baked trip occupies each pooled entity
 /// slot. Taxis use a forward cursor over the start-sorted trip list (rebuilt on a
-/// clock wrap/scrub); buses are few enough to full-scan each frame.
+/// clock wrap/scrub); buses admit from two `partition_point`-bounded windows of the
+/// same start-sorted list (`now` and the after-midnight `now + 1440`).
 #[derive(Resource, Default)]
 pub struct ReplayState {
     veh_slot_trip: Vec<i32>, // vehicle slot -> taxi trip idx (-1 = free)
@@ -201,6 +224,7 @@ pub struct ReplayState {
     veh_vp_prev: [f64; 3],   // last frame's viewport, for motion-settle detection
     bus_slot_trip: Vec<i32>, // bus slot -> bus trip idx (-1 = free)
     bus_mapped: Vec<bool>,   // bus trip -> currently occupies a slot
+    bus_max_span_min: Option<f32>, // widest bus trip (end-start); admit-window lower bound, computed once
 }
 
 impl ReplayState {
@@ -213,6 +237,7 @@ impl ReplayState {
             veh_vp_prev: [0.0; 3],
             bus_slot_trip: vec![-1; MAX_BUSES],
             bus_mapped: vec![false; n_bus],
+            bus_max_span_min: None,
         }
     }
 }
@@ -227,31 +252,31 @@ pub fn spawn_pool(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ColorMaterial>,
-    glasses_icon: Handle<Image>,
-    bus_icon: Handle<Image>,
+    icons: AgentIcons,
 ) -> AgentPool {
-    // Dashcam vehicles stay clay triangles (they read as moving cars); glasses
-    // pedestrians get the eyeglasses icon; ACE buses get the bus icon.
-    let veh_mesh = meshes.add(RegularPolygon::new(7.0, 3));
-    let veh_mat = materials.add(crate::theme::map::AMBER); // rideshare dashcam (amber warning)
-    let ped_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 16.0));
-    let ped_mat = materials.add(ColorMaterial {
-        color: Color::WHITE,
-        texture: Some(glasses_icon.clone()),
-        ..default()
-    });
+    // Every mobile class is a textured quad carrying its top-down icon (drawn
+    // nose-up; `position_agents` spins it along travel). The class color lives in
+    // the icon's ink, so each material stays WHITE (a tint would multiply it away).
+    let icon_mat = |materials: &mut Assets<ColorMaterial>, icon: &Handle<Image>| {
+        materials.add(ColorMaterial {
+            color: Color::WHITE,
+            texture: Some(icon.clone()),
+            ..default()
+        })
+    };
+    let veh_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 17.0));
+    let veh_mat = icon_mat(materials, &icons.taxi); // rideshare dashcam (amber ink)
+    // Quad sizes compensate for how much of the 128px tile each silhouette fills
+    // (the person is ~half the tile wide; the bus nearly full height).
+    let ped_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 20.0));
+    let ped_mat = icon_mat(materials, &icons.glasses);
     let bus_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 30.0));
-    let bus_mat = materials.add(ColorMaterial {
-        color: Color::WHITE,
-        texture: Some(bus_icon.clone()),
-        ..default()
-    });
-    // Delivery robots: a small cool-violet box — visually distinct from clay cars,
-    // icon peds, and bus icons (no texture needed).
-    let robot_mesh = meshes.add(Rectangle::new(10.0, 8.0));
-    let robot_mat = materials.add(crate::theme::map::ROBOT_VIOLET); // speculative outlier
-    // Teslas: a triangle in caution orange (deeper warning than the rideshare amber).
-    let tesla_mat = materials.add(crate::theme::map::ORANGE);
+    let bus_mat = icon_mat(materials, &icons.bus);
+    // Delivery robots: violet cargo box (speculative outlier).
+    let robot_mesh = meshes.add(world::merged_icon_quads(&[Vec2::new(0.0, 0.0)], 14.0));
+    let robot_mat = icon_mat(materials, &icons.robot);
+    // Teslas: orange glass-roof car (deeper warning than the rideshare amber).
+    let tesla_mat = icon_mat(materials, &icons.tesla);
 
     let mut vehicles = Vec::with_capacity(MAX_VEHICLES);
     for _ in 0..MAX_VEHICLES {
@@ -353,18 +378,23 @@ pub fn spawn_pool(
         active_teslas: 0,
         ped_mat,
         bus_mat,
-        glasses_icon,
-        bus_icon,
+        veh_mat,
+        tesla_mat,
+        glasses_icon: icons.glasses,
+        bus_icon: icons.bus,
+        taxi_icon: icons.taxi,
+        tesla_icon: icons.tesla,
     }
 }
 
 fn activate_ped(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand, start_node: u32) {
     let route = sim.graph.random_walk_route(start_node, PED_WALK_EDGES, rng);
     agent.progress_m = rng.next_f64() * route.total_m.max(1.0);
-    agent.route = route;
+    agent.route = Arc::new(route);
     agent.speed_mps = PED_SPEED_MPS;
     agent.active = true;
     agent.counted = false;
+    agent.seg_hint = 0;
 }
 
 /// Sample a graph node from a cumulative weight table (so agents cluster where the
@@ -387,10 +417,11 @@ fn activate_robot(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand) {
     let start = weighted_node(&sim.robot_node_cumulative, sim.graph.node_count(), rng);
     let route = sim.graph.random_walk_route(start, PED_WALK_EDGES, rng);
     agent.progress_m = rng.next_f64() * route.total_m.max(1.0);
-    agent.route = route;
+    agent.route = Arc::new(route);
     agent.speed_mps = ROBOT_SPEED_MPS;
     agent.active = true;
     agent.counted = false;
+    agent.seg_hint = 0;
 }
 
 /// Activate a Tesla: spawn at a registration-density-weighted node + drive the graph.
@@ -398,10 +429,11 @@ fn activate_tesla(agent: &mut MobileAgent, sim: &Sim, rng: &mut WyRand) {
     let start = weighted_node(&sim.tesla_node_cumulative, sim.graph.node_count(), rng);
     let route = sim.graph.random_walk_route(start, PED_WALK_EDGES, rng);
     agent.progress_m = rng.next_f64() * route.total_m.max(1.0);
-    agent.route = route;
+    agent.route = Arc::new(route);
     agent.speed_mps = TESLA_SPEED_MPS;
     agent.active = true;
     agent.counted = false;
+    agent.seg_hint = 0;
 }
 
 /// Scale active agent counts by time-of-day and the two scenario sliders, so the
@@ -579,20 +611,18 @@ pub fn animate_agents(
         {
             agent.progress_m += agent.speed_mps * dt;
             if agent.progress_m > agent.route.total_m {
-                // Continue the walk from the current endpoint instead of re-seeding
-                // at a fresh weighted node. Re-seeding on every completion teleported
-                // the agent across the map — and because a 16-edge walk completes in
-                // only a few real seconds at time-lapse rates, the faster classes
-                // (Teslas especially) appeared to "zip" around. The robotability /
-                // registration-density weighting still shapes the initial spawn.
                 let end = agent.route.position_at(agent.route.total_m);
                 let node = sim.graph.snap_nearest(end).unwrap_or(0);
-                agent.route = sim.graph.random_walk_route(node, PED_WALK_EDGES, &mut pool.rng);
+                agent.route = Arc::new(sim.graph.random_walk_route(node, PED_WALK_EDGES, &mut pool.rng));
                 agent.progress_m = 0.0;
                 agent.counted = false;
+                agent.seg_hint = 0;
             }
         }
-        let p = agent.route.position_at(agent.progress_m);
+        let (p, h) = {
+            let MobileAgent { route, progress_m, seg_hint, .. } = &mut *agent;
+            route.position_and_heading_at(*progress_m, seg_hint)
+        };
         let z = match agent.class {
             AgentClass::Vehicle => Z_VEHICLE,
             AgentClass::Bus => Z_BUS,
@@ -601,12 +631,7 @@ pub fn animate_agents(
             AgentClass::Tesla => Z_TESLA,
         };
         tf.translation = world::to_world(p, z);
-        // Orient the (symmetric) car triangles (dashcam + Tesla) along travel; bus +
-        // glasses + robot boxes stay upright.
-        if matches!(agent.class, AgentClass::Vehicle | AgentClass::Tesla) {
-            let h = agent.route.heading_at(agent.progress_m);
-            tf.rotation = Quat::from_rotation_z((h.y.atan2(h.x) - FRAC_PI_2) as f32);
-        }
+        tf.rotation = Quat::from_rotation_z((h.y.atan2(h.x) - FRAC_PI_2) as f32);
         if agent.flash > 0.0 {
             agent.flash = (agent.flash - time.delta_secs() * 2.5).max(0.0);
         }
@@ -693,6 +718,27 @@ pub fn mobile_capture_events(
             agent.counted = false; // re-arm after leaving range
         }
     }
+}
+
+/// Indices of the start-sorted `btrips` that *may* be live at minute `now`: the union
+/// of the `now` window and the after-midnight `now + 1440` window (trips encoded past
+/// 24h). A trip live at effective minute `m` has `start ∈ (m - max_span, m]` — since
+/// `end = start + span > m` forces `start > m - max_span`, and `start ≤ m` — so each
+/// window is a contiguous `partition_point`-bounded range. The caller still applies the
+/// exact `[start,end)` `bus_active` test; this only *bounds the scan* (replacing a full
+/// timetable sweep) and yields ascending indices, so the admitted set — and the over-cap
+/// earliest-start subsample — is byte-for-byte the same as the old `0..len` full scan.
+fn bus_admit_indices(
+    btrips: &[BusTrip],
+    now: f32,
+    max_span: f32,
+) -> std::iter::Chain<std::ops::Range<usize>, std::ops::Range<usize>> {
+    let window_at = |m: f32| {
+        let lo = btrips.partition_point(|t| t.start_min <= m - max_span);
+        let hi = btrips.partition_point(|t| t.start_min <= m);
+        lo..hi
+    };
+    window_at(now).chain(window_at(now + 1440.0))
 }
 
 /// Drive vehicles (taxis) + buses from the baked real-day schedules: a trip occupies
@@ -828,12 +874,13 @@ pub fn replay_agents(
                 break; // pool full
             }
             rs.veh_slot_trip[free] = ti as i32;
-            let route = sim.taxi_routes[trips[ti].route_idx as usize].clone();
+            let route = Arc::clone(&sim.taxi_routes[trips[ti].route_idx as usize]);
             if let Ok(mut a) = q.get_mut(pool.vehicles[free]) {
                 a.route = route;
                 a.active = true;
                 a.flash = 0.0;
                 a.counted = false;
+                a.seg_hint = 0;
             }
         }
         // Position active taxis along their route by elapsed fraction — but through a
@@ -855,13 +902,24 @@ pub fn replay_agents(
     }
     rs.veh_last_now = now;
 
-    // ---------- Buses: full scan (few; dual window for after-midnight trips) ----------
+    // ---------- Buses: two windowed scans over the start-sorted timetable ----------
+    // A bus is live if `now` is inside its `[start,end)`, or (for trips encoded past
+    // 24h) if `now + 1440` is. Both conditions are contiguous start-sorted ranges, so
+    // instead of scanning the whole day's timetable every frame we admit from just those
+    // two `partition_point`-bounded windows. Same `bus_active` predicate and same
+    // ascending-index (earliest-start-first) admission order as the old full scan, so the
+    // active set — and the over-cap subsample — is identical.
     let btrips = &sim.bus_day.trips;
     let bus_on = params.show_agents && params.ace_on && !params.heatmap_on;
     let bus_active = |t: &BusTrip| {
         (now >= t.start_min && now < t.end_min)
             || (now >= t.start_min - 1440.0 && now < t.end_min - 1440.0)
     };
+    // Widest trip span → how far before `now` a still-running trip may have started.
+    // Computed once (start-sorted trips make this the only bound the scan windows need).
+    let max_span = *rs
+        .bus_max_span_min
+        .get_or_insert_with(|| btrips.iter().map(|t| t.end_min - t.start_min).fold(0.0_f32, f32::max));
     for slot in 0..rs.bus_slot_trip.len() {
         let ti = rs.bus_slot_trip[slot];
         if ti >= 0 && (!bus_on || !bus_active(&btrips[ti as usize])) {
@@ -874,7 +932,10 @@ pub fn replay_agents(
     }
     if bus_on {
         let mut free = 0usize;
-        for ti in 0..btrips.len() {
+        // Window A (now) has lower indices than window B (now+1440), so the chained
+        // iterator preserves earliest-start-first order; `bus_mapped` guards any
+        // (impossible, for buses) double-admit. See [`bus_admit_indices`].
+        'admit: for ti in bus_admit_indices(btrips, now, max_span) {
             if !bus_active(&btrips[ti]) || rs.bus_mapped[ti] {
                 continue;
             }
@@ -882,16 +943,17 @@ pub fn replay_agents(
                 free += 1;
             }
             if free >= rs.bus_slot_trip.len() {
-                break;
+                break 'admit;
             }
             rs.bus_slot_trip[free] = ti as i32;
             rs.bus_mapped[ti] = true;
-            let route = sim.bus_routes[btrips[ti].shape_idx as usize].clone();
+            let route = Arc::clone(&sim.bus_routes[btrips[ti].shape_idx as usize]);
             if let Ok(mut a) = q.get_mut(pool.buses[free]) {
                 a.route = route;
                 a.active = true;
                 a.flash = 0.0;
                 a.counted = false;
+                a.seg_hint = 0;
             }
         }
         // Position active buses by their real per-stop time→arc keyframes, so motion
@@ -951,6 +1013,53 @@ fn bus_arc_at(kf: &[[f32; 2]], t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bus_admit_indices` (the two windowed scans) must admit exactly the trips a full
+    /// `0..len` scan filtered by `bus_active` would, for every minute of the day —
+    /// including the after-midnight wrap for trips encoded past 1440.
+    #[test]
+    fn bus_admit_windows_match_full_scan() {
+        let mk = |start: f32, end: f32| BusTrip {
+            route_idx: 0,
+            shape_idx: 0,
+            start_min: start,
+            end_min: end,
+            keyframes: vec![[start, 0.0], [end, 100.0]],
+        };
+        // Regular daytime trips, an evening trip that runs past midnight (end > 1440),
+        // and after-midnight trips encoded past 24h (start ≥ 1440).
+        let mut trips = vec![
+            mk(0.0, 45.0),
+            mk(360.0, 400.0),
+            mk(360.0, 500.0), // overlapping-start, longer → sets max_span
+            mk(720.0, 765.0),
+            mk(1380.0, 1470.0), // starts 23:00, ends 00:30 next day
+            mk(1450.0, 1500.0), // after-midnight (01:10–01:30 encoded past 24h)
+            mk(1439.0, 1441.0),
+        ];
+        trips.sort_by(|a, b| a.start_min.total_cmp(&b.start_min));
+        let max_span = trips.iter().map(|t| t.end_min - t.start_min).fold(0.0_f32, f32::max);
+
+        for now_i in 0..1440 {
+            let now = now_i as f32;
+            let bus_active = |t: &BusTrip| {
+                (now >= t.start_min && now < t.end_min)
+                    || (now >= t.start_min - 1440.0 && now < t.end_min - 1440.0)
+            };
+            // Ground truth: every trip the old full scan would find active.
+            let expected: Vec<usize> =
+                (0..trips.len()).filter(|&i| bus_active(&trips[i])).collect();
+            // Via the windows (then the same exact predicate + dedup, as the system does).
+            let mut got: Vec<usize> = Vec::new();
+            for i in bus_admit_indices(&trips, now, max_span) {
+                if bus_active(&trips[i]) && !got.contains(&i) {
+                    got.push(i);
+                }
+            }
+            got.sort_unstable();
+            assert_eq!(got, expected, "active set differs at minute {now_i}");
+        }
+    }
 
     #[test]
     fn landmarks_occlude_agents() {

@@ -107,7 +107,12 @@ const ZOOM_MAX: f32 = 30.0;
 const STORY_OVERVIEW_ZOOM: f32 = 9.0; // StoryMap "overview" — wide view of the island
 const FLY_AREA_ZOOM: f32 = 2.6; // walkshed center — shows ~the 10-minute reach
 const FLY_POINT_ZOOM: f32 = 1.6; // a single route endpoint — street level
+const FLY_DIRECT_ZOOM: f32 = 0.8; // direct-capture — tight street frame so the FOV cones read
 const FLY_DUR: f32 = 0.7; // seconds
+/// Reel-only Ken-Burns push-in: fraction of the camera scale (m/px) shed per second on a
+/// settled hold, so a static caption beat drifts gently instead of freezing. ~1%/s ≈ a 4–5%
+/// zoom-in over a typical hold. See [`ken_burns_drift`].
+const KEN_BURNS_RATE: f32 = 0.01;
 
 // Paths relative to the AssetServer root (`assets/`); works native + web.
 // Distinct extensions disambiguate the per-type postcard loaders.
@@ -159,11 +164,19 @@ const DOT_PATH_NYC: &str = "processed/dot_cameras_nyc.osdot";
 /// MVP; the other agent layers stay Manhattan-only / off.
 const ACE_PATH_NYC: &str = "processed/ace_corridors_nyc.osace";
 const BUS_DAY_PATH_NYC: &str = "processed/bus_day_nyc.osbusday";
-/// Citywide street network — the five-borough **drive** graph (OSM surface roads,
-/// largest connected component spanning all boroughs via their bridges; the walk
-/// network would strand Staten Island, which has no pedestrian crossing). Renders the
-/// streets across the city and backs citywide routing/walkshed.
+/// Citywide **drive** network (CSCL, incl. highways/ramps). Renders the street basemap and
+/// backs vehicle routing + the roving-coverage overlay.
 const GRAPH_PATH_NYC: &str = "processed/graph_nyc.osgraph";
+/// Citywide **pedestrian** network (CSCL walk classifier) — what every walkshed and A→B walk
+/// routes over, and what the paper's `R_i` is computed on.
+///
+/// This graph deliberately leaves **Staten Island as its own component**: the Verrazzano carries no
+/// footway, so there is no pedestrian crossing, and a walk route from SI to Brooklyn *should* fail.
+/// The drive graph was originally used here precisely because it keeps one connected component —
+/// a routing convenience that silently became a measurement decision, flooding walksheds over
+/// 724 km of limited-access highway. A 10-minute walkshed is local, so cross-borough connectivity
+/// buys nothing and cost correctness. See `graph_osm::CsclNetwork`.
+const GRAPH_WALK_PATH_NYC: &str = "processed/graph_nyc_walk.osgraph";
 /// All-five-borough outline (one asset): the five main landmasses first (ring `i` ↔
 /// borough region `i` for the footprint loader), then detached islands. Also the
 /// runtime camera clip (`in_manhattan` tests point-in-any-ring), so it un-clips the
@@ -198,7 +211,6 @@ const NEIGHBORHOOD_LABEL_MAX_MPP: f32 = 22.0;
 
 /// Runtime state for one lazily-loaded footprint region (a borough).
 struct FootprintRegionState {
-    label: &'static str,
     path: &'static str,
     bbox: [f64; 4], // ENU [min_x, min_y, max_x, max_y]
     handle: Option<Handle<FootprintsRes>>,
@@ -308,6 +320,10 @@ pub enum Mode {
     None,
     Route,
     Walkshed,
+    /// A stricter "My area": which cameras are pointed *directly at* one address
+    /// (FOV facing it, within range) + how many moving dashcams likely record it per
+    /// day — not the "could see you within a 10-min walk" reach of `Walkshed`.
+    DirectCapture,
     Neighborhoods,
 }
 
@@ -381,10 +397,97 @@ impl NeighborhoodStat {
     }
 }
 
+/// Uniform grid over neighborhood bounding boxes so `point → neighborhood` is
+/// O(cell occupancy) instead of O(all ~312). Built once at world build and stored
+/// on [`Sim`]; the per-frame mobile tally (`sample_neighborhood_mobile`) hits this
+/// for thousands of agents + the full active taxi fleet each recount.
+///
+/// Exact-preserving: a neighborhood can only [`contains`](NeighborhoodStat::contains)
+/// a point that lies inside its bbox, so any true match is guaranteed to have been
+/// bucketed into the query point's cell — the grid's candidate set is a superset of
+/// the true match. Candidates are stored in ascending neighborhood index and tested
+/// in order, so [`locate`](NeighborhoodGrid::locate) returns the *same* first match
+/// the old `neighborhoods.iter().position(|st| st.contains(p))` did.
+#[derive(Default)]
+pub struct NeighborhoodGrid {
+    min_x: f64,
+    min_y: f64,
+    inv_cell: f64,
+    cols: usize,
+    rows: usize,
+    /// Ascending neighborhood indices whose bbox overlaps each cell (row-major).
+    cells: Vec<Vec<u32>>,
+}
+
+impl NeighborhoodGrid {
+    /// ~500 m cells — neighborhoods span ~1–2 km, so each overlaps only a handful of
+    /// cells and each cell lists only a handful of neighborhoods.
+    const CELL_M: f64 = 500.0;
+
+    pub fn build(nbhds: &[NeighborhoodStat]) -> Self {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for st in nbhds {
+            min_x = min_x.min(st.bbox[0]);
+            min_y = min_y.min(st.bbox[1]);
+            max_x = max_x.max(st.bbox[2]);
+            max_y = max_y.max(st.bbox[3]);
+        }
+        if !min_x.is_finite() {
+            return Self::default(); // no neighborhoods → locate() falls back to linear
+        }
+        let cell = Self::CELL_M;
+        let cols = (((max_x - min_x) / cell).ceil() as usize).max(1);
+        let rows = (((max_y - min_y) / cell).ceil() as usize).max(1);
+        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+        let clampi = |v: f64, hi: usize| (v.floor() as isize).clamp(0, hi as isize - 1) as usize;
+        // Push in ascending `i` so each cell's list stays index-sorted (first-match order).
+        for (i, st) in nbhds.iter().enumerate() {
+            let c0 = clampi((st.bbox[0] - min_x) / cell, cols);
+            let c1 = clampi((st.bbox[2] - min_x) / cell, cols);
+            let r0 = clampi((st.bbox[1] - min_y) / cell, rows);
+            let r1 = clampi((st.bbox[3] - min_y) / cell, rows);
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    cells[r * cols + c].push(i as u32);
+                }
+            }
+        }
+        Self { min_x, min_y, inv_cell: 1.0 / cell, cols, rows, cells }
+    }
+
+    /// Lowest-index neighborhood containing `p`, or `None`. Bit-identical to
+    /// `nbhds.iter().position(|st| st.contains(p))`.
+    pub fn locate(&self, p: Enu, nbhds: &[NeighborhoodStat]) -> Option<usize> {
+        if self.cells.is_empty() {
+            return nbhds.iter().position(|st| st.contains(p)); // unbuilt: exact fallback
+        }
+        let cx = (p.x - self.min_x) * self.inv_cell;
+        let cy = (p.y - self.min_y) * self.inv_cell;
+        if cx < 0.0 || cy < 0.0 || cx >= self.cols as f64 || cy >= self.rows as f64 {
+            return None; // outside every bbox → outside every neighborhood
+        }
+        for &i in &self.cells[cy as usize * self.cols + cx as usize] {
+            if nbhds[i as usize].contains(p) {
+                return Some(i as usize);
+            }
+        }
+        None
+    }
+}
+
 /// The loaded simulation world (routing graph + placed sensors + ACE corridors).
 #[derive(Resource)]
 pub struct Sim {
     pub graph: StreetGraph,
+    /// Building-footprint line-of-sight index every camera sightline is tested against.
+    ///
+    /// **Currently always empty in the app** — the citywide index is ~5.5 M walls (~110 MB),
+    /// which the WASM build cannot hold. The batch (and therefore every number in the paper)
+    /// uses the real index; bringing the app to parity needs a per-borough / per-viewport
+    /// subset (docs/OCCLUSION_PLAN.md, phase 5). Typed as the real thing so that flip is a
+    /// one-line change and every call site is already correct.
+    pub occ: sim_core::OccluderIndex,
     /// Drive network (CSCL, incl. highways) the roving-coverage overlay snaps onto.
     pub drive_graph: StreetGraph,
     pub sensors: Vec<sim_core::SensorInstance>,
@@ -408,14 +511,17 @@ pub struct Sim {
     pub cam_query_r2: f64,
     /// Per-neighborhood camera aggregation (all boroughs; app renders Manhattan by default).
     pub neighborhoods: Vec<NeighborhoodStat>,
+    /// Spatial index over `neighborhoods` bboxes for O(cell) point-in-neighborhood
+    /// lookup in the per-frame mobile tally (same result as a linear `position` scan).
+    pub neighborhood_grid: NeighborhoodGrid,
     /// Real-day ACE bus schedule (replayed by the clock).
     pub bus_day: BusDayLayer,
     /// Real-day rideshare trips (replayed by the clock).
     pub taxi_day: TaxiDayLayer,
     /// `Route` per bus shape (for `position_at` during replay), indexed by `BusTrip.shape_idx`.
-    pub bus_routes: Vec<Route>,
+    pub bus_routes: Vec<std::sync::Arc<Route>>,
     /// `Route` per taxi O-D pool entry, indexed by `TaxiTrip.route_idx`.
-    pub taxi_routes: Vec<Route>,
+    pub taxi_routes: Vec<std::sync::Arc<Route>>,
     /// ENU bbox `[min_x, min_y, max_x, max_y]` per taxi route (same index), for the
     /// viewport cull in `replay_agents` — admit a trip only if its route bbox overlaps
     /// the visible rect (cheap; no per-frame `position_at` to test visibility).
@@ -465,6 +571,10 @@ pub struct Params {
     pub plazas_on: bool,
     /// Draw the curated landmark buildings as 2.5D massing (orientation aids).
     pub landmarks_on: bool,
+    /// Float the landmark **name labels** (+ their offshore leader lines) over the water.
+    /// Off by default — the massings orient on their own; the names are an opt-in overlay
+    /// in "More layers" (independent of `landmarks_on`).
+    pub landmark_labels_on: bool,
     /// Draw the LinkNYC kiosks (Wi-Fi hubs). Off by default — a dense supplementary
     /// layer the visitor opts into.
     pub linknyc_on: bool,
@@ -518,6 +628,7 @@ impl Default for Params {
             parks_on: true,
             plazas_on: true,
             landmarks_on: true,
+            landmark_labels_on: false,
             linknyc_on: false,
             ace_on: true,
             dashcam_on: true,
@@ -637,10 +748,12 @@ pub(crate) struct FacilityPin {
     pub name: String,
     pub kind: sim_core::assets::FacilityKind,
     pub subtype: String,
-    pub lat: f64,
-    pub lon: f64,
     /// Deduplicated fixed cameras within [`FACILITY_SCAN_M`] (one per physical camera).
     pub cameras_near: u32,
+    /// Position + layer of each camera counted in `cameras_near` (one per physical group,
+    /// at the group's drawn-marker position). Ringed on the map when the institution is
+    /// selected, so the score reads camera-by-camera. Empty in the ranking-only unit tests.
+    pub near_cams: Vec<(Vec2, sim_core::SourceKind)>,
 }
 /// All institutions + a surveillance-ranked index, for the left panel + click-picking.
 #[derive(Resource, Default)]
@@ -664,10 +777,19 @@ pub(crate) struct InstitutionsView {
     pub t: f32,
     pub show_schools: bool,
     pub show_libraries: bool,
+    pub show_parks: bool,
+    pub show_plazas: bool,
 }
 impl Default for InstitutionsView {
     fn default() -> Self {
-        InstitutionsView { active: false, t: 0.0, show_schools: true, show_libraries: true }
+        InstitutionsView {
+            active: false,
+            t: 0.0,
+            show_schools: true,
+            show_libraries: true,
+            show_parks: true,
+            show_plazas: true,
+        }
     }
 }
 /// Rank facility indices most-watched first (nearby-camera count desc, then name asc
@@ -688,12 +810,15 @@ fn rank_facilities(pins: &[FacilityPin]) -> Vec<usize> {
 pub(crate) struct FacilityMarker {
     pub kind: sim_core::assets::FacilityKind,
 }
-/// The single reusable ring that highlights the selected institution.
+/// Tags every mesh that should track the selected institution: the selection ring
+/// and the two 200 m scan-range discs (fill + outline). `facility_highlight_follow`
+/// moves and shows/hides all of them together.
 #[derive(Component)]
 pub(crate) struct FacilityHighlight;
-/// Handle to the [`FacilityHighlight`] entity (moved onto the selected institution).
-#[derive(Resource)]
-pub(crate) struct FacilityHighlightEntity(pub Entity);
+/// One layer-colored ring drawn around each counted camera near the selected
+/// institution. Spawned/despawned in bulk by `facility_cam_rings` on selection change.
+#[derive(Component)]
+pub(crate) struct FacilityCamRing;
 /// World size (m) of an institution marker square, and its painter z (above cameras
 /// so the subjects read clearly while the view is up).
 const FACILITY_MARK_SIZE: f32 = 26.0;
@@ -795,10 +920,17 @@ pub struct WalkLive {
     pub last_progress: f64,
 }
 
-/// The current one-point walkshed result (for the panel).
+/// The current one-point walkshed result (for the panel). Also carries the
+/// **Direct capture** result (`capture` / `daily_dashcams`), since that mode reuses the
+/// same address-input + `WalkshedVis` plumbing — only one of `summary` / `capture` is
+/// set at a time, chosen by `Mode`. `sync_mode` clears all of it on a mode switch.
 #[derive(Resource, Default)]
 pub struct WalkshedState {
     pub summary: Option<sim_core::WalkshedSummary>,
+    /// Direct-capture result: the cameras pointed straight at the placed address.
+    pub capture: Option<sim_core::DirectCaptureSummary>,
+    /// Direct-capture: modeled moving dashcams that record the address per day.
+    pub daily_dashcams: f64,
     /// A gentle one-off hint shown with the result (e.g. the seeded SoHo example);
     /// cleared the moment the user places their own walkshed.
     pub status: Option<String>,
@@ -852,8 +984,9 @@ pub(crate) struct LandmarkVis;
 #[derive(Component)]
 pub(crate) struct BridgeVis;
 /// Landmark name label (world-anchored `Text2d`), kept a constant on-screen size by
-/// `size_landmark_labels`; follows `landmarks_on`. Floated off-island over the water
-/// with a leader line back to the building (see [`offshore_label_anchors`]).
+/// `size_landmark_labels`; follows `landmark_labels_on` (its own toggle, off by default).
+/// Floated off-island over the water with a leader line back to the building (see
+/// [`offshore_label_anchors`]).
 #[derive(Component)]
 pub(crate) struct LandmarkLabel;
 /// Hairline leader lines tying off-island labels back to their objects. One merged
@@ -864,7 +997,7 @@ pub(crate) struct LeaderLines {
     base_half: f32,
     mesh: Handle<Mesh>,
 }
-/// Marks the landmark leader-line mesh (visibility follows `landmarks_on`, like the labels).
+/// Marks the landmark leader-line mesh (visibility follows `landmark_labels_on`, like the labels).
 #[derive(Component)]
 pub(crate) struct LandmarkLeader;
 #[derive(Component)]
@@ -929,6 +1062,12 @@ fn main() {
             ..default()
         }),
         ..default()
+    }).set(bevy::asset::AssetPlugin {
+        // Web has no hot-reload; disable the file watcher to stop per-frame
+        // `.meta` 404 polls that spam the console and waste bandwidth.
+        #[cfg(target_arch = "wasm32")]
+        watch_for_changes_override: Some(false),
+        ..default()
     }))
     .add_plugins(EguiPlugin::default())
     // Transparent on web (the white #stage shows through); white paper on native.
@@ -960,7 +1099,7 @@ fn main() {
     .init_resource::<SelectedFacility>()
     .init_resource::<InstitutionsView>()
     .init_resource::<NeighborhoodLive>()
-    .init_resource::<SimClock>()
+    .insert_resource(url_clock())
     .init_resource::<SimDate>()
     .init_resource::<ThemeReady>()
     .init_resource::<agents::ReplayState>()
@@ -970,14 +1109,15 @@ fn main() {
     .init_resource::<coverage::EdgeGrid>()
     .init_resource::<FootprintRegions>()
     .insert_resource(AgentPool::empty())
+    .insert_resource(ReelMode(url_reel_mode()))
     .add_systems(Startup, (start_loading, init_reduced_motion))
     .add_systems(
         Update,
         (
             (build_world, manage_footprint_regions),
             advance_clock,
-            (camera_control, fly_camera).chain(),
-            (handle_click, geocode::geocode_tick, apply_geocode, storymap_tick, storymap_autostart),
+            (camera_control, fly_camera, ken_burns_drift).chain(),
+            (handle_click, geocode::geocode_tick, apply_geocode, storymap_tick, storymap_autostart, reel_stat_emit),
             recompute_on_change,
             animate_walker,
             (walk_capture_events, agents::mobile_capture_events).chain(),
@@ -1030,6 +1170,8 @@ fn main() {
                 institutions_tick,
                 facility_markers_visibility,
                 facility_highlight_follow,
+                facility_cam_rings,
+                story_apply_institutions,
             ),
             (ui::setup_theme, apply_reset, smoke_exit),
         ),
@@ -1042,15 +1184,57 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, shot_capture);
     loading::register(&mut app);
-    // Dev-only: `OURSPACE_FPS=1` logs FPS / frame time to the console (~1/s) for
-    // performance measurement (e.g. citywide taxi-pool sizing).
-    if std::env::var("OURSPACE_FPS").is_ok() {
-        app.add_plugins((
-            bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
-            bevy::diagnostic::LogDiagnosticsPlugin::default(),
-        ));
+    // Phase-0 perf instrumentation: `?debug=perf` (web) / `OURSPACE_DEBUG_PERF=1` /
+    // `OURSPACE_FPS=1` (native) turns on the frame-time diagnostics + the on-canvas perf
+    // HUD (`ui::perf_hud`). `OURSPACE_FPS` additionally logs to the console (~1/s) for
+    // headless capture. See docs/SCALING.md §Phase 0.
+    if debug_perf_enabled() {
+        app.add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default());
+        app.add_systems(Update, ui::perf_hud);
+        if std::env::var("OURSPACE_FPS").is_ok() {
+            app.add_plugins(bevy::diagnostic::LogDiagnosticsPlugin::default());
+        }
     }
     app.run();
+}
+
+/// Whether the perf HUD + frame-time diagnostics are on. Web: `?debug=perf`. Native:
+/// `OURSPACE_DEBUG_PERF=1` or `OURSPACE_FPS=1` (the latter also logs to the console).
+/// Mirrors [`citywide_scope`]'s web-sys read; inert on the opposite target.
+fn debug_perf_enabled() -> bool {
+    if std::env::var("OURSPACE_DEBUG_PERF").is_ok() || std::env::var("OURSPACE_FPS").is_ok() {
+        return true;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .map(|s| s.contains("debug=perf"))
+            .unwrap_or(false);
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// "Reel"/clean-capture mode (`?reel=1`, or native `OURSPACE_REEL`): drop the right
+/// control panel and the StoryMap transport buttons so a recorded 9:16 frame is just the
+/// map + the date plate + the story caption. Used by `tools/reels/render.mjs`.
+#[derive(Resource, Default, Clone, Copy)]
+pub(crate) struct ReelMode(pub bool);
+
+fn url_reel_mode() -> bool {
+    if std::env::var("OURSPACE_REEL").is_ok() {
+        return true;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .map(|s| s.contains("reel=1") || s.contains("reel=on"))
+            .unwrap_or(false);
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 // ----------------------------------------------------------------- helpers ----
@@ -1226,8 +1410,10 @@ fn start_loading(
     // Only the layers with a citywide variant are swapped; the rest stay Manhattan
     // for the static-first MVP (footprints lazy per-borough; landmarks/ALPR/
     // enforcement/LinkNYC Manhattan-only).
+    // `graph_path` is the **pedestrian** graph (walksheds + A→B walks); the drive graph is chosen
+    // separately below. Citywide these are two different assets — see `GRAPH_WALK_PATH_NYC`.
     let (graph_path, cameras_path, dot_path, borough_path, ace_path, bus_day_path) = if citywide {
-        (GRAPH_PATH_NYC, CAMERAS_PATH_NYC, DOT_PATH_NYC, BOROUGH_PATH_NYC, ACE_PATH_NYC, BUS_DAY_PATH_NYC)
+        (GRAPH_WALK_PATH_NYC, CAMERAS_PATH_NYC, DOT_PATH_NYC, BOROUGH_PATH_NYC, ACE_PATH_NYC, BUS_DAY_PATH_NYC)
     } else {
         (GRAPH_PATH, CAMERAS_PATH, DOT_PATH, BOROUGH_PATH, ACE_PATH, BUS_DAY_PATH)
     };
@@ -1307,9 +1493,9 @@ fn manage_footprint_regions(
         if boro.0.rings.len() < FOOTPRINT_REGIONS.len() {
             return;
         }
-        for (i, (label, path)) in FOOTPRINT_REGIONS.iter().enumerate() {
+        // (The tuple's label half is documentation; regions are tracked by path.)
+        for (i, (_label, path)) in FOOTPRINT_REGIONS.iter().enumerate() {
             state.regions.push(FootprintRegionState {
-                label,
                 path,
                 bbox: ring_bbox(&boro.0.rings[i]),
                 handle: None,
@@ -1736,8 +1922,14 @@ fn build_world(
         ));
     }
 
-    // Streets.
-    let street_mesh = meshes.add(world::line_list_mesh(world::street_line_positions(graph.asset())));
+    // Streets — the **union** of both networks, because neither alone is the street map a reader
+    // expects. The pedestrian graph has no highways (the FDR, the BQE, the Cross Bronx would vanish);
+    // the drive graph has no park paths, promenades or pedestrian plazas (Broadway at Union Square
+    // would vanish). Routing still uses whichever graph is correct for the traveller — this is the
+    // basemap only, so drawing a segment twice costs a few overlapping lines and nothing else.
+    let mut street_pts = world::street_line_positions(graph.asset());
+    street_pts.extend(world::street_line_positions(drive_graph.asset()));
+    let street_mesh = meshes.add(world::line_list_mesh(street_pts));
     let street_mat = materials.add(theme::map::ZINC_500); // medium-gray ink linework on paper
     commands.spawn((
         Mesh2d(street_mesh),
@@ -2088,35 +2280,45 @@ fn build_world(
     // Institutions explore view reveals them.
     {
         use sim_core::assets::FacilityKind;
-        let fac_proj = EnuProjection::default();
         let scan_r2 = FACILITY_SCAN_M * FACILITY_SCAN_M;
         let mut fac_pins: Vec<FacilityPin> = fac
             .0
             .facilities
             .iter()
             .map(|f| {
-                let mut groups = std::collections::HashSet::new();
+                // One entry per *physical camera group* within range, keyed by group so the
+                // count stays deduplicated; the value is the group's drawn-marker position +
+                // layer (its primary), so the on-select rings land on the visible icons.
+                let mut groups: std::collections::HashMap<u32, (Vec2, sim_core::SourceKind)> =
+                    std::collections::HashMap::new();
                 for cand in cam_index.locate_within_distance([f.x, f.y], scan_r2) {
-                    groups.insert(sensors[cand.data as usize].group);
+                    let g = sensors[cand.data as usize].group;
+                    groups.entry(g).or_insert_with(|| {
+                        let prim = group_primary_idx.get(&g).copied().unwrap_or(cand.data as usize);
+                        let ps = &sensors[prim];
+                        (Vec2::new(ps.wedge.apex.x as f32, ps.wedge.apex.y as f32), ps.kind)
+                    });
                 }
-                let (lat, lon) = fac_proj.to_wgs84(Enu::new(f.x, f.y));
                 FacilityPin {
                     pos: Vec2::new(f.x as f32, f.y as f32),
                     name: f.name.clone(),
                     kind: f.kind,
                     subtype: f.subtype.clone(),
-                    lat,
-                    lon,
                     cameras_near: groups.len() as u32,
+                    near_cams: groups.into_values().collect(),
                 }
             })
             .collect();
         // Surveillance ranking: most cameras nearby first, name-stable on ties.
         let ranked = rank_facilities(&fac_pins);
-        // Per-class merged-quad markers in cool ink (subjects, not warm sensors).
+        // Per-class merged-quad markers, each a distinct hue that also contrasts its own
+        // ground fabric (dark green park marker on the sage park fill; deep rose plaza
+        // marker on the pale concrete plaza fill).
         for (kind, color) in [
             (FacilityKind::School, theme::map::ca(0x43, 0x37, 0x8a, 0.95)), // indigo
             (FacilityKind::Library, theme::map::ca(0x0d, 0x6b, 0x66, 0.95)), // teal
+            (FacilityKind::Park, theme::map::ca(0x16, 0x65, 0x34, 0.95)),   // deep green
+            (FacilityKind::Plaza, theme::map::ca(0x9d, 0x17, 0x4d, 0.95)),  // deep rose
         ] {
             let pts: Vec<Enu> = fac_pins
                 .iter()
@@ -2135,21 +2337,41 @@ fn build_world(
             ));
         }
         // A single reusable highlight ring, parked off until an institution is selected.
-        let highlight = commands
-            .spawn((
-                Mesh2d(meshes.add(Annulus::new(17.0, 23.0))),
-                MeshMaterial2d(materials.add(theme::map::ca(0xc2, 0x41, 0x0c, 0.95))),
-                Transform::from_xyz(0.0, 0.0, FACILITY_MARK_Z + 0.2),
-                Visibility::Hidden,
-                FacilityHighlight,
-            ))
-            .id();
-        commands.insert_resource(FacilityHighlightEntity(highlight));
+        commands.spawn((
+            Mesh2d(meshes.add(Annulus::new(17.0, 23.0))),
+            MeshMaterial2d(materials.add(theme::map::ca(0xc2, 0x41, 0x0c, 0.95))),
+            Transform::from_xyz(0.0, 0.0, FACILITY_MARK_Z + 0.2),
+            Visibility::Hidden,
+            FacilityHighlight,
+        ));
+        // The 200 m surveillance-scan range, borrowed from "My area": a translucent gold
+        // wash + a deep-amber boundary so the user can *see* the radius within which the
+        // nearby-camera score was counted (FACILITY_SCAN_M). Both track the selected
+        // institution via `FacilityHighlight` (the follow system only updates x/y +
+        // visibility, so each keeps its own z + mesh). Sat beneath the camera markers
+        // (z 1.0) so the cameras that were counted still read on top of the wash.
+        let scan_r = FACILITY_SCAN_M as f32;
+        commands.spawn((
+            Mesh2d(meshes.add(Circle::new(scan_r))),
+            MeshMaterial2d(materials.add(theme::map::ca(0xfa, 0xcc, 0x15, 0.10))),
+            Transform::from_xyz(0.0, 0.0, 0.42),
+            Visibility::Hidden,
+            FacilityHighlight,
+        ));
+        commands.spawn((
+            Mesh2d(meshes.add(Annulus::new(scan_r - 5.0, scan_r))),
+            MeshMaterial2d(materials.add(theme::map::ca(0xb4, 0x53, 0x09, 0.85))),
+            Transform::from_xyz(0.0, 0.0, 0.46),
+            Visibility::Hidden,
+            FacilityHighlight,
+        ));
         info!(
-            "institutions: {} loaded ({} schools, {} libraries)",
+            "institutions: {} loaded ({} schools, {} libraries, {} parks, {} plazas)",
             fac_pins.len(),
             fac_pins.iter().filter(|p| p.kind == FacilityKind::School).count(),
             fac_pins.iter().filter(|p| p.kind == FacilityKind::Library).count(),
+            fac_pins.iter().filter(|p| p.kind == FacilityKind::Park).count(),
+            fac_pins.iter().filter(|p| p.kind == FacilityKind::Plaza).count(),
         );
         commands.insert_resource(FacilityDirectory { pins: std::mem::take(&mut fac_pins), ranked });
     }
@@ -2178,9 +2400,14 @@ fn build_world(
     // fixed entity pool (vehicles + pedestrians). Routes also live on `Sim` for
     // runtime weighted resampling on recycle.
     let vehicle_routes = vr.0.routes.clone();
-    let glasses_icon = asset_server.load("icons/glasses.png");
-    let bus_icon = asset_server.load("icons/bus.png");
-    let pool = agents::spawn_pool(&mut commands, &mut meshes, &mut materials, glasses_icon, bus_icon);
+    let icons = agents::AgentIcons {
+        taxi: asset_server.load("icons/taxi.png"),
+        tesla: asset_server.load("icons/tesla.png"),
+        bus: asset_server.load("icons/bus.png"),
+        glasses: asset_server.load("icons/glasses.png"),
+        robot: asset_server.load("icons/robot.png"),
+    };
+    let pool = agents::spawn_pool(&mut commands, &mut meshes, &mut materials, icons);
     commands.insert_resource(pool);
 
     if std::env::var("OURSPACE_SMOKE").is_ok() {
@@ -2234,40 +2461,48 @@ fn build_world(
     for st in &mut neighborhoods {
         st.density = st.total as f64 / st.area_km2;
     }
+    // Spatial index for the per-frame mobile tally's point-in-neighborhood lookups.
+    let neighborhood_grid = NeighborhoodGrid::build(&neighborhoods);
 
     // Real-day trip replay: clone the baked schedules and pre-build a `Route` per
     // bus shape / taxi O-D so the runtime can `position_at` without re-deriving.
     let bus_day = bd.0.clone();
     let taxi_day = td.0.clone();
-    let bus_routes: Vec<Route> = bus_day
+    let bus_routes: Vec<std::sync::Arc<Route>> = bus_day
         .shapes
         .iter()
-        .map(|s| Route::from_points(s.iter().map(|p| Enu::new(p[0] as f64, p[1] as f64)).collect()))
+        .map(|s| std::sync::Arc::new(Route::from_points(s.iter().map(|p| Enu::new(p[0] as f64, p[1] as f64)).collect())))
         .collect();
-    let taxi_routes: Vec<Route> = taxi_day
+    let taxi_routes: Vec<std::sync::Arc<Route>> = taxi_day
         .routes
         .iter()
         .map(|r| {
-            Route::from_points(r.polyline.iter().map(|p| Enu::new(p[0] as f64, p[1] as f64)).collect())
+            std::sync::Arc::new(Route::from_points(r.polyline.iter().map(|p| Enu::new(p[0] as f64, p[1] as f64)).collect()))
         })
         .collect();
     // Turn-aware pace per taxi route: brake into corners, cruise (≤ the posted limit)
     // on straights, same trip duration. NYC's default limit is 25 mph; sharp turns are
     // taken down to ~30% of it. Computed once per pooled route (not per trip).
+    // NOTE: paces + bboxes are cheap (no f64 conversion); the Route build above is the
+    // expensive part (~200k × 20-point polylines). Kept eager for now because the
+    // viewport cull reads bboxes every frame and the pace is read per active taxi.
+    // A future optimization: store bboxes from the raw f32 polylines (no Route needed)
+    // and build Routes lazily per-slot on admission.
     let taxi_paces: Vec<sim_core::PaceProfile> = taxi_routes
         .iter()
         .map(|r| sim_core::PaceProfile::for_route(r, NYC_SPEED_LIMIT_MPS, TURN_SPEED_FRAC))
         .collect();
     // Per-route ENU bbox for the viewport cull (built once; cheap rect test at runtime).
-    let taxi_route_bboxes: Vec<[f32; 4]> = taxi_routes
+    let taxi_route_bboxes: Vec<[f32; 4]> = taxi_day
+        .routes
         .iter()
         .map(|r| {
             let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-            for p in &r.points {
-                x0 = x0.min(p.x as f32);
-                y0 = y0.min(p.y as f32);
-                x1 = x1.max(p.x as f32);
-                y1 = y1.max(p.y as f32);
+            for p in r.polyline.iter() {
+                x0 = x0.min(p[0]);
+                y0 = y0.min(p[1]);
+                x1 = x1.max(p[0]);
+                y1 = y1.max(p[1]);
             }
             [x0, y0, x1, y1]
         })
@@ -2320,6 +2555,7 @@ fn build_world(
 
     commands.insert_resource(Sim {
         graph,
+        occ: sim_core::OccluderIndex::empty(),
         drive_graph,
         sensors,
         layer,
@@ -2334,6 +2570,7 @@ fn build_world(
         cam_index,
         cam_query_r2,
         neighborhoods,
+        neighborhood_grid,
         bus_day,
         taxi_day,
         taxi_paces,
@@ -2419,8 +2656,11 @@ const PANEL_HALF_PX: f32 = 158.0;
 
 /// Resolve a fly target to (center, scale), fitting a route extent into the usable
 /// viewport (window minus the side panel) with margin, and offsetting the center so
-/// the target sits in the visible map area rather than under the panel.
-fn resolve_fly_target(to: FlyTo, windows: &Query<&Window>) -> (Vec2, f32) {
+/// the target sits in the visible map area rather than under the panel. In reel mode
+/// the side panel is hidden, so neither the panel reserve nor the left-shift applies —
+/// the target fills and centers the whole 9:16 frame (otherwise routes over-zoom and
+/// sit off to the left, framed for a panel that isn't there).
+fn resolve_fly_target(to: FlyTo, windows: &Query<&Window>, reel: bool) -> (Vec2, f32) {
     let (center, scale) = match to {
         FlyTo::Point { center, scale } => (center, scale.clamp(ZOOM_MIN, ZOOM_MAX)),
         FlyTo::Fit { center, w, h } => {
@@ -2428,15 +2668,18 @@ fn resolve_fly_target(to: FlyTo, windows: &Query<&Window>) -> (Vec2, f32) {
                 .single()
                 .map(|win| (win.width(), win.height()))
                 .unwrap_or((1280.0, 800.0));
-            let usable_w = (win_w - 340.0).max(240.0); // leave room for the side panel
+            let panel_reserve = if reel { 0.0 } else { 340.0 }; // room for the side panel
+            let usable_w = (win_w - panel_reserve).max(240.0);
             let usable_h = win_h.max(240.0);
             let sx = (w * 1.25) / (usable_w * 0.9);
             let sy = (h * 1.25) / (usable_h * 0.9);
             (center, sx.max(sy).clamp(ZOOM_MIN, ZOOM_MAX))
         }
     };
-    // Shift the camera right by half the panel so the target appears left of it.
-    (Vec2::new(center.x + PANEL_HALF_PX * scale, center.y), scale)
+    // Shift the camera right by half the panel so the target appears left of it — but
+    // not in reel mode, where there's no panel and the frame should stay centered.
+    let shift = if reel { 0.0 } else { PANEL_HALF_PX * scale };
+    (Vec2::new(center.x + shift, center.y), scale)
 }
 
 /// How far past the nearest shore (world m) an off-island label floats out over the water.
@@ -2645,14 +2888,15 @@ fn scale_leader_lines(
     }
 }
 
-/// Off-island leader lines follow their layer's label visibility (landmarks: hide in
-/// heatmap mode + the Operators view, like the labels themselves).
+/// Off-island leader lines follow their label's visibility — they only exist to tie a
+/// floated name back to its massing, so they ride `landmark_labels_on` (hidden in heatmap
+/// mode + the Operators view, like the labels themselves), not the massing toggle.
 fn sync_leader_visibility(
     params: Res<Params>,
     ov: Res<OperatorsView>,
     mut leaders: Query<&mut Visibility, With<LandmarkLeader>>,
 ) {
-    set_vis(&mut leaders, params.landmarks_on && !params.heatmap_on && !ov.active);
+    set_vis(&mut leaders, params.landmark_labels_on && !params.heatmap_on && !ov.active);
 }
 
 /// Intrinsic half-size (world m) of a LinkNYC kiosk marker quad (a touch smaller than
@@ -2747,8 +2991,24 @@ fn storymap_autostart(
         return; // run once, and only after the world has built
     }
     *done = true;
+    // A data-driven reel spec (`?reelspec=<base64url(json)>` on web, or `OURSPACE_REELSPEC`
+    // natively) wins over the built-in `?story=` tours — it's how `tools/reels/render.mjs
+    // --spec` plays an authored JSON tour with no recompile (docs/REELS_PLAN.md G2).
+    let via_spec = match url_reelspec() {
+        Some(json) => match storymap::from_spec_json(&json) {
+            Ok((title, steps)) => {
+                story.start(title, steps);
+                true
+            }
+            Err(e) => {
+                warn!("reelspec ignored: {e}");
+                false
+            }
+        },
+        None => false,
+    };
     #[cfg(target_arch = "wasm32")]
-    {
+    if !via_spec {
         if url_story_is("longitudinal") {
             story.start("A decade of watching", storymap::longitudinal());
         } else if url_story_is("tutorial") {
@@ -2756,7 +3016,65 @@ fn storymap_autostart(
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = &mut story;
+    let _ = via_spec;
+
+    // Signal the tour's total length so `tools/reels/render.mjs` can align its capture
+    // window to the story timeline (recording starts when the story does) instead of
+    // guessing a fixed settle. Harmless in interactive use — just a console line.
+    if story.active {
+        let total: f32 = story.steps.iter().map(|s| s.secs).sum();
+        info!("REEL_STORY_START secs={total:.2} steps={}", story.steps.len());
+    }
+}
+
+/// The reel spec passed in the URL (`?reelspec=<base64url(json)>`, web) or the environment
+/// (`OURSPACE_REELSPEC=<base64url(json)>`, native), decoded to its JSON string. `None` when
+/// absent or undecodable. The token is URL-safe base64, no padding — so it never needs
+/// percent-encoding and extracts cleanly from the raw query string.
+fn url_reelspec() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    let token = {
+        let search = web_sys::window().and_then(|w| w.location().search().ok())?;
+        search.split("reelspec=").nth(1)?.split('&').next()?.to_string()
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let token = std::env::var("OURSPACE_REELSPEC").ok()?;
+
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token.trim()).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// One clock parameter: `?t=`/`?rate=`/`?play=` from the URL (web) or `OURSPACE_T`/
+/// `OURSPACE_RATE`/`OURSPACE_PLAY` (native). Exact `key=` match per `&`-separated pair, so
+/// `t` doesn't accidentally match inside `rate`.
+#[cfg(target_arch = "wasm32")]
+fn clock_param(key: &str) -> Option<String> {
+    let s = web_sys::window().and_then(|w| w.location().search().ok())?;
+    s.trim_start_matches('?')
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn clock_param(key: &str) -> Option<String> {
+    std::env::var(format!("OURSPACE_{}", key.to_uppercase())).ok()
+}
+
+/// The initial [`SimClock`], with `?t=<hour>&rate=<x>&play=<0|1>` overrides applied over the
+/// default (17:00, 36×, playing). Lets `tools/reels/render.mjs` fix the time of day / speed
+/// for a reel (docs/REELS_PLAN.md G3).
+fn url_clock() -> SimClock {
+    let mut c = SimClock::default();
+    if let Some(t) = clock_param("t").and_then(|v| v.parse::<f64>().ok()) {
+        c.time_of_day = t.rem_euclid(24.0);
+    }
+    if let Some(r) = clock_param("rate").and_then(|v| v.parse::<f64>().ok()) {
+        c.rate = r.clamp(SIM_RATE_MIN, SIM_RATE_MAX);
+    }
+    if let Some(p) = clock_param("play") {
+        c.playing = p != "0" && !p.eq_ignore_ascii_case("false");
+    }
+    c
 }
 
 /// Whether the page URL carries `?story=<name>` (web only).
@@ -2780,7 +3098,8 @@ fn storymap_tick(
     mut fly: ResMut<CameraFly>,
     mut ov: ResMut<OperatorsView>,
     sim: Option<Res<Sim>>,
-    clock: Res<SimClock>,
+    mut clock: ResMut<SimClock>,
+    mut scrub_from: Local<f64>,
     mut route: ResMut<RouteState>,
     mut walkshed_state: ResMut<WalkshedState>,
     mut walk_live: ResMut<WalkLive>,
@@ -2794,24 +3113,61 @@ fn storymap_tick(
         return;
     }
     story.tick(time.delta_secs());
-    // The step's scene is applied exactly once, on entry.
-    if !story.active || !std::mem::take(&mut story.apply_pending) {
-        return;
+    if !story.active {
+        return; // the tick ended the story
     }
-    let Some(action) = story.current().map(|s| s.action) else {
+    let Some(step) = story.current().copied() else {
         return;
     };
+    let entering = std::mem::take(&mut story.apply_pending);
+
+    use storymap::StepAction as A;
+
+    // Per-frame: a `ClockScrub` step sweeps the simulated clock from `from` (or the hour at
+    // entry) to `to` across the step's dwell — the "a day in N seconds" time-lapse. Runs
+    // every frame (unlike the once-on-entry scenes below); `playing` is off so
+    // `advance_clock` doesn't fight the sweep.
+    if let A::ClockScrub { from, to } = step.action {
+        if entering {
+            clock.playing = false;
+            *scrub_from = from.unwrap_or(clock.time_of_day);
+        }
+        let p = if step.secs > 0.0 {
+            (story.elapsed / step.secs).clamp(0.0, 1.0) as f64
+        } else {
+            1.0
+        };
+        clock.time_of_day = (*scrub_from + (to - *scrub_from) * p).rem_euclid(24.0);
+    }
+
+    // Everything else is applied exactly once, on entry.
+    if !entering {
+        return;
+    }
+    let action = step.action;
     let proj = EnuProjection::default();
     let sim = sim.as_deref();
 
     // Baseline: each step opens from a clean scene; its action re-enables what it needs.
-    ov.active = false;
-    params.heatmap_on = false;
-    params.set_future(false);
+    // Despawns any prior walkshed/direct-capture overlay + clears the neighborhood
+    // choropleth (in reel mode `ui_panel` is skipped, so nothing else resets
+    // `neighborhoods_on` — the tick owns it). A `Caption` step is a pure hold ("leave the
+    // current view as-is"), so it skips the reset and lingers on whatever's on screen —
+    // the natural "hold on the result" beat after a Walkshed/DirectCapture/Neighborhoods
+    // step. `ClockScrub` likewise holds the scene while it sweeps time.
+    if !matches!(action, A::Caption | A::ClockScrub { .. }) {
+        ov.active = false;
+        params.heatmap_on = false;
+        params.set_future(false);
+        params.neighborhoods_on = false;
+        for ent in &walkshed_vis {
+            commands.entity(ent).despawn();
+        }
+    }
 
-    use storymap::StepAction as A;
     match action {
         A::Caption => {}
+        A::ClockScrub { .. } => {} // swept per-frame above
         A::Overview => {
             fly.request(FlyTo::Point { center: Vec2::ZERO, scale: STORY_OVERVIEW_ZOOM });
         }
@@ -2835,16 +3191,40 @@ fn storymap_tick(
         A::Walkshed { lat, lon } => {
             params.mode = Mode::Walkshed;
             let e = proj.to_enu(lat, lon);
-            for ent in &walkshed_vis {
-                commands.entity(ent).despawn();
-            }
             if let Some(sim) = sim {
                 place_walkshed(e, sim, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
             }
             fly.request(FlyTo::Point { center: Vec2::new(e.x as f32, e.y as f32), scale: FLY_AREA_ZOOM });
         }
+        A::DirectCapture { lat, lon } => {
+            params.mode = Mode::DirectCapture;
+            let e = proj.to_enu(lat, lon);
+            if let Some(sim) = sim {
+                place_direct_capture(
+                    e, sim, &params, &mut commands, &mut meshes, &mut materials, &mut walkshed_state,
+                );
+            }
+            fly.request(FlyTo::Point { center: Vec2::new(e.x as f32, e.y as f32), scale: FLY_DIRECT_ZOOM });
+        }
+        A::Neighborhoods { at } => {
+            params.mode = Mode::Neighborhoods;
+            params.neighborhoods_on = true;
+            let (center, scale) = match at {
+                Some((lat, lon, z)) => {
+                    let e = proj.to_enu(lat, lon);
+                    (Vec2::new(e.x as f32, e.y as f32), z)
+                }
+                None => (Vec2::ZERO, STORY_OVERVIEW_ZOOM),
+            };
+            fly.request(FlyTo::Point { center, scale });
+        }
         A::Operators => {
             ov.active = true;
+        }
+        A::Institutions { .. } => {
+            // The Institutions view lives in resources outside this (param-maxed) system;
+            // `story_apply_institutions` activates the view, filters, and selects+flies. The
+            // baseline reset above already cleared the other overlays, so nothing to do here.
         }
         A::Future => {
             params.set_future(true);
@@ -2878,18 +3258,71 @@ fn storymap_tick(
     }
 }
 
+/// Emit a structured `REEL_STAT {json}` console line whenever the headline result changes.
+/// It's the JS-readable export of what the reel is currently showing (docs/REELS_PLAN.md G4):
+/// `tools/reels/render.mjs` captures it for a sidecar `.stats.json` + logging, and it pairs
+/// with the `{cameras}`/`{dashcams}` caption tokens the app fills in `ui::storymap_ui`.
+fn reel_stat_emit(
+    params: Res<Params>,
+    walkshed: Res<WalkshedState>,
+    route: Res<RouteState>,
+    inst: Res<InstitutionsView>,
+    fac_dir: Res<FacilityDirectory>,
+    fac_sel: Res<SelectedFacility>,
+    mut last: Local<String>,
+) {
+    // The Institutions explore view is orthogonal to `params.mode`, so it's checked first:
+    // when it's up with a selected institution, the headline is that place's nearby-camera
+    // count (matches the `{cameras}` token filled in `ui::storymap_ui`).
+    let stat = if inst.active {
+        fac_sel
+            .0
+            .and_then(|i| fac_dir.pins.get(i))
+            .map(|p| format!("{{\"mode\":\"institutions\",\"cameras\":{}}}", p.cameras_near))
+    } else {
+        match params.mode {
+        Mode::Walkshed => walkshed.summary.as_ref().map(|s| {
+            format!(
+                "{{\"mode\":\"walkshed\",\"cameras\":{},\"cameras_raw\":{},\"minutes\":{:.0}}}",
+                s.cameras_corrected.round() as i64, s.cameras_raw, s.max_minutes
+            )
+        }),
+        Mode::DirectCapture => walkshed.capture.as_ref().map(|c| {
+            format!(
+                "{{\"mode\":\"direct_capture\",\"cameras\":{},\"cameras_raw\":{},\"dashcams\":{}}}",
+                c.cameras_corrected.round() as i64,
+                c.cameras_raw,
+                walkshed.daily_dashcams.round().max(0.0) as i64
+            )
+        }),
+        Mode::Route => route
+            .summary
+            .as_ref()
+            .map(|s| format!("{{\"mode\":\"route\",\"cameras\":{}}}", s.headline_devices)),
+        Mode::None | Mode::Neighborhoods => None,
+        }
+    };
+    if let Some(s) = stat {
+        if *last != s {
+            *last = s.clone();
+            info!("REEL_STAT {s}");
+        }
+    }
+}
+
 /// Ease the camera toward a requested fly target (smoothstep pan + zoom); snaps when
 /// reduced-motion is on. Runs right after `camera_control`, which cancels it on input.
 fn fly_camera(
     time: Res<Time>,
     ov: Res<OperatorsView>,
+    reel: Res<ReelMode>,
     windows: Query<&Window>,
     mut fly: ResMut<CameraFly>,
     mut cam: Query<&mut Transform, With<Camera2d>>,
 ) {
     let Ok(mut t) = cam.single_mut() else { return };
     if let Some(to) = fly.pending.take() {
-        let (to_c, to_s) = resolve_fly_target(to, &windows);
+        let (to_c, to_s) = resolve_fly_target(to, &windows, reel.0);
         fly.active = Some(FlyState {
             from_c: t.translation.truncate(),
             from_s: t.scale.x,
@@ -2911,6 +3344,40 @@ fn fly_camera(
     if f >= 1.0 {
         fly.active = None;
     }
+}
+
+/// Reel-only **Ken-Burns push-in**: while a story is playing and the camera has settled,
+/// shed a sliver of scale (m/px) each frame so a held shot drifts gently inward instead of
+/// freezing — the classic slow zoom that keeps a static caption beat alive. Deliberately
+/// narrow so it never fights anything that owns the framing:
+/// - only in reel mode, and not when reduced-motion is set;
+/// - only while a story is active and no fly is in flight/pending (a fly owns the camera,
+///   and starts its ease from wherever the drift left the scale);
+/// - not during the `Operators` takeover (its towers are laid out for the *frozen* viewport,
+///   so zooming would crop them) nor a `ClockScrub` step (the scene is already in motion).
+/// Between beats each fly resets the scale to its target, so the drift can't accumulate
+/// across the reel — it's bounded to a few percent per hold.
+fn ken_burns_drift(
+    time: Res<Time>,
+    reel: Res<ReelMode>,
+    fly: Res<CameraFly>,
+    ov: Res<OperatorsView>,
+    story: Res<storymap::StoryMap>,
+    mut cam: Query<&mut Transform, With<Camera2d>>,
+) {
+    if !reel.0 || ov.reduced_motion || !story.active {
+        return;
+    }
+    if fly.active.is_some() || fly.pending.is_some() || ov.active || ov.t > 0.0 {
+        return; // a fly or the Operators layout owns the framing
+    }
+    if matches!(story.current().map(|s| s.action), Some(storymap::StepAction::ClockScrub { .. })) {
+        return; // the time-lapse is already moving; don't stack a zoom on it
+    }
+    let Ok(mut t) = cam.single_mut() else { return };
+    let k = (1.0 - KEN_BURNS_RATE * time.delta_secs()).clamp(0.0, 1.0);
+    t.scale.x *= k;
+    t.scale.y *= k;
 }
 
 /// Request the right fly for a route edit: fit the whole path once both ends route,
@@ -3118,13 +3585,17 @@ fn handle_click(
 
     match params.mode {
         Mode::None => {} // no mode selected — the map is inert until one is chosen
-        Mode::Walkshed => {
+        // Both single-address modes place on click; `place_for_mode` picks the walkshed
+        // vs. the stricter direct-capture query. They share the Walkshed address box.
+        Mode::Walkshed | Mode::DirectCapture => {
             for e in &walkshed_vis {
                 commands.entity(e).despawn();
             }
-            place_walkshed(
+            place_for_mode(
+                params.mode,
                 enu,
                 &sim,
+                &params,
                 &mut commands,
                 &mut meshes,
                 &mut materials,
@@ -3199,7 +3670,7 @@ fn rebuild_route(
             match sim_core::run_route(
                 &sim.graph,
                 &sim.sensors,
-                &[],
+                &sim.occ,
                 &mobile,
                 a,
                 b,
@@ -3209,6 +3680,8 @@ fn rebuild_route(
                 Some(&sim.robot_field),
                 Some(&sim.tesla_field),
                 sim.real_rates.as_ref(),
+                None,
+                None,
             ) {
                 Ok((r, summary)) => {
                     let line = meshes.add(world::line_strip_mesh(&r.points, 2.0));
@@ -3272,11 +3745,12 @@ fn apply_geocode(
                 for e in &walkshed_vis {
                     commands.entity(e).despawn();
                 }
-                place_walkshed(enu, &sim, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
+                place_for_mode(params.mode, enu, &sim, &params, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
                 walkshed_state.status = None;
                 let (lat, lon) = proj.to_wgs84(enu);
                 geo.reverse_lookup(geocode::Field::Walkshed, lat, lon);
-                fly.request(FlyTo::Point { center: Vec2::new(enu.x as f32, enu.y as f32), scale: FLY_AREA_ZOOM });
+                let scale = if params.mode == Mode::DirectCapture { FLY_DIRECT_ZOOM } else { FLY_AREA_ZOOM };
+                fly.request(FlyTo::Point { center: Vec2::new(enu.x as f32, enu.y as f32), scale });
             } else {
                 // Random A→B: two well-separated nodes (700–2500 m apart) for a real walk.
                 let a = sim.graph.node_pos(rng.below(n) as u32);
@@ -3308,6 +3782,7 @@ fn apply_geocode(
                     commands.entity(e).despawn();
                 }
                 walkshed_state.summary = None;
+                walkshed_state.capture = None;
                 walkshed_state.status = None;
             }
             geocode::Field::Start => {
@@ -3341,9 +3816,10 @@ fn apply_geocode(
             for e in &walkshed_vis {
                 commands.entity(e).despawn();
             }
-            place_walkshed(enu, &sim, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
+            place_for_mode(params.mode, enu, &sim, &params, &mut commands, &mut meshes, &mut materials, &mut walkshed_state);
             walkshed_state.status = None;
-            fly.request(FlyTo::Point { center, scale: FLY_AREA_ZOOM });
+            let scale = if params.mode == Mode::DirectCapture { FLY_DIRECT_ZOOM } else { FLY_AREA_ZOOM };
+            fly.request(FlyTo::Point { center, scale });
         }
         geocode::Field::Start => {
             route.a = Some(enu);
@@ -3431,7 +3907,7 @@ fn place_walkshed(
     let Some(node) = sim.graph.snap_nearest(enu) else { return };
     let ws = sim.graph.walkshed(node, WALKSHED_SECONDS, WALK_SPEED);
     let recall = 1.0 / sim.layer.recall.unwrap_or(1.0);
-    let summary = sim_core::walkshed_exposure(&sim.graph, &ws, &sim.sensors, &[], recall);
+    let summary = sim_core::walkshed_exposure(&sim.graph, &ws, &sim.sensors, &sim.occ, recall);
 
     // Isochrone: the convex hull of every reachable node, drawn as a translucent
     // gold wash + a deeper-amber boundary so the 10-minute study area reads as one
@@ -3499,6 +3975,103 @@ fn place_walkshed(
     walkshed_state.summary = Some(summary);
 }
 
+/// Place a **Direct capture** query at `enu`: which fixed cameras are pointed *straight at*
+/// this address (FOV covering it, within range) and how many moving dashcams likely record
+/// it per day. Draws the address target, a ring + translucent facing cone for each capturing
+/// camera, and stashes the result in `WalkshedState` — mirrors `place_walkshed` and reuses
+/// the `WalkshedVis` marker so the shared despawn/reset plumbing clears it on mode switch.
+fn place_direct_capture(
+    enu: Enu,
+    sim: &Sim,
+    params: &Params,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    walkshed_state: &mut WalkshedState,
+) {
+    // Which fixed cameras' field of view directly covers this exact point (deduped by
+    // physical-camera group, recall-corrected like the walkshed / A→B paths).
+    let recall = 1.0 / sim.layer.recall.unwrap_or(1.0);
+    let summary = sim_core::direct_capture_exposure(&sim.sensors, &sim.occ, enu, recall);
+
+    // Each capturing camera: a translucent facing cone (its FOV wedge, apex→address) beneath
+    // a ring, colored by layer (CCTV maroon / DOT amber / ALPR red / enforcement orange).
+    // The cone alpha is kept modest so overlapping cones don't muddy, but high enough to read
+    // on a recorded reel frame (0.15 was too faint — see docs/REELS_PLAN.md Phase 2).
+    let ring = meshes.add(Annulus::new(11.0, 15.0));
+    let mut ring_mats: std::collections::HashMap<u8, Handle<ColorMaterial>> = Default::default();
+    let mut cone_mats: std::collections::HashMap<u8, Handle<ColorMaterial>> = Default::default();
+    for cam in &summary.cameras {
+        let color = walkshed_ring_color(cam.kind);
+        let cone_mat = cone_mats
+            .entry(cam.kind as u8)
+            .or_insert_with(|| materials.add(color.with_alpha(0.28)))
+            .clone();
+        let cone = meshes.add(world::wedge_mesh(
+            cam.heading_rad as f32,
+            cam.half_fov_rad as f32,
+            cam.range_m as f32,
+            20,
+        ));
+        commands.spawn((
+            Mesh2d(cone),
+            MeshMaterial2d(cone_mat),
+            Transform::from_translation(world::to_world(cam.apex, 0.2)),
+            WalkshedVis,
+        ));
+        let ring_mat = ring_mats
+            .entry(cam.kind as u8)
+            .or_insert_with(|| materials.add(color))
+            .clone();
+        commands.spawn((
+            Mesh2d(ring.clone()),
+            MeshMaterial2d(ring_mat),
+            Transform::from_translation(world::to_world(cam.apex, 1.6)),
+            WalkshedVis,
+        ));
+    }
+    // The watched address: a small red target where every cone converges.
+    commands.spawn((
+        Mesh2d(meshes.add(Circle::new(9.0))),
+        MeshMaterial2d(materials.add(theme::map::RED)),
+        Transform::from_translation(world::to_world(enu, 3.0)),
+        WalkshedVis,
+    ));
+
+    // Modeled moving dashcams that record this spot per day: the analytical dashcam model
+    // (local rideshare density × diurnal traffic × dashcam penetration × per-pass framing),
+    // integrated over the 24-hour traffic curve. A model estimate, not a device count.
+    let zone = sim.dashcam_field.intensity_at(enu);
+    let daily_traffic: f64 = (0..24).map(|h| sim_core::mobile::traffic_multiplier(h as f64)).sum();
+    const VEH_PER_MIN_PEAK: f64 = 12.0; // DashcamConfig default (sim-core mobile.rs)
+    const CAPTURE_PROB: f64 = 0.40; // fraction of passes that frame a fixed spot
+    walkshed_state.daily_dashcams =
+        VEH_PER_MIN_PEAK * 60.0 * zone * daily_traffic * params.dashcam_penetration as f64 * CAPTURE_PROB;
+    walkshed_state.summary = None;
+    walkshed_state.capture = Some(summary);
+}
+
+/// Dispatch an address placement to the active single-address mode: the stricter
+/// Direct-capture query or the 10-minute walkshed. Both share the `WalkshedVis` /
+/// `WalkshedState` plumbing, so callers just despawn `WalkshedVis` first and call this.
+#[allow(clippy::too_many_arguments)]
+fn place_for_mode(
+    mode: Mode,
+    enu: Enu,
+    sim: &Sim,
+    params: &Params,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    walkshed_state: &mut WalkshedState,
+) {
+    if mode == Mode::DirectCapture {
+        place_direct_capture(enu, sim, params, commands, meshes, materials, walkshed_state);
+    } else {
+        place_walkshed(enu, sim, commands, meshes, materials, walkshed_state);
+    }
+}
+
 /// Animated walk: pulse each camera as the looping walker enters its view, and
 /// keep a live "captured this pass" tally (resets each loop).
 #[allow(clippy::too_many_arguments)]
@@ -3538,7 +4111,10 @@ fn walk_capture_events(
             continue;
         }
         let s = &sim.sensors[id as usize];
-        if sim_core::captures(&s.wedge, pos, &[]) && walk_live.seen.insert(id) {
+        if s.wedge.covers_unoccluded(pos)
+            && !sim.occ.blocked(s.wedge.apex, pos, s.host_poly)
+            && walk_live.seen.insert(id)
+        {
             walk_live.count += 1;
             activate_ping(&ping_pool, &mut pings, s.wedge.apex);
         }
@@ -3589,6 +4165,7 @@ fn sync_mode(
     mut route: ResMut<RouteState>,
     mut walkshed_state: ResMut<WalkshedState>,
     mut walk_live: ResMut<WalkLive>,
+    story: Res<storymap::StoryMap>,
     mut commands: Commands,
 ) {
     if *last == Some(params.mode) {
@@ -3596,8 +4173,12 @@ fn sync_mode(
     }
     let first = last.is_none();
     *last = Some(params.mode);
-    if first {
-        return; // don't wipe on startup
+    // Skip the wipe on startup, and while a story is playing: story-driven mode switches
+    // are cleaned up by the StoryMap tick's own baseline, and this interactive wipe would
+    // otherwise despawn a walkshed/direct-capture overlay the story just placed. `last` is
+    // still updated above, so no spurious wipe fires when the story ends on that mode.
+    if first || story.active {
+        return;
     }
     for e in &route_vis {
         commands.entity(e).despawn();
@@ -3610,11 +4191,13 @@ fn sync_mode(
             Mode::None => String::new(),
             Mode::Route => "Click to set start (A), then destination (B).".into(),
             Mode::Walkshed => "Click a point to map its 10-minute walkshed.".into(),
+            Mode::DirectCapture => "Click an address to see which cameras point straight at it.".into(),
             Mode::Neighborhoods => "Hover a neighborhood for its camera breakdown.".into(),
         },
         ..default()
     };
     walkshed_state.summary = None;
+    walkshed_state.capture = None;
     walkshed_state.status = None;
     *walk_live = WalkLive::default();
 }
@@ -3633,6 +4216,8 @@ fn recompute_on_change(
     sim: Option<Res<Sim>>,
     mut route: ResMut<RouteState>,
     mut last: Local<Option<SummarySig>>,
+    // Cached route→sensor cull, keyed by route identity `(route_len_bits, route_points)`.
+    mut cull_cache: Local<Option<(u64, usize, Vec<sim_core::SensorInstance>)>>,
 ) {
     let Some(sim) = sim else { return };
     let Some(r) = route.route.clone() else {
@@ -3664,23 +4249,40 @@ fn recompute_on_change(
     // requires distance ≤ range_m, so this is exact — no undercount), via the
     // R-tree over dense route samples. Turns the summarize cost from ~5,236 ×
     // ticks into ~(few hundred) × ticks so a slider drag stays snappy.
-    let samples = r.sample_over_time(WALK_SPEED, 1.0);
-    let mut ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for (_, p) in &samples {
-        for c in sim.cam_index.locate_within_distance([p.x, p.y], sim.cam_query_r2) {
-            ids.insert(c.data);
+    //
+    // The culled set depends *only* on route geometry — not the hour, class toggles,
+    // or sliders — so cache it by route identity and reuse it across the ~48 hour-step
+    // recomputes/day and every slider drag on the same route. Sensor ids are sorted
+    // before mapping so the set's iteration order (hence `summarize`'s float
+    // accumulation) is deterministic instead of `HashSet`-random — reproducible without
+    // changing which sensors are counted.
+    let route_key = (sig.route_len_bits, sig.route_points);
+    let cache_hit = matches!(cull_cache.as_ref(), Some((rl, rp, _)) if *rl == route_key.0 && *rp == route_key.1);
+    if !cache_hit {
+        let samples = r.sample_over_time(WALK_SPEED, 1.0);
+        let mut ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_, p) in &samples {
+            for c in sim.cam_index.locate_within_distance([p.x, p.y], sim.cam_query_r2) {
+                ids.insert(c.data);
+            }
         }
+        let mut ids: Vec<u64> = ids.into_iter().collect();
+        ids.sort_unstable();
+        let nearby: Vec<sim_core::SensorInstance> =
+            ids.iter().map(|&id| sim.sensors[id as usize]).collect();
+        *cull_cache = Some((route_key.0, route_key.1, nearby));
     }
-    let nearby: Vec<sim_core::SensorInstance> =
-        ids.iter().map(|&id| sim.sensors[id as usize]).collect();
+    let nearby = &cull_cache.as_ref().unwrap().2;
 
     let mobile = build_mobile(&params, &sim);
     let summary = sim_core::summarize(
-        &r, &nearby, &[], &mobile, sim_params(&sim), clock.time_of_day,
+        &r, nearby, &sim.occ, &mobile, sim_params(&sim), clock.time_of_day,
         Some(&sim.dashcam_field),
         Some(&sim.robot_field),
         Some(&sim.tesla_field),
         sim.real_rates.as_ref(),
+        None,
+        None,
     );
     route.summary = Some(summary);
 }
@@ -3843,9 +4445,10 @@ fn sync_building_visibility(
     // Plazas (fill + hatch) follow the same ground-fabric gating, own toggle.
     set_vis(&mut plazas, params.plazas_on && !hm && !nb);
     set_vis(&mut landmarks, params.landmarks_on && !hm);
-    // Labels clear out of the heatmap overlay and the Operators view (where the map
-    // recedes), but stay over the choropleth alongside their landmarks.
-    set_vis(&mut labels, params.landmarks_on && !hm && !ov.active);
+    // Labels ride their own toggle (off by default): they clear out of the heatmap
+    // overlay and the Operators view (where the map recedes), but stay over the
+    // choropleth. Independent of `landmarks_on` — the massings can show without names.
+    set_vis(&mut labels, params.landmark_labels_on && !hm && !ov.active);
     // Kiosks hide in heatmap mode and behind the Operators towers (they aren't an
     // operator column), like the labels.
     set_vis(&mut linknyc, params.linknyc_on && !hm && !ov.active);
@@ -4134,7 +4737,7 @@ fn advance_heat_rows(b: &mut HeatBuild, sim: &Sim, rows: usize) {
                 .as_ref()
                 .is_some_and(|t| t.locate_within_distance([x, y], b.ace_r2).next().is_some());
             let r = sim_core::exposure_rates_per_minute(
-                p, b.hour, &scratch, &[], near_ace, &b.mobile, b.recall,
+                p, b.hour, &scratch, &sim.occ, near_ace, &b.mobile, b.recall,
                 Some(&sim.dashcam_field),
                 Some(&sim.robot_field),
                 Some(&sim.tesla_field),
@@ -4228,11 +4831,13 @@ fn apply_reset(
             Mode::None => String::new(),
             Mode::Route => "Click to set start (A), then destination (B).".into(),
             Mode::Walkshed => "Click a point to map its 10-minute walkshed.".into(),
+            Mode::DirectCapture => "Click an address to see which cameras point straight at it.".into(),
             Mode::Neighborhoods => "Hover a neighborhood for its camera breakdown.".into(),
         },
         ..default()
     };
     walkshed_state.summary = None;
+    walkshed_state.capture = None;
     walkshed_state.status = None;
     *walk_live = WalkLive::default();
 }
@@ -4517,7 +5122,8 @@ fn sample_neighborhood_mobile(
     // appear the instant the layer turns on; then a few times a second after that.
     let first = live.by_nbhd.len() != sim.neighborhoods.len();
     *acc += time.delta_secs();
-    if first || *acc >= 0.5 {
+    let recounted = first || *acc >= 0.5;
+    if recounted {
         *acc = 0.0;
         // Tally active agents into their neighborhood (bbox-prefiltered point-in-poly).
         let mut counts = vec![MobileCount::default(); sim.neighborhoods.len()];
@@ -4544,7 +5150,7 @@ fn sample_neighborhood_mobile(
                 continue;
             }
             let p = a.route.position_at(a.progress_m);
-            if let Some(i) = sim.neighborhoods.iter().position(|st| st.contains(p)) {
+            if let Some(i) = sim.neighborhood_grid.locate(p, &sim.neighborhoods) {
                 let c = &mut counts[i];
                 match a.class {
                     Vehicle => c.rideshare += 1,
@@ -4577,7 +5183,7 @@ fn sample_neighborhood_mobile(
                     None => frac * route.total_m,
                 };
                 let p = route.position_at(d);
-                if let Some(idx) = sim.neighborhoods.iter().position(|st| st.contains(p)) {
+                if let Some(idx) = sim.neighborhood_grid.locate(p, &sim.neighborhoods) {
                     counts[idx].rideshare += 1;
                 }
             }
@@ -4591,8 +5197,17 @@ fn sample_neighborhood_mobile(
         return;
     }
 
-    // Repaint + relabel every frame from the cached counts (cheap; ~40 entities), so
-    // labels freshly (re)spawned by `rebuild_neighborhoods` reflect the latest sample.
+    // Only repaint/relabel when the throttled recount above actually fired. Between
+    // recounts the counts are frozen, so the colors + "N mobile" strings are identical;
+    // and fills/labels freshly (re)spawned by `rebuild_neighborhoods` already carry the
+    // current sample's colors + text at spawn. Gating here avoids ~N `format!` heap
+    // allocs + N material-change-detection triggers every single frame at citywide scale.
+    if !recounted {
+        return;
+    }
+
+    // Repaint + relabel from the cached counts (cheap; ~40 entities) so the choropleth
+    // reflects the latest sample.
     let (lo, hi) = density_range(&sim, &live, params.neighborhoods_all);
     for (id, mat) in &fills {
         let st = &sim.neighborhoods[id.0];
@@ -4785,7 +5400,7 @@ fn size_landmark_labels(
     cam: Query<&Transform, With<Camera2d>>,
     mut labels: Query<&mut Transform, (With<LandmarkLabel>, Without<Camera2d>)>,
 ) {
-    if !params.landmarks_on {
+    if !params.landmark_labels_on {
         return;
     }
     let Ok(cam_t) = cam.single() else { return };
@@ -4867,28 +5482,138 @@ fn facility_markers_visibility(
             && match m.kind {
                 FacilityKind::School => inst.show_schools,
                 FacilityKind::Library => inst.show_libraries,
+                FacilityKind::Park => inst.show_parks,
+                FacilityKind::Plaza => inst.show_plazas,
             };
         *vis = if show { Visibility::Visible } else { Visibility::Hidden };
     }
 }
 
-/// Move the highlight ring onto the selected institution (or hide it).
+/// Story-driven Institutions scene: when a reel/story step is an `Institutions` action,
+/// open the view, filter the markers, and select + fly to the rank-th most-watched
+/// matching institution — so a spec can author the "who's watching the park?" reel
+/// (pillar #5) with no clicks. Kept separate from `storymap_tick` because that system is
+/// already at Bevy's 16-param limit and the view's resources live outside it. Tracks the
+/// applied step index so it fires once per step entry and mirrors the tick's hold
+/// semantics: a `Caption`/`ClockScrub` step after an `Institutions` step holds the view;
+/// any other step tears it down.
+fn story_apply_institutions(
+    story: Res<storymap::StoryMap>,
+    mut inst: ResMut<InstitutionsView>,
+    fac_dir: Res<FacilityDirectory>,
+    mut sel: ResMut<SelectedFacility>,
+    mut fly: ResMut<CameraFly>,
+    mut applied: Local<Option<usize>>,
+) {
+    use storymap::StepAction as A;
+    if !story.active {
+        *applied = None;
+        return;
+    }
+    if *applied == Some(story.idx) {
+        return; // this step's entry already handled
+    }
+    let Some(step) = story.current() else { return };
+    *applied = Some(story.idx);
+    match step.action {
+        A::Institutions { parks_only, rank } => {
+            use sim_core::assets::FacilityKind;
+            inst.active = true;
+            inst.show_parks = true;
+            inst.show_plazas = !parks_only;
+            inst.show_schools = !parks_only;
+            inst.show_libraries = !parks_only;
+            // `ranked` is most-watched first; pick the rank-th matching institution.
+            let matches = |k: FacilityKind| !parks_only || k == FacilityKind::Park;
+            if let Some(&idx) = fac_dir
+                .ranked
+                .iter()
+                .filter(|&&i| fac_dir.pins.get(i).is_some_and(|p| matches(p.kind)))
+                .nth(rank)
+            {
+                sel.0 = Some(idx);
+                fly.request(FlyTo::Point { center: fac_dir.pins[idx].pos, scale: FLY_AREA_ZOOM });
+            }
+        }
+        A::Caption | A::ClockScrub { .. } => {} // hold the current scene
+        _ => {
+            inst.active = false; // any other step leaves the Institutions view
+            sel.0 = None;
+        }
+    }
+}
+
+/// Move the selection ring + the 200 m scan-range discs onto the selected institution
+/// (or hide them). All three are tagged `FacilityHighlight` and share this follow logic —
+/// only x/y + visibility are touched, so each keeps the z + mesh it was spawned with.
 fn facility_highlight_follow(
     inst: Res<InstitutionsView>,
     sel: Res<SelectedFacility>,
     dir: Res<FacilityDirectory>,
-    hl: Option<Res<FacilityHighlightEntity>>,
     mut q: Query<(&mut Transform, &mut Visibility), With<FacilityHighlight>>,
 ) {
-    let Some(hl) = hl else { return };
-    let Ok((mut t, mut vis)) = q.get_mut(hl.0) else { return };
     let pin = sel.0.and_then(|i| dir.pins.get(i));
-    if let (true, Some(p)) = (inst.active, pin) {
-        t.translation.x = p.pos.x;
-        t.translation.y = p.pos.y;
-        *vis = Visibility::Visible;
-    } else {
-        *vis = Visibility::Hidden;
+    match (inst.active, pin) {
+        (true, Some(p)) => {
+            for (mut t, mut vis) in &mut q {
+                t.translation.x = p.pos.x;
+                t.translation.y = p.pos.y;
+                *vis = Visibility::Visible;
+            }
+        }
+        _ => {
+            for (_, mut vis) in &mut q {
+                *vis = Visibility::Hidden;
+            }
+        }
+    }
+}
+
+/// Ring each counted camera around the selected institution — layer-colored (maroon
+/// CCTV / red ALPR / amber DOT / orange enforcement), exactly like the in-shed cameras
+/// in "My area" — so the nearby-camera score reads camera-by-camera on the map. Rebuilt
+/// only when the selection (or the view's active state) actually changes; otherwise a
+/// cheap early-out. The ring mesh is created once and cached in a `Local`.
+fn facility_cam_rings(
+    inst: Res<InstitutionsView>,
+    sel: Res<SelectedFacility>,
+    dir: Res<FacilityDirectory>,
+    existing: Query<Entity, With<FacilityCamRing>>,
+    mut last: Local<Option<usize>>,
+    mut ring_mesh: Local<Option<Handle<Mesh>>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    let want = if inst.active { sel.0 } else { None };
+    if want == *last {
+        return; // nothing changed — leave the current rings in place
+    }
+    *last = want;
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    let Some(pin) = want.and_then(|i| dir.pins.get(i)) else {
+        return; // deselected / view closed — rings cleared above
+    };
+    let mesh = ring_mesh
+        .get_or_insert_with(|| meshes.add(Annulus::new(14.0, 19.0)))
+        .clone();
+    // One material per layer, reused across every ring of that kind.
+    let mut mats: std::collections::HashMap<u8, Handle<ColorMaterial>> = Default::default();
+    for (p, kind) in &pin.near_cams {
+        let mat = mats
+            .entry(*kind as u8)
+            .or_insert_with(|| materials.add(walkshed_ring_color(*kind)))
+            .clone();
+        commands.spawn((
+            Mesh2d(mesh.clone()),
+            MeshMaterial2d(mat),
+            // Above the camera icons (z 1.0) so each ring frames its icon; below the
+            // institution marker (1.6) + selection ring (1.8).
+            Transform::from_xyz(p.x, p.y, 1.2),
+            FacilityCamRing,
+        ));
     }
 }
 
@@ -5154,9 +5879,8 @@ mod facility_tests {
             name: name.to_string(),
             kind,
             subtype: String::new(),
-            lat: 0.0,
-            lon: 0.0,
             cameras_near,
+            near_cams: Vec::new(),
         }
     }
 
@@ -5174,5 +5898,99 @@ mod facility_tests {
         // the zero-camera entry sorts last.
         let names: Vec<&str> = ranked.iter().map(|&i| pins[i].name.as_str()).collect();
         assert_eq!(names, ["Most Watched", "Alpha School", "Beta School", "Quiet Library"]);
+    }
+}
+
+#[cfg(test)]
+mod neighborhood_grid_tests {
+    use super::*;
+
+    /// A neighborhood from an exterior ring, with bbox derived from it (as the pipeline does).
+    fn nbhd(exterior: Vec<[f64; 2]>) -> NeighborhoodStat {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &exterior {
+            min_x = min_x.min(p[0]);
+            min_y = min_y.min(p[1]);
+            max_x = max_x.max(p[0]);
+            max_y = max_y.max(p[1]);
+        }
+        NeighborhoodStat {
+            name: String::new(),
+            borough: String::new(),
+            exterior,
+            bbox: [min_x, min_y, max_x, max_y],
+            centroid: Enu::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5),
+            area_km2: 1e-9,
+            cctv: 0,
+            dot: 0,
+            alpr: 0,
+            total: 0,
+            density: 0.0,
+        }
+    }
+
+    fn square(x0: f64, y0: f64, s: f64) -> Vec<[f64; 2]> {
+        vec![[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s]]
+    }
+
+    /// An L-shape occupying three quadrants of an `s×s` box (missing the top-right),
+    /// so its bbox overlaps a neighbor placed in that top-right corner but the polygons
+    /// don't — exercising the grid's "bbox-candidate is a superset" path.
+    fn el(x0: f64, y0: f64, s: f64) -> Vec<[f64; 2]> {
+        let h = s * 0.5;
+        vec![
+            [x0, y0],
+            [x0 + s, y0],
+            [x0 + s, y0 + h],
+            [x0 + h, y0 + h],
+            [x0 + h, y0 + s],
+            [x0, y0 + s],
+        ]
+    }
+
+    /// The grid must return exactly what the old linear `iter().position(contains)` did,
+    /// for every probed point — same index or same `None`.
+    #[test]
+    fn locate_matches_linear_scan() {
+        // Mix of disjoint squares, an L-shape whose bbox overlaps a square tucked in its
+        // notch, and cells that span multiple grid buckets (500 m).
+        let nbhds = vec![
+            nbhd(square(0.0, 0.0, 300.0)),
+            nbhd(square(400.0, 0.0, 300.0)),
+            nbhd(square(0.0, 400.0, 1200.0)), // spans several grid cells
+            nbhd(el(2000.0, 2000.0, 800.0)),
+            nbhd(square(2400.0, 2400.0, 300.0)), // sits in the L's empty top-right notch
+        ];
+        let grid = NeighborhoodGrid::build(&nbhds);
+
+        // Dense probe grid across (and beyond) the populated region.
+        let mut checked = 0;
+        let mut inside_hits = 0;
+        let mut x = -600.0;
+        while x <= 3600.0 {
+            let mut y = -600.0;
+            while y <= 3600.0 {
+                let p = Enu::new(x, y);
+                let linear = nbhds.iter().position(|st| st.contains(p));
+                let via_grid = grid.locate(p, &nbhds);
+                assert_eq!(via_grid, linear, "mismatch at ({x}, {y})");
+                if linear.is_some() {
+                    inside_hits += 1;
+                }
+                checked += 1;
+                y += 17.0; // prime-ish step to land inside and outside polygons + on the notch
+            }
+            x += 17.0;
+        }
+        assert!(checked > 40_000, "probe grid too sparse to be meaningful");
+        assert!(inside_hits > 100, "probe grid never landed inside a neighborhood");
+    }
+
+    /// An empty index falls back to the exact linear scan (returns None on no neighborhoods).
+    #[test]
+    fn empty_grid_is_safe() {
+        let grid = NeighborhoodGrid::build(&[]);
+        assert_eq!(grid.locate(Enu::new(10.0, 10.0), &[]), None);
     }
 }

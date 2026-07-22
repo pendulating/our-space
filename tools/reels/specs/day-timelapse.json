@@ -1,0 +1,15 @@
+{
+  "id": "day-timelapse",
+  "title": "A day of surveillance in 20 seconds",
+  "size": [1080, 1920],
+  "fps": 30,
+  "clock": { "t": 6.0, "play": false },
+  "steps": [
+    { "action": "FlyTo", "lat": 40.7549, "lon": -73.9840, "zoom": 3.5, "secs": 2.0,
+      "caption": "Midtown Manhattan, 6 AM." },
+    { "action": "ClockScrub", "from": 6.0, "to": 22.0, "secs": 14.0,
+      "caption": "From 6 AM the buses, taxis, and dashcams fill the streets. Each one carries a camera." },
+    { "action": "Caption", "secs": 2.5,
+      "caption": "Moving cameras track the crowd and peak at rush hour." }
+  ]
+}

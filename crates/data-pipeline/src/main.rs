@@ -28,6 +28,7 @@ mod linknyc;
 mod graph_synth;
 mod neighborhoods;
 mod robotability;
+mod subway_gtfs;
 mod taxi_day;
 mod tesla;
 mod vehicle_routes;
@@ -126,6 +127,23 @@ fn run() -> anyhow::Result<()> {
             enforcement::bake(csv, out)?;
             Ok(())
         }
+        Some("bake-subway") => {
+            let gtfs_dir = args.get(2).context(USAGE)?;
+            let out = args.get(3).context(USAGE)?;
+            let service = args.get(4).map(String::as_str).unwrap_or("Weekday");
+            let w0 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(7.0);
+            let w1 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+            // SI Ferry GTFS defaults to the subway feed's sibling directory.
+            let ferry = args.get(7).cloned().unwrap_or_else(|| {
+                Path::new(gtfs_dir)
+                    .parent()
+                    .map(|p| p.join("siferry").to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "data/snapshots/gtfs/siferry".into())
+            });
+            ensure_parent(out)?;
+            subway_gtfs::bake(gtfs_dir, out, service, (w0, w1), &ferry)?;
+            Ok(())
+        }
         Some("bake-teslas") => {
             let geojson = args.get(2).context(USAGE)?;
             let counts = args.get(3).context(USAGE)?;
@@ -198,9 +216,15 @@ fn run() -> anyhow::Result<()> {
         Some("bake-facilities") => {
             let json = args.get(2).context(USAGE)?;
             let out = args.get(3).context(USAGE)?;
-            let boro = args.get(4).map(String::as_str); // optional borough filter (e.g. MANHATTAN)
+            // Borough filter (e.g. MANHATTAN); "all" (or omitted) keeps every borough.
+            let boro = args
+                .get(4)
+                .map(String::as_str)
+                .filter(|b| !b.eq_ignore_ascii_case("all"));
+            let parks = args.get(5).map(String::as_str); // optional Parks Properties geojson
+            let plazas = args.get(6).map(String::as_str); // optional Pedestrian Plazas geojson
             ensure_parent(out)?;
-            facilities::bake(json, out, boro)?;
+            facilities::bake(json, out, boro, parks, plazas)?;
             Ok(())
         }
         Some("bake-dashcam-field") => {
@@ -234,6 +258,13 @@ fn run() -> anyhow::Result<()> {
             let max_routes: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(1000);
             ensure_parent(out)?;
             vehicle_routes::bake(graph, geojson, od, out, max_routes)?;
+            Ok(())
+        }
+        Some("tessellate") => {
+            let input = args.get(2).context(USAGE)?;
+            let out = args.get(3).context(USAGE)?;
+            ensure_parent(out)?;
+            tessellate_footprints(input, out)?;
             Ok(())
         }
         _ => bail!(USAGE),
@@ -272,13 +303,24 @@ fn bake_graph(args: &[String]) -> anyhow::Result<()> {
             graph_osm::bake(json, out, boundary, true)?;
             Ok(())
         }
-        Some("--cscl") => {
+        Some("--cscl") | Some("--cscl-walk") => {
             // Five-borough street network from NYC's CSCL centerline GeoJSON (Socrata
             // inkn-q76z) — the Overpass route can't pull all of NYC at once. Optional
             // 3rd arg clips to a borough boundary (e.g. a Manhattan drive graph whose
             // rw_type, carried in segment_id, drives time-based taxi routing); optional
             // 4th arg is a parks GeoJSON whose interiors are dropped from the drivable
             // surface network (CSCL codes car-free park drives/paths as "Street").
+            //
+            // `--cscl-walk` builds the **pedestrian** network instead: it keeps paths,
+            // boardwalks, steps and bridge promenades, drops highways/ramps and anything
+            // flagged `nonped=V`, and ignores the parks / Open-Streets masks (those are
+            // car-exclusion layers — a park interior is prime walking surface). This is the
+            // graph `R_i` must be flooded over; the drive graph omits 7,171 walkable segments.
+            let net = if args.first().map(String::as_str) == Some("--cscl-walk") {
+                graph_osm::CsclNetwork::Walk
+            } else {
+                graph_osm::CsclNetwork::Drive
+            };
             let geojson = args.get(1).context(USAGE)?;
             let out = args.get(2).context(USAGE)?;
             // `-` (or empty) skips an optional path arg, so parks can be passed without
@@ -288,7 +330,7 @@ fn bake_graph(args: &[String]) -> anyhow::Result<()> {
             let parks = opt(4);
             let open_streets = opt(5); // NYC DOT Open Streets (car-free) mask
             ensure_parent(out)?;
-            graph_osm::bake_cscl(geojson, out, boundary, parks, open_streets)?;
+            graph_osm::bake_cscl(geojson, out, net, boundary, parks, open_streets)?;
             Ok(())
         }
         _ => bail!(USAGE),
@@ -311,11 +353,62 @@ fn ensure_parent(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pre-tessellate a `.osbldg` footprints asset into a `.ostess` triangle buffer.
+/// Runs earcutr natively (multi-threaded, fast) so the WASM app uploads the mesh
+/// directly — zero triangulation at load time.
+fn tessellate_footprints(input: &str, out: &str) -> anyhow::Result<()> {
+    use sim_core::assets::{BuildingFootprints, TessellatedFootprints};
+    let bytes = std::fs::read(input).with_context(|| format!("reading {input}"))?;
+    let fp: BuildingFootprints = postcard::from_bytes(&bytes)
+        .with_context(|| format!("decoding {input} as BuildingFootprints"))?;
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for ring in &fp.polygons {
+        let r: &[[f32; 2]] = if ring.len() >= 2 && ring.first() == ring.last() {
+            &ring[..ring.len() - 1]
+        } else {
+            ring
+        };
+        if r.len() < 3 {
+            continue;
+        }
+        let flat: Vec<f64> = r.iter().flat_map(|p| [p[0] as f64, p[1] as f64]).collect();
+        let Ok(tri) = earcutr::earcut(&flat, &[], 2) else { continue };
+        if tri.is_empty() {
+            continue;
+        }
+        let base = positions.len() as u32;
+        for p in r {
+            positions.push([p[0], p[1], 0.0]);
+        }
+        for &i in &tri {
+            indices.push(base + i as u32);
+        }
+    }
+    let tess = TessellatedFootprints {
+        origin: fp.origin,
+        positions,
+        indices,
+        provenance: fp.provenance,
+    };
+    let out_bytes = postcard::to_allocvec(&tess)?;
+    std::fs::write(out, &out_bytes).with_context(|| format!("writing {out}"))?;
+    eprintln!(
+        "tessellated {} polygons -> {} verts, {} tris -> {out} ({} KB)",
+        fp.polygons.len(),
+        tess.positions.len(),
+        tess.indices.len() / 3,
+        out_bytes.len() / 1024,
+    );
+    Ok(())
+}
+
 const USAGE: &str = "usage:\n  \
     data-pipeline bake-graph --synthetic <rows> <cols> <spacing_m> <out.postcard>\n  \
     data-pipeline bake-graph --overpass-json <walk.json> <out.postcard> [manhattan.geojson]\n  \
     data-pipeline bake-graph --overpass-drive <walk.json> <out.osgraph> [manhattan.geojson]\n  \
     data-pipeline bake-graph --cscl <cscl.geojson> <out.osgraph> [boundary.geojson|-] [parks.geojson|-] [open_streets.geojson]\n  \
+    data-pipeline bake-graph --cscl-walk <cscl.geojson> <out.osgraph> [boundary.geojson|-]   (pedestrian network)\n  \
     data-pipeline bake-cameras <map_data.csv> <out.postcard> [manhattan|nyc]\n  \
     data-pipeline bake-cctv <amnesty_counts_per_intersections.csv> <dahir_map_data.csv> <out.postcard> [manhattan|nyc]\n  \
     data-pipeline bake-ace <gtfs_dir> <ace_routes.json> <out.postcard> [manhattan|nyc] [boundary.geojson]\n  \
@@ -325,11 +418,13 @@ const USAGE: &str = "usage:\n  \
     data-pipeline bake-footprints <building_footprints.geojson> <out.osbldg> [borough|all] [boundary.geojson]\n  \
     data-pipeline bake-parks <parks_properties.geojson> <out.ospark> [borough|all]\n  \
     data-pipeline bake-plazas <pedestrian_plazas.geojson> <out.osplaza>\n  \
+    data-pipeline bake-facilities <facilities.json> <out.osfac> [borough|all] [parks.geojson] [plazas.geojson]\n  \
     data-pipeline bake-landmarks <landmarks_lod2.json> <out.oslmk>\n  \
     data-pipeline bake-linknyc <kiosks.json> <out.oslink> [manhattan.geojson]\n  \
     data-pipeline bake-robotability <graph.osgraph> <sidewalks.geojson> <out.osrobot>\n  \
     data-pipeline bake-teslas <nyc_zips.geojson> <tesla_by_zip.csv> <out.osteslas>\n  \
     data-pipeline bake-enforcement <enforcement_signs.csv> <out.oscam>\n  \
+    data-pipeline bake-subway <gtfs_dir> <out.ossub> [service_id=Weekday] [win_start_h=7] [win_end_h=10] [ferry_gtfs_dir=<gtfs_dir>/../siferry]\n  \
     data-pipeline bake-bus-day <gtfs_dir> <ace_routes.json> <YYYYMMDD> <out.osbusday> [manhattan|nyc] [boundary.geojson]\n  \
     data-pipeline bake-taxi-day <graph.osgraph> <taxi_zones.geojson> <perminute_od.csv> <trips_all.csv> <YYYYMMDD> <out.ostaxiday>\n  \
     data-pipeline bake-dashcam-field <taxi_zones.geojson> <zone_trips.csv> <out.postcard>\n  \

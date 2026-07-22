@@ -17,8 +17,12 @@ use sim_core::assets::{
     AceCorridorLayer, AlprReaderLayer, BoroughOutline, BuildingFootprints, BusDayLayer,
     CctvCameraLayer, DashcamFieldLayer, EquityLayer, FacilityLayer, FixedSensorLayer, GraphAsset,
     HeatmapLayer, LandmarkMassing, LinkNycLayer, NeighborhoodLayer, RobotabilityField, TaxiDayLayer,
-    TeslaField, VehicleRoutesLayer,
+    TeslaField, TessellatedFootprints, VehicleRoutesLayer,
 };
+
+/// Magic prefix on brotli-compressed baked assets (written by `web/build.sh` for the
+/// web deploy). Chosen to never collide with a raw postcard stream's first bytes.
+const BROTLI_MAGIC: &[u8] = b"OSZ1";
 
 macro_rules! postcard_asset {
     ($name:ident, $inner:ty) => {
@@ -44,6 +48,7 @@ postcard_asset!(RobotabilityRes, RobotabilityField);
 postcard_asset!(TeslaFieldRes, TeslaField);
 postcard_asset!(BoroughRes, BoroughOutline);
 postcard_asset!(FootprintsRes, BuildingFootprints);
+postcard_asset!(TessFootprintsRes, TessellatedFootprints);
 // Parks reuse the flat-polygon footprint payload, under their own extension so the
 // loader resolves them distinctly (the app tints them green, not building-gray).
 postcard_asset!(ParksRes, BuildingFootprints);
@@ -82,7 +87,14 @@ impl<A: Asset + DeserializeOwned> AssetLoader for PostcardLoader<A> {
     ) -> Result<A, anyhow::Error> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        Ok(postcard::from_bytes(&bytes)?)
+        if let Some(payload) = bytes.strip_prefix(BROTLI_MAGIC) {
+            use std::io::Read;
+            let mut out = Vec::new();
+            brotli::Decompressor::new(payload, 4096).read_to_end(&mut out)?;
+            Ok(postcard::from_bytes(&out)?)
+        } else {
+            Ok(postcard::from_bytes(&bytes)?)
+        }
     }
 
     fn extensions(&self) -> &[&str] {
@@ -109,6 +121,7 @@ pub fn register(app: &mut App) {
         .init_asset::<TeslaFieldRes>()
         .init_asset::<BoroughRes>()
         .init_asset::<FootprintsRes>()
+        .init_asset::<TessFootprintsRes>()
         .init_asset::<ParksRes>()
         .init_asset::<PlazaRes>()
         .init_asset::<LandmarkRes>()
@@ -131,6 +144,7 @@ pub fn register(app: &mut App) {
         .register_asset_loader(PostcardLoader::<TeslaFieldRes>::new("osteslas"))
         .register_asset_loader(PostcardLoader::<BoroughRes>::new("osboro"))
         .register_asset_loader(PostcardLoader::<FootprintsRes>::new("osbldg"))
+        .register_asset_loader(PostcardLoader::<TessFootprintsRes>::new("ostess"))
         .register_asset_loader(PostcardLoader::<ParksRes>::new("ospark"))
         .register_asset_loader(PostcardLoader::<PlazaRes>::new("osplaza"))
         .register_asset_loader(PostcardLoader::<LandmarkRes>::new("oslmk"))
@@ -139,8 +153,11 @@ pub fn register(app: &mut App) {
 }
 
 /// Handles requested at startup; the world is built once they resolve.
+/// Split into critical (blocks first interactive frame) and deferred (visual
+/// layers + agent data that load in the background).
 #[derive(Resource)]
 pub struct LoadingHandles {
+    // --- Critical: needed for the first interactive frame (routing + exposure) ---
     pub graph: Handle<GraphAssetRes>,
     /// A drive network (CSCL, incl. highways like the FDR) the roving-coverage
     /// overlay snaps vehicle motion onto, so highway use lights up too.
@@ -155,13 +172,14 @@ pub struct LoadingHandles {
     pub dashcam: Handle<DashcamFieldRes>,
     pub alpr: Handle<AlprRes>,
     pub dot: Handle<DotRes>,
+    pub borough: Handle<BoroughRes>,
+    // --- Deferred: visual layers + agent data (loaded in background) ---
     pub vehicle_routes: Handle<VehicleRoutesRes>,
     pub neighborhoods: Handle<NeighborhoodRes>,
     pub bus_day: Handle<BusDayRes>,
     pub taxi_day: Handle<TaxiDayRes>,
     pub robotability: Handle<RobotabilityRes>,
     pub teslas: Handle<TeslaFieldRes>,
-    pub borough: Handle<BoroughRes>,
     pub footprints: Handle<FootprintsRes>,
     /// Park polygons (green context fabric) — Manhattan-clipped or citywide.
     pub parks: Handle<ParksRes>,

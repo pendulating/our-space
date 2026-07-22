@@ -53,7 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let from = proj.to_enu(from_lat, from_lon);
     let to = proj.to_enu(to_lat, to_lon);
     let (_route, sum) = run_route(
-        &graph, &sensors, &[], &mobile, from, to, params, departure_hour, dashcam_field.as_ref(), None, None, None,
+        &graph, &sensors, &sim_core::OccluderIndex::empty(), &mobile, from, to, params, departure_hour,
+        dashcam_field.as_ref(), None, None, None, None, None,
     )?;
 
     println!("── our-space exposure demo ──────────────────────────────");

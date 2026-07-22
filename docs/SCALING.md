@@ -64,9 +64,56 @@ Agents are deliberately *absent* from this list: the caps mean five boroughs
 render the same agent budget, just spread thinner. The work there is making them
 *spawn where the camera is looking* (Phase 3), not making them faster.
 
+### Delivered (2026-07): citywide runtime + transfer wins
+
+Stat-preserving optimizations against the bottlenecks above. Each is exact by
+construction (integer counts / identical sets / byte-identical bytes); the two subtle
+ones carry equivalence unit tests.
+
+- **Neighborhood spatial grid** (`NeighborhoodGrid`, `main.rs`). The per-frame mobile
+  tally (`sample_neighborhood_mobile`) did an `O(agents × ~312)` point-in-polygon scan
+  over the full active taxi fleet + every agent, every 0.5 s — the #5 bottleneck's real
+  cost. A ~500 m bbox grid cuts each lookup to a handful of candidates; `locate` returns
+  the *same* first match as the old linear scan (non-overlapping polys, ascending-index
+  candidates). Test: `neighborhood_grid_tests::locate_matches_linear_scan` (40 k+ probes).
+- **Choropleth recolor gated on the recount** (`sample_neighborhood_mobile`). The fill
+  recolor + `density_range` re-sort + `N` `format!("{} mobile")` label allocs ran *every
+  frame*; now they run only when the throttled 0.5 s recount actually changes the counts
+  (freshly (re)spawned labels already carry the right colors/text from
+  `rebuild_neighborhoods`, so this is visually identical).
+- **Bus admission via two windowed scans** (`bus_admit_indices`, `agents.rs`). Buses used
+  to re-scan the whole start-sorted timetable every frame; now they admit from just the
+  `now` and after-midnight `now + 1440` `partition_point` windows — identical active set
+  + over-cap subsample. Test: `agents::tests::bus_admit_windows_match_full_scan` (all
+  1440 minutes incl. the midnight wrap).
+- **Route sensor-cull cache** (`recompute_on_change`). The culled sensor set depends only
+  on route geometry, but was rebuilt on every ~30-min hour-step tick and slider drag; now
+  cached by `(route_len_bits, route_points)`. Ids are sorted before use, pinning the set's
+  order so `summarize`'s float accumulation is deterministic (previously `HashSet`-random).
+- **Brotli-compressed baked layers** (`web/build.sh` + `loading.rs`). GitHub Pages doesn't
+  compress `application/octet-stream`, so the layers shipped raw. `build.sh` now brotli-q11
+  compresses each `web/dist/assets/processed/*` behind an `OSZ1` magic prefix; the loader
+  decompresses transparently (native `assets/` stay raw). Citywide taxi layer **46 → 9 MB**,
+  `web/dist` total **≈ −78 MB of transfer**; decompressed bytes are byte-identical, so no
+  layer or statistic changes. Budget-gate values in `build.sh` now track compressed sizes.
+
 ---
 
 ## 3. Build the instrumentation first (Phase 0)
+
+> **Status (2026-06-30): BUILT.** All four pieces below are in. Perf HUD =
+> `ui::perf_hud` (FPS · frame ms + live taxi/bus/ped/tesla/robot counts + zoom +
+> scope), gated by `debug_perf_enabled()` (`?debug=perf` web / `OURSPACE_DEBUG_PERF` /
+> `OURSPACE_FPS` native). Frame-time matrix = `tools/inspect/profile.mjs` (rAF p50/p95/max
+> over {build × zoom}). Bundle gate = the budget block in `web/build.sh` (fails the build
+> over budget; per-asset + total). Baseline = `docs/perf-baseline.json` (regenerate with
+> `node tools/inspect/profile.mjs`). Measured baseline: p50 8.3 ms / p95 ≤ 9.3 ms at every
+> preset (well under the 16.6 ms target; mean FPS is vsync-capped ~115–120 so p95/max are
+> the regression signal — rare ~40 ms hitches at citywide peak). Deviations from the plan:
+> the HUD shows agent counts rather than JS-heap (Bevy WASM heap isn't exposed via
+> `performance.memory`); the matrix lives in a sibling `profile.mjs` rather than an
+> `inspect.mjs --profile` flag, and sweeps via the `?city=` param + wheel-zoom (no
+> per-layer `?story=` presets yet).
 
 Do not scale anything until we can see frame time, asset weight, and entity counts
 on demand. None of this ships to end users — it's gated behind a debug flag.
@@ -203,7 +250,10 @@ pipeline as Manhattan.
   ~1.08 M buildings) — *not* the CityGML (`DA_WISE_GML.zip` is the 14 GB 3D model, for
   landmarks). Naive citywide bake ≈ 120 MB; RDP-simplified (@ 1 m, ≥ 18 m²) ≈ 51 MB
   — still far past a flat web budget. **Solved by lazy per-borough loading** (below).
-- **ALPR / enforcement / LinkNYC** raw snapshots are Manhattan-only (small re-fetch).
+- **Enforcement** is now citywide (4,182 DOT sign locations, refetched 2026-07-14). **ALPR** (DeFlock,
+  444 devices) already spans four boroughs -- Manhattan (288) + Bronx (45) + Queens (41) + Brooklyn (32),
+  no Staten Island -- so the snapshot is the full crowdsource extent, not a Manhattan clip. Only
+  **LinkNYC** stays Manhattan-only (small re-fetch).
 - **OSM street graph** is Manhattan-only — needed only for routing/walkshed/
   robotability/taxi, all deferred, so the static+buses MVP needs no citywide OSM.
   Routing modes stay Manhattan-gated in the citywide build for now.
@@ -252,6 +302,11 @@ pedestrian-only network would strand (no walk crossing). Result: **71,483 nodes 
 `GRAPH_PATH_NYC` in for the citywide build; the exposure grid stays bounded (it clamps
 to ≤280×360 cells and just coarsens), and buses/taxi don't index the graph, so the
 swap is safe.
+
+**Note (2026-07-14):** this drive-ish union is the **app basemap** graph. The citywide bake now also
+produces a true pedestrian graph `graph_nyc_walk.osgraph` (`nonped=V` drop), and every paper walkshed
+(`R_i`, destination `R_j`, counterfactual, covariates) runs on it; the app basemap still unions both
+networks. See `docs/OCCLUSION_PLAN.md` §14.
 
 ### On-the-fly NYCOpenData APIs — spike findings (2026-06-25)
 

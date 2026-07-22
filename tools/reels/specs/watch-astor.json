@@ -1,0 +1,16 @@
+{
+  "id": "watch-astor",
+  "title": "How many cameras watch Astor Place?",
+  "size": [1080, 1920],
+  "fps": 30,
+  "steps": [
+    { "action": "Overview", "secs": 2.0,
+      "caption": "A living map of who is watching New York City." },
+    { "action": "FlyTo", "lat": 40.7300, "lon": -73.9910, "zoom": 2.6, "secs": 2.5,
+      "caption": "Astor Place, Manhattan." },
+    { "action": "Walkshed", "lat": 40.7300, "lon": -73.9910, "secs": 5.0,
+      "caption": "Every fixed camera within a 10-minute walk." },
+    { "action": "Caption", "secs": 3.0,
+      "caption": "~{cameras} cameras watch this block. Measured, not guessed." }
+  ]
+}

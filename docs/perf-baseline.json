@@ -1,0 +1,39 @@
+{
+  "measured_at": "2026-06-30T16:15:16.102Z",
+  "context": {
+    "viewport": "1440x900 @1x",
+    "browser": "system Google Chrome (WebGPU / Metal)",
+    "note": "requestAnimationFrame cadence = on-screen render rate. Mean FPS is vsync-capped; treat p95_ms / max_ms as the regression signal (frame budget = 16.6 ms @60Hz / 8.3 ms @120Hz).",
+    "settle_ms": 47000,
+    "sample_ms": 6000
+  },
+  "cells": [
+    {
+      "cell": "manhattan / default",
+      "fps": 119.4,
+      "p50_ms": 8.3,
+      "p95_ms": 8.7,
+      "max_ms": 25,
+      "frames": 717,
+      "loaded": true
+    },
+    {
+      "cell": "nyc / whole-city",
+      "fps": 114.3,
+      "p50_ms": 8.3,
+      "p95_ms": 9.2,
+      "max_ms": 41.8,
+      "frames": 686,
+      "loaded": true
+    },
+    {
+      "cell": "nyc / neighborhood",
+      "fps": 114.8,
+      "p50_ms": 8.3,
+      "p95_ms": 9.3,
+      "max_ms": 41.6,
+      "frames": 689,
+      "loaded": true
+    }
+  ]
+}

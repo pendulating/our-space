@@ -23,6 +23,9 @@ STEEL = (0x41, 0x60, 0x7e, 255)   # ALPR / owl (pictorial)
 CYAN = (0x4d, 0x7a, 0x8c, 255)    # DOT cyan-slate (pictorial)
 GLASS = (0x34, 0x51, 0x69, 255)   # smart glasses (Tier D slate)
 ACE = (0x25, 0x63, 0xeb, 255)     # ACE bus corridor — transit blue (blue-600)
+AMBER = (0xf5, 0x9e, 0x0b, 255)   # rideshare dashcam agents (theme map::AMBER)
+ORANGE = (0xf9, 0x73, 0x16, 255)  # Tesla agents (theme map::ORANGE)
+VIOLET = (0x9a, 0x8f, 0xc0, 255)  # delivery robots (theme map::ROBOT_VIOLET)
 # Surveillance wordmark inks (must match theme.rs map:: tokens).
 MAROON = (0x7f, 0x1d, 0x1d, 255)  # CCTV — dense baseline, recedes by value
 RED = (0xdc, 0x26, 0x26, 255)     # FLOCK / ALPR — the headline threat
@@ -91,16 +94,53 @@ def dot():
     return img
 
 
-def glasses():
-    """Smart glasses — clean thin engraved frames, no playful accent."""
+def glasses_top():
+    """Pedestrian wearing smart glasses, seen from directly above — head +
+    shoulders silhouette facing up (travel direction), with the glasses band as
+    the single cold-light detail across the face."""
     img, d = canvas()
     c = GLASS
-    w = px(5)
-    d.rounded_rectangle([px(16), px(50), px(56), px(80)], radius=px(10), outline=c, width=w)
-    d.rounded_rectangle([px(72), px(50), px(112), px(80)], radius=px(10), outline=c, width=w)
-    d.line([(px(56), px(60)), (px(72), px(60))], fill=c, width=w)   # bridge
-    d.line([(px(16), px(58)), (px(4), px(52))], fill=c, width=w)    # temples
-    d.line([(px(112), px(58)), (px(124), px(52))], fill=c, width=w)
+    # shoulders (top-down torso: a wide ellipse)
+    d.ellipse([px(30), px(42), px(98), px(104)], fill=c)
+    # head, overlapping the shoulders, forward of center
+    d.ellipse([px(46), px(20), px(82), px(56)], fill=c)
+    # the glasses: a light band across the front of the head (the tech accent)
+    d.rounded_rectangle([px(48), px(25), px(80), px(34)], radius=px(4), fill=LIGHT)
+    return img
+
+
+def car_top(color, glass_roof=False):
+    """Top-down car, nose up (agents rotate along travel). `glass_roof` swaps the
+    separate windshield/rear-window panes for a Tesla's full glass canopy. A small
+    cold-ink dot marks the onboard camera — the reason the car is on this map."""
+    img, d = canvas()
+    # side mirrors (small nubs proud of the body, at windshield height)
+    d.rounded_rectangle([px(28), px(38), px(42), px(46)], radius=px(3), fill=color)
+    d.rounded_rectangle([px(86), px(38), px(100), px(46)], radius=px(3), fill=color)
+    # body
+    d.rounded_rectangle([px(38), px(8), px(90), px(120)], radius=px(19), fill=color)
+    if glass_roof:
+        d.rounded_rectangle([px(45), px(34), px(83), px(108)], radius=px(9), fill=LIGHT)
+        d.ellipse([px(60), px(36), px(68), px(44)], fill=SLATE)   # autopilot cam, windshield top
+    else:
+        d.rounded_rectangle([px(45), px(34), px(83), px(54)], radius=px(6), fill=LIGHT)   # windshield
+        d.rounded_rectangle([px(47), px(98), px(81), px(112)], radius=px(5), fill=LIGHT)  # rear glass
+        d.ellipse([px(60), px(46), px(68), px(54)], fill=SLATE)   # dashcam at the mirror mount
+    return img
+
+
+def robot_top():
+    """Sidewalk delivery robot from above — a rounded cargo box with a light lid
+    seam, a front camera dot, and the rear safety-flag whip as a corner dot."""
+    img, d = canvas()
+    c = VIOLET
+    d.rounded_rectangle([px(34), px(20), px(94), px(108)], radius=px(15), fill=c)
+    # lid seam (inset outline, the only large internal detail)
+    d.rounded_rectangle([px(42), px(30), px(86), px(98)], radius=px(9), outline=LIGHT, width=px(3))
+    # forward camera
+    d.ellipse([px(59), px(20), px(69), px(30)], fill=SLATE)
+    # safety flag, rear-right
+    d.ellipse([px(78), px(92), px(88), px(102)], fill=SLATE)
     return img
 
 
@@ -135,28 +175,33 @@ def brand(label, color):
     return img
 
 
-def bus():
-    """Side-view transit bus — spare silhouette."""
+def bus_top():
+    """Top-down transit bus, nose up — a long roof slab with the windshield, two
+    roof hatches, and rear glass as cold-light details; a slate dot marks the
+    forward-facing ACE camera behind the windshield."""
     img, d = canvas()
     c = ACE
-    d.rounded_rectangle([px(12), px(40), px(116), px(84)], radius=px(8), fill=c)   # body
-    # a single thin window band (cold light), no mullion clutter
-    d.rounded_rectangle([px(20), px(48), px(92), px(60)], radius=px(3), fill=LIGHT)
-    # door seam
-    d.rectangle([px(100), px(48), px(104), px(76)], fill=LIGHT)
-    # wheels
-    d.ellipse([px(28), px(76), px(46), px(94)], fill=SLATE)
-    d.ellipse([px(82), px(76), px(100), px(94)], fill=SLATE)
+    d.rounded_rectangle([px(42), px(6), px(86), px(122)], radius=px(10), fill=c)    # body
+    d.rounded_rectangle([px(47), px(11), px(81), px(21)], radius=px(4), fill=LIGHT)  # windshield
+    d.ellipse([px(60), px(24), px(68), px(32)], fill=SLATE)                          # ACE cam
+    d.rounded_rectangle([px(52), px(44), px(76), px(58)], radius=px(4), fill=LIGHT)  # roof hatch
+    d.rounded_rectangle([px(52), px(74), px(76), px(88)], radius=px(4), fill=LIGHT)  # roof hatch
+    d.rounded_rectangle([px(48), px(110), px(80), px(117)], radius=px(3), fill=LIGHT)  # rear glass
     return img
 
 
 if __name__ == "__main__":
-    # Pictorial silhouettes (mobile agents still use bus/glasses).
+    # Pictorial silhouettes (fixed markers).
     save(cctv(), "cctv.png")
     save(owl(), "owl.png")
     save(dot(), "dot.png")
-    save(glasses(), "glasses.png")
-    save(bus(), "bus.png")
+    # Mobile agents: top-down, nose-up silhouettes (the renderer rotates each
+    # icon along its travel heading).
+    save(glasses_top(), "glasses.png")
+    save(bus_top(), "bus.png")
+    save(car_top(AMBER), "taxi.png")
+    save(car_top(ORANGE, glass_roof=True), "tesla.png")
+    save(robot_top(), "robot.png")
     # Branded wordmarks for the fixed map markers + Operators-view chips: the icons
     # become the operator's name, in the operator's ink. Surveillance ramp — distinct
     # in hue and value so the dense layers stay legible on the white ground.

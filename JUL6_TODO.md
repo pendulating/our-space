@@ -1,0 +1,5 @@
+- [x] Activate the frontend design skills you have and prepare a comprehensive, validated, and tested suite of screen size-responsive variants of the application; while desktop looks good, mobile and tablet are atrocious. Do not stop until, using playwright or a similar browser capture tool, all browser sizes display intuitively, fit all necessary content, and are polished. 
+- [x] Ensure that all data snapshots in data/snapshots have reproducibile tooling/scripts to pull and regenerate the dataset, if needed. 
+- [x] Design interactive marimo notebooks that explore and visualize the exposure model created a few sessions ago (CBG outputs here: /Users/mattfranchi/Repos/our-space/data/derived/exposure)
+- [x] Ensure the reels functionality creates reels that are readable -- text is large enough and high-contrast enough, etc. 
+- [x] Ensure that text used in reels does not include em dashes (--), other 'Claude-isms', or generic and flowery writing. The goal is to be descriptive and concise. 

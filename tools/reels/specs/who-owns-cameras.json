@@ -1,0 +1,17 @@
+{
+  "id": "who-owns-cameras",
+  "title": "Who owns the cameras?",
+  "size": [1080, 1920],
+  "fps": 30,
+  "poster": 9.0,
+  "steps": [
+    { "action": "Overview", "secs": 2.5,
+      "caption": "Every camera watching Manhattan has an owner." },
+    { "action": "Operators", "secs": 6.5,
+      "caption": "They sort by owner: city agencies, private fleets, transit." },
+    { "action": "Caption", "secs": 3.5,
+      "caption": "It isn't one system. Each tower is a separate operator watching the same streets." },
+    { "action": "Caption", "secs": 3.0,
+      "caption": "Fixed cameras are measured. The moving and future columns are a model." }
+  ]
+}

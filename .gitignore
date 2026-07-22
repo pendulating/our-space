@@ -13,6 +13,20 @@ Cargo.lock.orig
 # curl/DuckDB/Overpass steps); never commit them.
 /data/snapshots/
 
+# Derived pipeline outputs (exposure batches, .ossub, result tables) — large
+# and regenerable via data-pipeline / batch / the analysis scripts.
+/data/derived/
+
+# Rendered reel output (video/frames) — large, regenerable via tools/reels.
+/tools/reels/out/
+
+# marimo notebook cache/exports.
+/notebooks/__marimo__/
+
+# The FAccT'27 paper lives in its own repo (pendulating/facct27_...); it is
+# checked out here for convenience but must not be embedded as a gitlink.
+/facct27_digital_eyes_on_the_street/
+
 # Python virtualenv for the OSMnx export step
 /.venv
 __pycache__/
@@ -29,3 +43,12 @@ __pycache__/
 /.agents
 /.claude
 /skills-lock.json
+
+# Secrets — API keys (Census, etc.). Never commit.
+/.env
+/.env.*
+
+# Python analysis env (uv)
+.venv/
+__pycache__/
+*.pyc
