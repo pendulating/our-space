@@ -766,6 +766,14 @@ fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key).ok().and_then(|s| s.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(default)
 }
 
+/// ACS B08301 bus share within the transit mode (the transit sub-mode weight used by
+/// `od-exposure-modal`'s `bus_share` closure, factored out for M3 pair emission).
+fn bus_share_of(acs: &Table, geoid: &str) -> f64 {
+    let b = fnum(acs.get(geoid, "commute_bus")).unwrap_or(0.0);
+    let tr = fnum(acs.get(geoid, "commute_transit")).unwrap_or(0.0);
+    if tr > 0.0 { (b / tr).clamp(0.0, 1.0) } else { 0.35 }
+}
+
 
 fn edge_midpoint(e: &EdgeData) -> Enu {
     let p = &e.polyline[e.polyline.len() / 2];
@@ -2489,6 +2497,8 @@ struct ModePair {
     /// traversal, day-averaged. Weighted by street-exposed mode share at aggregation.
     m_ace: f64,
     m_dash: f64,
+    /// Destination BG (for M3 pair emission; empty in the modal command's variant).
+    work_geoid: String,
     /// Walkable commute: the WALK-graph route exists and is ≤ WALK_MAX_M. Gates the
     /// observed-shares mode model for income-suppressed homes (the MNL gates itself
     /// through t_walk).
@@ -2733,6 +2743,17 @@ fn od_exposure_mnl(
     let bus = BusParams::from_env();
     // M1 mobile layers (see od_exposure_modal): shared read-only state for the pass below.
     let mob = std::sync::Arc::new(MobileLayers::load()?);
+    // M3 incidence-inversion emission (OUTLINE §8): when OURSPACE_EMIT_PAIRS is set, every
+    // routed (home, work) pair also appends one row — home_bg, work_bg, jobs, and the
+    // per-traversal mobile encounters — so the transpose (exposure each WORK BG generates,
+    // decomposed by the HOME of the people captured) can be computed downstream. Off by
+    // default: the pair file is ~1.9M rows for the full OD matrix.
+    let pairs_path = std::env::var("OURSPACE_EMIT_PAIRS").ok().filter(|s| !s.is_empty());
+    let pair_rows: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    eprintln!(
+        "  M3 pair emission: {}",
+        pairs_path.as_deref().unwrap_or("off")
+    );
     eprintln!("  transit bus sub-mode: [{}]", bus.describe());
     let circuity = subway_circuity();
     match &submat {
@@ -2864,6 +2885,7 @@ fn od_exposure_mnl(
                     m_dash,
                     short,
                     transit_ok,
+                    work_geoid: wid.clone(),
                 });
             }
             if pairs.is_empty() {
@@ -3037,11 +3059,7 @@ fn od_exposure_mnl(
                 // Street-exposed mode share: drive rides the corridor fully; the bus sub-share
                 // of transit does too (rail riders skip it) — ACS B08301 bus/subway split,
                 // same source as the transit sub-mode model. See od_exposure_modal.
-                let bus_share = {
-                    let b = fnum(acs.get(&h.geoid, "commute_bus")).unwrap_or(0.0);
-                    let tr = fnum(acs.get(&h.geoid, "commute_transit")).unwrap_or(0.0);
-                    if tr > 0.0 { (b / tr).clamp(0.0, 1.0) } else { 0.35 }
-                };
+                let bus_share = bus_share_of(&acs, &h.geoid);
                 let street_share = (pd + pt * bus_share).min(1.0);
                 w_ace += p.flow * p.m_ace * street_share;
                 w_dash += p.flow * p.m_dash * street_share;
@@ -3062,10 +3080,51 @@ fn od_exposure_mnl(
                 w_ace * inv,
                 w_dash * inv,
             );
+            // M3 emission: per-pair rows with the street-exposure-weighted mobile encounters
+            // this (home, work) pair generates — exactly what the incidence-inversion
+            // transpose consumes. Computed here while the mode shares are in scope.
+            if let Some(pp) = &pairs_path {
+                let mut buf = pair_rows.lock().unwrap();
+                for p in &h.pairs {
+                    let (pw, pd, pt) = if h.has_income {
+                        mode_probs(p, h.vot, asc_drive, asc_transit)
+                    } else {
+                        gated_shares(h.shares, p)
+                    };
+                    let bus_share = bus_share_of(&acs, &h.geoid);
+                    let street = (pd + pt * bus_share).min(1.0);
+                    buf.push(format!(
+                        "{},{},{},{:.4},{:.4},{:.4}",
+                        h.geoid,
+                        p.work_geoid,
+                        p.flow,
+                        street,
+                        p.m_ace * street,
+                        p.m_dash * street,
+                    ));
+                }
+            }
             (h.geoid.clone(), row)
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // M3: write the per-pair file (sorted for determinism) when emission is on.
+    if let Some(pp) = &pairs_path {
+        let mut buf = pair_rows.into_inner().unwrap();
+        buf.sort();
+        use std::io::Write as _;
+        let pw = std::io::BufWriter::new(
+            std::fs::File::create(pp).with_context(|| format!("creating {pp}"))?,
+        );
+        let mut w = pw;
+        writeln!(w, "home_bg,work_bg,jobs,street_share,m_ace,m_dash")?;
+        for line in &buf {
+            writeln!(w, "{line}")?;
+        }
+        w.flush()?;
+        eprintln!("  M3 pairs: {} rows -> {pp}", buf.len());
+    }
 
     let mut w = std::io::BufWriter::new(
         std::fs::File::create(out_path).with_context(|| format!("creating {out_path}"))?,
@@ -3216,6 +3275,7 @@ fn exposure_table(
         A_drive,A_route,A_dest,A_route_alpr,A_route_dot,A_route_enf,A_flow_coverage,A_n_dest,\
         A_modal,commute_modal,mode_p_drive,mode_p_transit,mode_p_walk,\
         A_mnl,commute_mnl,mnl_p_drive,mnl_p_transit,mnl_p_walk,\
+        M_ace_res,M_dash_res,M_ace_act_mnl,M_dash_act_mnl,M_ace_act_modal,M_dash_act_modal,\
         E_i,E_i_mnl,\
         pop_acs,pct_white_nh,pct_black_nh,pct_asian_nh,pct_hispanic,median_hh_income,\
         pct_commute_transit,pct_commute_car,pct_commute_walk,pct_renter,poverty_rate\n";
@@ -3281,6 +3341,7 @@ fn exposure_table(
              {},{},{},{},{},{},{},{},\
              {},{},{},{},{},\
              {},{},{},{},{},\
+             {},{},{},{},{},{},\
              {},{},\
              {},{},{},{},{},{},{},{},{},{},{}\n",
             boro(g),
@@ -3293,6 +3354,11 @@ fn exposure_table(
             a("route_enf"), share(ai.get(g, "jobs_covered"), ai.get(g, "jobs_total")), a("n_dest"),
             m("A_modal"), m("commute_modal"), m("p_drive"), m("p_transit"), m("p_walk"),
             x("A_modal"), x("commute_modal"), x("p_drive"), x("p_transit"), x("p_walk"),
+            // M1 mobile terms (blank when the source bake predates them, so the
+            // M2/M3 scripts can distinguish "layer off" from "zero exposure").
+            r("m_ace_res"), r("m_dash_res"),
+            x("m_ace_act"), x("m_dash_act"),
+            m("m_ace_act"), m("m_dash_act"),
             ei_modal, ei_mnl,
             d("pop_total"),
             share(acs.get(g, "white_nh"), acs.get(g, "pop_total")),

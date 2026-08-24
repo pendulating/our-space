@@ -51,6 +51,11 @@ echo "==> 2/4  network descriptives (drive vs walk)"
 
 echo "==> 3/4  analyses"
 uv run python tools/inequality_stats.py       # -> inequality_stats.json, lorenz_curves.csv
+uv run python tools/compounding.py            # -> compounding.json (M2: corr(R_i, M_i^act);
+                                              #    needs the M1 mobile columns in the table)
+uv run python tools/incidence_inversion.py    # -> incidence_inversion.json (M3; needs
+                                              #    OURSPACE_PAIRS=... od_pairs CSV emitted via
+                                              #    OURSPACE_EMIT_PAIRS=<path> batch od-exposure-mnl)
 uv run python tools/crime_ladder.py           # -> crime_ladder.json
 uv run python tools/analyze_counterfactual.py # -> counterfactual.json
 uv run python tools/capture_recapture.py      # -> capture_recapture.json (+ recall_draws)
