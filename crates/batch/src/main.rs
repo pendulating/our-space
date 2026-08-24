@@ -658,6 +658,115 @@ fn read(path: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {path} (bake assets first)"))
 }
 
+/// The observed mobile classes (ACE buses + rideshare dashcams), loaded for the
+/// block-group/OD exposure commands — the M1 plumbing that lets [[M_i]] terms ride
+/// alongside the fixed-camera census.
+///
+/// **Graceful absence:** if either baked asset is missing, that class is silently
+/// disabled and its output columns are 0 — but a stderr line says so loudly, because a
+/// zero column in `data/derived/` must mean "layer off", never "layer forgotten". The
+/// heatmap already loads these same two assets; this is the same universe, finally
+/// shared by every command.
+struct MobileLayers {
+    ace_tree: Option<RTree<[f64; 2]>>,
+    ace_cap_r2: f64,
+    ace_routes: usize,
+    dashcam: Option<sim_core::DashcamFieldLayer>,
+    mobile: sim_core::MobileScenario,
+    dashcam_on: bool,
+}
+
+impl MobileLayers {
+    fn load() -> Result<Self> {
+        let mut mobile = sim_core::MobileScenario::fields_only();
+        // Only the OBSERVED fleets are enabled for the paper's tables; glasses stay
+        // scenario-only (they are Tier D and excluded from empirical claims).
+        mobile.glasses = None;
+
+        let mut ace_tree: Option<RTree<[f64; 2]>> = None;
+        let (mut ace_cap_r2, mut ace_routes) = (0.0_f64, 0_usize);
+        match std::fs::read(ACE_PATH) {
+            Ok(bytes) => match sim_core::AceCorridorLayer::from_bytes(&bytes) {
+                Ok(ace) => {
+                    ace_routes = ace.routes.len();
+                    let cfg = sim_core::AceConfig::new(
+                        ace.segments
+                            .iter()
+                            .map(|s| {
+                                [sim_core::Vec2::new(s[0][0], s[0][1]), sim_core::Vec2::new(s[1][0], s[1][1])]
+                            })
+                            .collect(),
+                    );
+                    ace_cap_r2 = cfg.capture_range_m.powi(2);
+                    // Densify each segment to ~10 m points so proximity queries don't
+                    // miss the middle of long segments (same as the heatmap).
+                    let mut pts = Vec::new();
+                    for s in &ace.segments {
+                        let a = sim_core::Vec2::new(s[0][0], s[0][1]);
+                        let b = sim_core::Vec2::new(s[1][0], s[1][1]);
+                        let n = (a.distance(b) / 10.0).ceil().max(1.0) as usize;
+                        for k in 0..=n {
+                            let p = a.lerp(b, k as f64 / n as f64);
+                            pts.push([p.x, p.y]);
+                        }
+                    }
+                    ace_tree = Some(RTree::bulk_load(pts));
+                    mobile.ace = Some(cfg);
+                }
+                Err(e) => eprintln!("  WARNING: ACE asset failed to decode ({e}); ACE class OFF"),
+            },
+            Err(_) => eprintln!(
+                "  WARNING: {ACE_PATH} missing — ACE class OFF (bake it with data-pipeline bake-ace)"
+            ),
+        }
+
+        let dashcam = std::fs::read(DASHCAM_PATH)
+            .ok()
+            .and_then(|b| sim_core::DashcamFieldLayer::from_bytes(&b).ok());
+        let dashcam_on = dashcam.is_some();
+        if !dashcam_on {
+            eprintln!(
+                "  WARNING: {DASHCAM_PATH} missing — dashcam class OFF (bake it with bake-dashcam-field)"
+            );
+        }
+        mobile.dashcam = dashcam.as_ref().map(|_| {
+            // The field scales the config's baseline rate spatially; defaults carry the
+            // penetration/capture assumptions, which sweep via OURSPACE_DASH_PEN /
+            // OURSPACE_DASH_CAP (see `sweep_dashcam_params`).
+            sim_core::DashcamConfig {
+                penetration: env_f64("OURSPACE_DASH_PEN", 0.40),
+                capture_prob: env_f64("OURSPACE_DASH_CAP", 0.40),
+                ..sim_core::DashcamConfig::default()
+            }
+        });
+
+        Ok(Self { ace_tree, ace_cap_r2, ace_routes, dashcam, mobile, dashcam_on })
+    }
+}
+
+/// Hour-averaging weights over a representative day for walkshed-resident time:
+/// 8 waking hours weighted by each hour's activity level, normalized to sum to 1.
+/// The residential term integrates over *presence*, not a single departure hour,
+/// so a single-hour snapshot would misstate it; this is the cheap defensible prior
+/// (the composite E_i already uses a time-budget argument of the same kind).
+fn day_weights() -> [(f64, f64); 8] {
+    [
+        (8.5, sim_core::traffic_multiplier(8.5)),
+        (10.5, sim_core::traffic_multiplier(10.5)),
+        (13.0, sim_core::traffic_multiplier(13.0)),
+        (15.0, sim_core::traffic_multiplier(15.0)),
+        (17.5, sim_core::traffic_multiplier(17.5)),
+        (19.0, sim_core::traffic_multiplier(19.0)),
+        (21.0, sim_core::traffic_multiplier(21.0)),
+        (23.0, sim_core::traffic_multiplier(23.0)),
+    ]
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|s| s.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(default)
+}
+
+
 fn edge_midpoint(e: &EdgeData) -> Enu {
     let p = &e.polyline[e.polyline.len() / 2];
     Enu::new(p[0], p[1])
@@ -1012,6 +1121,20 @@ fn bg_exposure(graph_path: &str, points_path: &str, out_path: &str, walk_min: f6
     let (sensors, recall, occ) = load_fixed_sensors()?;
     let fov = sim_core::FovModel::from_env();
     eprintln!("  census FOV: {}", fov.describe());
+    // M1: the observed mobile classes ride alongside the fixed census. Their per-minute
+    // encounter rates are averaged over a representative day (see `day_weights`) because
+    // a resident's walkshed presence spans hours, not one departure minute.
+    let mob = MobileLayers::load()?;
+    if mob.mobile.ace.is_some() {
+        eprintln!("  mobile: {} ACE routes loaded", mob.ace_routes);
+    }
+    if mob.dashcam_on {
+        eprintln!(
+            "  mobile: dashcam field loaded (penetration {:.2}, capture {:.2}; env OURSPACE_DASH_PEN/OURSPACE_DASH_CAP)",
+            env_f64("OURSPACE_DASH_PEN", 0.40),
+            env_f64("OURSPACE_DASH_CAP", 0.40)
+        );
+    }
     let proj = EnuProjection::default();
     let max_seconds = walk_min * 60.0;
 
@@ -1035,7 +1158,7 @@ fn bg_exposure(graph_path: &str, points_path: &str, out_path: &str, walk_min: f6
         // recall r reconstructable from this one bake, with no re-run:
         //     cameras(r) = cameras_unconfirmed / r + (cameras_raw - cameras_unconfirmed)
         // That is what lets the undercount bootstrap draw 500 recall values cheaply.
-        "id,lat,lon,snap_m,reachable_edges,cameras_raw,cameras_unconfirmed,cameras_corrected,cctv,alpr,dot,enforcement\n",
+        "id,lat,lon,snap_m,reachable_edges,cameras_raw,cameras_unconfirmed,cameras_corrected,cctv,alpr,dot,enforcement,m_ace_res,m_dash_res\n",
     );
     let (mut n, mut skipped) = (0usize, 0usize);
     for line in text.lines() {
@@ -1065,6 +1188,64 @@ fn bg_exposure(graph_path: &str, points_path: &str, out_path: &str, walk_min: f6
             .map(|g| sensors[g.data])
             .collect();
         let s = sim_core::walkshed_exposure_with(&graph, &ws, &nearby, &occ, recall, &fov, None);
+        // M_i^res: expected devices/min from each observed mobile class, averaged over a
+        // representative day of waking hours (weights ∝ each hour's activity level). Sample
+        // points retrace the same walkshed edges the fixed census used, thinned to a 50 m
+        // stride (the mobile fields are smooth zone-level intensities; 10 m buys nothing);
+        // the reported figure is the mean day-averaged per-point rate over the walkshed —
+        // the "typical sidewalk moment in my walkshed". A full space-time integral needs
+        // trajectory-level presence data (future work).
+        let (mut ace_res, mut dash_res) = (0.0_f64, 0.0_f64);
+        if mob.mobile.ace.is_some() || mob.dashcam_on {
+            const MOBILE_STRIDE_M: f64 = 50.0;
+            let mut n_samples = 0_usize;
+            let mut sw = [0.0_f64; 2];
+            let edges = &graph.asset().edges;
+            let mut scratch: Vec<sim_core::Vec2> = Vec::new();
+            let weights = day_weights();
+            let wsum: f64 = weights.iter().map(|(_, w)| w).sum();
+            for &ei in &ws.edges {
+                sim_core::sample_polyline_into(
+                    &edges[ei as usize].polyline,
+                    MOBILE_STRIDE_M,
+                    true,
+                    1.0,
+                    &mut scratch,
+                );
+                for p in &scratch {
+                    // ACE proximity test once per sample (cheap R-tree lookup); the rate
+                    // itself is hour-folded below.
+                    let near_ace = mob
+                        .ace_tree
+                        .as_ref()
+                        .is_some_and(|t| t.locate_within_distance([p.x, p.y], mob.ace_cap_r2).next().is_some());
+                    for &(h, w) in &weights {
+                        let r = sim_core::exposure_rates_per_minute(
+                            *p,
+                            h,
+                            &[],
+                            &occ,
+                            near_ace,
+                            &mob.mobile,
+                            recall,
+                            mob.dashcam.as_ref(),
+                            None,
+                            None,
+                            None,
+                        );
+                        sw[0] += r.ace * w;
+                        sw[1] += r.dashcam * w;
+                    }
+                    n_samples += 1;
+                }
+                scratch.clear();
+            }
+            if n_samples > 0 {
+                let inv = 1.0 / (n_samples as f64 * wsum);
+                ace_res = sw[0] * inv;
+                dash_res = sw[1] * inv;
+            }
+        }
         // Per-type distinct-camera tally (each group counted once, under its representative
         // kind) for the ALPR-vs-traffic-vs-CCTV type contrast (plan §5d).
         let (mut cctv, mut alpr, mut dot, mut enf) = (0u32, 0u32, 0u32, 0u32);
@@ -1077,7 +1258,7 @@ fn bg_exposure(graph_path: &str, points_path: &str, out_path: &str, walk_min: f6
             }
         }
         out.push_str(&format!(
-            "{id},{lat:.6},{lon:.6},{snap_m:.1},{},{},{:.4},{:.4},{cctv},{alpr},{dot},{enf}\n",
+            "{id},{lat:.6},{lon:.6},{snap_m:.1},{},{},{:.4},{:.4},{cctv},{alpr},{dot},{enf},{ace_res:.4},{dash_res:.4}\n",
             s.reachable_edges,
             s.cameras_raw,
             s.cameras_unconfirmed, // weighted under the census-FOV expectation → fractional
@@ -1595,6 +1776,7 @@ fn od_exposure(
     let (sensors, recall, occ) = load_fixed_sensors()?;
     let fov = sim_core::FovModel::from_env();
     eprintln!("  census FOV: {}", fov.describe());
+    let mob = MobileLayers::load()?;
     let proj = EnuProjection::default();
     let max_seconds = walk_min * 60.0;
     let cull_r2 = (max_seconds * DEFAULT_WALK_SPEED_MPS + 300.0).powi(2);
@@ -1659,7 +1841,7 @@ fn od_exposure(
 
     let mut out = String::from(
         "home_bg,lat,lon,snap_m,n_dest,jobs_covered,jobs_total,\
-         A_drive,route_cams,dest_cams,route_alpr,route_dot,route_enf\n",
+         A_drive,route_cams,dest_cams,route_alpr,route_dot,route_enf,m_ace_act,m_dash_act\n",
     );
     let mut home_ids: Vec<&String> = od.keys().collect();
     home_ids.sort(); // deterministic output order
@@ -1677,6 +1859,7 @@ fn od_exposure(
 
         let (mut w_route, mut w_dest) = (0.0f64, 0.0f64);
         let (mut w_alpr, mut w_dot, mut w_enf) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut w_ace, mut w_dash) = (0.0f64, 0.0f64);
         let (mut jobs_cov, mut n_dest) = (0.0f64, 0usize);
         for (wid, jobs) in &dests {
             let Some(work) = bg.get(wid) else { continue };
@@ -1686,6 +1869,12 @@ fn od_exposure(
             };
             routed += 1;
             let (rc, ra, rd, re) = route_road_cameras(&route.points, &sensors, &cam_tree, &occ, recall);
+            // M_i^act mobile terms: expected encounters for one traversal of the driven leg.
+            if mob.mobile.ace.is_some() || mob.dashcam_on {
+                let (ma, md) = route_mobile_exposure(&route.points, &mob, &occ, recall);
+                w_ace += jobs * ma;
+                w_dash += jobs * md;
+            }
             let de = *dest_cache.entry(work.wnode).or_insert_with(|| {
                 let ws = walk.walkshed(work.wnode, max_seconds, DEFAULT_WALK_SPEED_MPS);
                 let wp = walk.node_pos(work.wnode);
@@ -1714,7 +1903,7 @@ fn od_exposure(
         let snap_m = home.enu.distance(graph.node_pos(home.node));
         out.push_str(&format!(
             "{hid},{:.6},{:.6},{snap_m:.1},{n_dest},{jobs_cov:.0},{jobs_total:.0},\
-             {:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
+             {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4}\n",
             home.lat,
             home.lon,
             rcm + dcm,
@@ -1723,6 +1912,8 @@ fn od_exposure(
             w_alpr / jobs_cov,
             w_dot / jobs_cov,
             w_enf / jobs_cov,
+            w_ace / jobs_cov,
+            w_dash / jobs_cov,
         ));
         done += 1;
     }
@@ -1733,6 +1924,76 @@ fn od_exposure(
         dest_cache.len()
     );
     Ok(())
+}
+
+/// Expected devices/min from the observed mobile classes along a routed leg, day-averaged
+/// over `day_weights()` and integrated over the leg's *traversal time* — i.e. an expected
+/// encounter count for one traversal at the mean daily rate, not a per-minute rate. The
+/// commute happens at ~8–9 AM in reality, but hour-folding over the representative day
+/// keeps M_i^act comparable with M_i^res (same averaging convention); the AM-peak-only
+/// variant is one env knob away (`OURSPACE_COMMUTE_HOUR`).
+///
+/// Returns (ace_encounters, dashcam_encounters) for one traversal of the polyline.
+fn route_mobile_exposure(
+    pts: &[Enu],
+    mob: &MobileLayers,
+    occ: &sim_core::OccluderIndex,
+    recall: f64,
+) -> (f64, f64) {
+    const STEP: f64 = 50.0; // smooth zone fields; no need for the fixed-camera 10 m stride
+
+    let mut samples: Vec<Enu> = Vec::new();
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let n = ((a.distance(b) / STEP).ceil() as usize).max(1);
+        for k in 0..n {
+            let t = k as f64 / n as f64;
+            samples.push(Enu::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+        }
+    }
+    if let Some(last) = pts.last() {
+        samples.push(*last);
+    }
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let weights = day_weights();
+    let wsum: f64 = weights.iter().map(|(_, w)| w).sum();
+    // Traversal time per sample: assume the drive-graph free-flow pace is roughly uniform
+    // across the leg, so each sample "costs" total_time / n_samples minutes. Total time is
+    // NOT known here (callers have it); we instead integrate rate × (leg_m / speed). NYC
+    // average bus+car street speed ≈ 5 m/s (11 mph door-to-door including lights) — the
+    // same constant the heatmap's per-edge rates implicitly assume for midpoints.
+    const STREET_SPEED_MPS: f64 = 5.0;
+    let min_per_sample = STEP / STREET_SPEED_MPS / 60.0;
+
+    let mut acc = [0.0_f64; 2];
+    for p in &samples {
+        let near_ace = mob
+            .ace_tree
+            .as_ref()
+            .is_some_and(|t| t.locate_within_distance([p.x, p.y], mob.ace_cap_r2).next().is_some());
+        for &(h, w) in &weights {
+            let r = sim_core::exposure_rates_per_minute(
+                sim_core::Vec2::new(p.x, p.y),
+                h,
+                &[],
+                occ,
+                near_ace,
+                &mob.mobile,
+                recall,
+                mob.dashcam.as_ref(),
+                None,
+                None,
+                None,
+            );
+            acc[0] += r.ace * w;
+            acc[1] += r.dashcam * w;
+        }
+    }
+    let scale = min_per_sample / wsum;
+    (acc[0] * scale, acc[1] * scale)
 }
 
 /// Fixed-camera exposure along a route, split by traveller mode. Always tallies distinct
@@ -2029,6 +2290,9 @@ fn od_exposure_modal(
     let routed = std::sync::atomic::AtomicU64::new(0);
     let subway = SubwayParams::from_env();
     let bus = BusParams::from_env();
+    // M1 mobile layers: shared read-only state for the parallel routing pass below
+    // (RTree and field layer are immutably queried; MobileScenario is Copy-config).
+    let mob = std::sync::Arc::new(MobileLayers::load()?);
     eprintln!("  transit bus sub-mode: [{}]", bus.describe());
     let circuity = subway_circuity();
     match &submat {
@@ -2056,7 +2320,10 @@ fn od_exposure_modal(
             let (mut w_dest, mut w_commute) = (0.0f64, 0.0f64);
             let (mut w_drive, mut w_transit, mut w_walk, mut w_subway) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let (mut w_pd, mut w_pt, mut w_pw) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut w_ace, mut w_dash) = (0.0f64, 0.0f64);
             let (mut jobs_cov, mut n_dest) = (0.0f64, 0usize);
+            // Mobile layers behind a shared Arc: clone the handle into the closure's scope.
+            let mob = mob.clone();
 
             for (wid, jobs) in &dests {
                 let Some(work) = bg.get(wid) else { continue };
@@ -2072,6 +2339,12 @@ fn od_exposure_modal(
                     &route.points, &sensors, &cam_tree, &occ, recall, false, &fov,
                     (home_groups, dest_groups),
                 );
+                // M_i^act mobile terms for the driven leg (expected encounters per traversal).
+                let (m_ace, m_dash) = if mob.mobile.ace.is_some() || mob.dashcam_on {
+                    route_mobile_exposure(&route.points, &mob, &occ, recall)
+                } else {
+                    (0.0, 0.0)
+                };
                 // The WALK share walks the WALK graph (see od_exposure_mnl for why routing a
                 // pedestrian on the drive geometry is wrong). Drive distance pre-gates the A*.
                 let (walk_leg, short) = if route.total_m <= WALK_MAX_M * 1.5 {
@@ -2143,6 +2416,12 @@ fn od_exposure_modal(
                 w_transit += jobs * transit_leg;
                 w_walk += jobs * walk_leg; // already 0 unless the walk-graph route is short
                 w_subway += jobs * pt * subway_cams; // subway contribution to the commute leg
+                // Mobile encounters ride the drive leg (both the drive and bus sub-modes
+                // traverse the same corridor; transit riders on rail skip it, so weight
+                // by (drive share + bus sub-share of transit) — the street-exposed part).
+                let street_share = pd + pt * sub_bus;
+                w_ace += jobs * m_ace * street_share;
+                w_dash += jobs * m_dash * street_share;
                 w_pd += jobs * pd;
                 w_pt += jobs * pt;
                 w_pw += jobs * pw;
@@ -2156,10 +2435,12 @@ fn od_exposure_modal(
             let (dest, commute) = (w_dest * inv, w_commute * inv);
             let row = format!(
                 "{hid},{:.6},{:.6},{n_dest},{jobs_cov:.0},{jobs_total:.0},\
-                 {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                 {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4}",
                 home.lat, home.lon, dest + commute, dest, commute,
                 w_drive * inv, w_transit * inv, w_walk * inv, w_pd * inv, w_pt * inv, w_pw * inv,
                 w_subway * inv,
+                w_ace * inv,
+                w_dash * inv,
             );
             Some((hid.clone(), row))
         })
@@ -2174,7 +2455,7 @@ fn od_exposure_modal(
         w,
         "home_bg,lat,lon,n_dest,jobs_covered,jobs_total,\
          A_modal,A_dest,commute_modal,commute_drive,commute_transit,commute_walk,\
-         p_drive,p_transit,p_walk,commute_subway"
+         p_drive,p_transit,p_walk,commute_subway,m_ace_act,m_dash_act"
     )?;
     for (_, row) in &rows {
         writeln!(w, "{row}")?;
@@ -2204,6 +2485,10 @@ struct ModePair {
     e_subway: f64, // MTA-system portion of e_transit (for the commute_subway sensitivity column)
     e_walk: f64,
     dest: f64,
+    /// M_i^act mobile terms for the driven leg: expected (ACE, dashcam) encounters per
+    /// traversal, day-averaged. Weighted by street-exposed mode share at aggregation.
+    m_ace: f64,
+    m_dash: f64,
     /// Walkable commute: the WALK-graph route exists and is ≤ WALK_MAX_M. Gates the
     /// observed-shares mode model for income-suppressed homes (the MNL gates itself
     /// through t_walk).
@@ -2446,6 +2731,8 @@ fn od_exposure_mnl(
     let no_path = std::sync::atomic::AtomicU64::new(0);
     let subway = SubwayParams::from_env();
     let bus = BusParams::from_env();
+    // M1 mobile layers (see od_exposure_modal): shared read-only state for the pass below.
+    let mob = std::sync::Arc::new(MobileLayers::load()?);
     eprintln!("  transit bus sub-mode: [{}]", bus.describe());
     let circuity = subway_circuity();
     match &submat {
@@ -2495,6 +2782,12 @@ fn od_exposure_mnl(
                     &route.points, &sensors, &cam_tree, &occ, recall, false, &fov,
                     (home_groups, dest_groups),
                 );
+                // M_i^act mobile terms for the driven leg (expected encounters per traversal).
+                let (m_ace, m_dash) = if mob.mobile.ace.is_some() || mob.dashcam_on {
+                    route_mobile_exposure(&route.points, &mob, &occ, recall)
+                } else {
+                    (0.0, 0.0)
+                };
 
                 // The WALK alternative walks the WALK graph. Routing it on the drive geometry
                 // (the pre-2026-07-14 behavior) denied walkers park paths and promenades and
@@ -2567,6 +2860,8 @@ fn od_exposure_mnl(
                     e_subway,
                     e_walk,
                     dest,
+                    m_ace,
+                    m_dash,
                     short,
                     transit_ok,
                 });
@@ -2723,6 +3018,7 @@ fn od_exposure_mnl(
             let (mut w_dest, mut w_commute) = (0.0f64, 0.0f64);
             let (mut w_drive, mut w_transit, mut w_walk, mut w_subway) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let (mut w_pd, mut w_pt, mut w_pw) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut w_ace, mut w_dash) = (0.0f64, 0.0f64);
             let (asc_drive, asc_transit) = asc[h.group];
             let mut jobs_cov = 0.0f64;
             for p in &h.pairs {
@@ -2738,6 +3034,17 @@ fn od_exposure_mnl(
                 w_transit += p.flow * p.e_transit;
                 w_walk += p.flow * p.e_walk;
                 w_subway += p.flow * pt * p.e_subway; // subway contribution to the commute leg
+                // Street-exposed mode share: drive rides the corridor fully; the bus sub-share
+                // of transit does too (rail riders skip it) — ACS B08301 bus/subway split,
+                // same source as the transit sub-mode model. See od_exposure_modal.
+                let bus_share = {
+                    let b = fnum(acs.get(&h.geoid, "commute_bus")).unwrap_or(0.0);
+                    let tr = fnum(acs.get(&h.geoid, "commute_transit")).unwrap_or(0.0);
+                    if tr > 0.0 { (b / tr).clamp(0.0, 1.0) } else { 0.35 }
+                };
+                let street_share = (pd + pt * bus_share).min(1.0);
+                w_ace += p.flow * p.m_ace * street_share;
+                w_dash += p.flow * p.m_dash * street_share;
                 w_pd += p.flow * pd;
                 w_pt += p.flow * pt;
                 w_pw += p.flow * pw;
@@ -2747,11 +3054,13 @@ fn od_exposure_mnl(
             let (dest, commute) = (w_dest * inv, w_commute * inv);
             let row = format!(
                 "{},{:.6},{:.6},{},{jobs_cov:.0},{:.0},\
-                 {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                 {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4}",
                 h.geoid, h.lat, h.lon, h.pairs.len(), h.jobs_total,
                 dest + commute, dest, commute,
                 w_drive * inv, w_transit * inv, w_walk * inv, w_pd * inv, w_pt * inv, w_pw * inv,
                 w_subway * inv,
+                w_ace * inv,
+                w_dash * inv,
             );
             (h.geoid.clone(), row)
         })
@@ -2765,7 +3074,7 @@ fn od_exposure_mnl(
         w,
         "home_bg,lat,lon,n_dest,jobs_covered,jobs_total,\
          A_modal,A_dest,commute_modal,commute_drive,commute_transit,commute_walk,\
-         p_drive,p_transit,p_walk,commute_subway"
+         p_drive,p_transit,p_walk,commute_subway,m_ace_act,m_dash_act"
     )?;
     for (_, row) in &rows {
         writeln!(w, "{row}")?;

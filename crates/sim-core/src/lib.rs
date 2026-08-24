@@ -36,7 +36,11 @@ pub use occlusion::{OccluderIndex, DEFAULT_CELL_M};
 pub use geometry::{captures, FrustumWedge, OccluderEdge};
 pub use graph::{PaceProfile, Route, RouteError, StreetGraph, Walkshed, DEFAULT_WALK_SPEED_MPS};
 pub use math::Vec2;
-pub use mobile::{AceConfig, DashcamConfig, GlassesConfig, MobileScenario, RobotConfig, TeslaConfig};
+pub use mobile::{
+    bus_headway_minutes, pedestrian_multiplier, traffic_multiplier, AceConfig, DashcamConfig,
+    GlassesConfig, MobileScenario, RobotConfig, TeslaConfig,
+};
+pub use crate::assets::{AceCorridorLayer, DashcamFieldLayer};
 pub use projection::{EnuProjection, GeoOrigin};
 pub use rng::{RngLike, WyRand};
 pub use scenario::{
