@@ -457,7 +457,12 @@ def fetch_tlc() -> None:
     try:
         import geopandas as gpd  # project dep (pyproject.toml)
 
-        gdf = gpd.read_file(os.path.join(SNAP, "tlc", "taxi_zones.zip")).to_crs(4326)
+        # The upstream zip nests the shapefile under taxi_zones/; GDAL's /vsizip
+        # root scan doesn't recurse, so name the inner .shp explicitly.
+        zpath = os.path.join(SNAP, "tlc", "taxi_zones.zip")
+        gdf = gpd.read_file(
+            f"/vsizip/{os.path.abspath(zpath)}/taxi_zones/taxi_zones.shp"
+        ).to_crs(4326)
         gdf.to_file(os.path.join(SNAP, "tlc", "taxi_zones.geojson"), driver="GeoJSON")
         print("  wrote tlc/taxi_zones.geojson (EPSG:4326 via geopandas)")
     except ImportError:

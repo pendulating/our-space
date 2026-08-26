@@ -325,14 +325,22 @@ impl OpenStreetMask {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             // Full + school closures are car-free; "Limited Local Access" keeps cars.
-            if !reviewstat.starts_with("Full Closure") {
+            // Upstream has drifted between vocabularies: the export once spelled
+            // statuses "Full Closure…"-style, now codes them approvedFull /
+            // approvedFullSchools / approvedLimited — accept both.
+            let full = reviewstat.starts_with("Full Closure")
+                || reviewstat == "approvedFull"
+                || reviewstat == "approvedFullSchools";
+            if !full {
                 continue;
             }
             let days = props
                 .and_then(|p| p.get("apprdayswe"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !days.contains(weekday) {
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let weekday_ci = weekday.to_ascii_lowercase();
+            if !days.contains(&weekday_ci) {
                 continue;
             }
             let Some(geom) = f.geometry else { continue };

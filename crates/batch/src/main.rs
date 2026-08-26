@@ -1844,92 +1844,116 @@ fn od_exposure(
         od.entry(h.to_string()).or_default().push((w.to_string(), jobs));
     }
 
-    // 3. Destination-walkshed exposure cache (per work-BG node = R_j; distinct nodes ≤ #BGs).
-    let mut dest_cache: HashMap<u32, f64> = HashMap::new();
+    // 3. Destination-walkshed exposure, one pass over every BG walk-node (each BG is a
+    //    destination somewhere) — the same parallel precompute the mnl/modal variants do.
+    //    Cached read-only so the per-home routing pass below can go parallel: each row's
+    //    accumulation order over its destinations is unchanged, so output is byte-identical
+    //    to the old serial loop, just ~16× faster.
+    use rayon::prelude::*;
+    let all_wnodes: std::collections::HashSet<u32> = bg.values().map(|b| b.wnode).collect();
+    let dest_exp: HashMap<u32, f64> = all_wnodes
+        .par_iter()
+        .map(|&node| {
+            let ws = walk.walkshed(node, max_seconds, DEFAULT_WALK_SPEED_MPS);
+            let wp = walk.node_pos(node);
+            let nearby: Vec<SensorInstance> = cam_tree
+                .locate_within_distance([wp.x, wp.y], cull_r2)
+                .map(|g| sensors[g.data])
+                .collect();
+            let s = sim_core::walkshed_exposure_with(&walk, &ws, &nearby, &occ, recall, &fov, None);
+            (node, s.cameras_corrected.max(0.0))
+        })
+        .collect();
+
+    let mut home_ids: Vec<&String> = od.keys().collect();
+    home_ids.sort(); // deterministic output order; par_iter preserves input order
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let skipped = std::sync::atomic::AtomicUsize::new(0);
+    let no_path = std::sync::atomic::AtomicU64::new(0);
+    let routed = std::sync::atomic::AtomicU64::new(0);
+
+    let mut rows: Vec<(String, String)> = home_ids
+        .par_iter()
+        .filter_map(|&hid| {
+            let Some(home) = bg.get(hid) else {
+                skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            };
+            let mut dests = od[hid].clone();
+            dests.sort_by(|a, b| b.1.total_cmp(&a.1)); // most job flow first
+            let jobs_total: f64 = dests.iter().map(|(_, j)| j).sum();
+            dests.truncate(top_k);
+
+            let (mut w_route, mut w_dest) = (0.0f64, 0.0f64);
+            let (mut w_alpr, mut w_dot, mut w_enf) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut w_ace, mut w_dash) = (0.0f64, 0.0f64);
+            let (mut jobs_cov, mut n_dest) = (0.0f64, 0usize);
+            for (wid, jobs) in &dests {
+                let Some(work) = bg.get(wid) else { continue };
+                let Ok((route, _t, _edges)) = graph.route_timed_pen(home.node, work.node, 1.0) else {
+                    no_path.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                };
+                routed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (rc, ra, rd, re) = route_road_cameras(&route.points, &sensors, &cam_tree, &occ, recall);
+                // M_i^act mobile terms: expected encounters for one traversal of the driven leg.
+                if mob.mobile.ace.is_some() || mob.dashcam_on {
+                    let (ma, md) = route_mobile_exposure(&route.points, &mob, &occ, recall);
+                    w_ace += jobs * ma;
+                    w_dash += jobs * md;
+                }
+                let de = dest_exp.get(&work.wnode).copied().unwrap_or(0.0);
+                w_route += jobs * rc;
+                w_dest += jobs * de;
+                w_alpr += jobs * ra;
+                w_dot += jobs * rd;
+                w_enf += jobs * re;
+                jobs_cov += jobs;
+                n_dest += 1;
+            }
+            if jobs_cov <= 0.0 {
+                skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+            // Flow-weighted mean exposure per commuter from this home BG.
+            let (rcm, dcm) = (w_route / jobs_cov, w_dest / jobs_cov);
+            let snap_m = home.enu.distance(graph.node_pos(home.node));
+            let row = format!(
+                "{hid},{:.6},{:.6},{snap_m:.1},{n_dest},{jobs_cov:.0},{jobs_total:.0},\
+                 {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4}\n",
+                home.lat,
+                home.lon,
+                rcm + dcm,
+                rcm,
+                dcm,
+                w_alpr / jobs_cov,
+                w_dot / jobs_cov,
+                w_enf / jobs_cov,
+                w_ace / jobs_cov,
+                w_dash / jobs_cov,
+            );
+            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some((hid.clone(), row))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = String::from(
         "home_bg,lat,lon,snap_m,n_dest,jobs_covered,jobs_total,\
          A_drive,route_cams,dest_cams,route_alpr,route_dot,route_enf,m_ace_act,m_dash_act\n",
     );
-    let mut home_ids: Vec<&String> = od.keys().collect();
-    home_ids.sort(); // deterministic output order
-    let (mut done, mut skipped, mut no_path, mut routed) = (0usize, 0usize, 0u64, 0u64);
-
-    for hid in home_ids {
-        let Some(home) = bg.get(hid) else {
-            skipped += 1;
-            continue;
-        };
-        let mut dests = od[hid].clone();
-        dests.sort_by(|a, b| b.1.total_cmp(&a.1)); // most job flow first
-        let jobs_total: f64 = dests.iter().map(|(_, j)| j).sum();
-        dests.truncate(top_k);
-
-        let (mut w_route, mut w_dest) = (0.0f64, 0.0f64);
-        let (mut w_alpr, mut w_dot, mut w_enf) = (0.0f64, 0.0f64, 0.0f64);
-        let (mut w_ace, mut w_dash) = (0.0f64, 0.0f64);
-        let (mut jobs_cov, mut n_dest) = (0.0f64, 0usize);
-        for (wid, jobs) in &dests {
-            let Some(work) = bg.get(wid) else { continue };
-            let Ok((route, _t, _edges)) = graph.route_timed_pen(home.node, work.node, 1.0) else {
-                no_path += 1;
-                continue;
-            };
-            routed += 1;
-            let (rc, ra, rd, re) = route_road_cameras(&route.points, &sensors, &cam_tree, &occ, recall);
-            // M_i^act mobile terms: expected encounters for one traversal of the driven leg.
-            if mob.mobile.ace.is_some() || mob.dashcam_on {
-                let (ma, md) = route_mobile_exposure(&route.points, &mob, &occ, recall);
-                w_ace += jobs * ma;
-                w_dash += jobs * md;
-            }
-            let de = *dest_cache.entry(work.wnode).or_insert_with(|| {
-                let ws = walk.walkshed(work.wnode, max_seconds, DEFAULT_WALK_SPEED_MPS);
-                let wp = walk.node_pos(work.wnode);
-                let nearby: Vec<SensorInstance> = cam_tree
-                    .locate_within_distance([wp.x, wp.y], cull_r2)
-                    .map(|g| sensors[g.data])
-                    .collect();
-                sim_core::walkshed_exposure_with(&walk, &ws, &nearby, &occ, recall, &fov, None)
-                    .cameras_corrected
-                    .max(0.0)
-            });
-            w_route += jobs * rc;
-            w_dest += jobs * de;
-            w_alpr += jobs * ra;
-            w_dot += jobs * rd;
-            w_enf += jobs * re;
-            jobs_cov += jobs;
-            n_dest += 1;
-        }
-        if jobs_cov <= 0.0 {
-            skipped += 1;
-            continue;
-        }
-        // Flow-weighted mean exposure per commuter from this home BG.
-        let (rcm, dcm) = (w_route / jobs_cov, w_dest / jobs_cov);
-        let snap_m = home.enu.distance(graph.node_pos(home.node));
-        out.push_str(&format!(
-            "{hid},{:.6},{:.6},{snap_m:.1},{n_dest},{jobs_cov:.0},{jobs_total:.0},\
-             {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4}\n",
-            home.lat,
-            home.lon,
-            rcm + dcm,
-            rcm,
-            dcm,
-            w_alpr / jobs_cov,
-            w_dot / jobs_cov,
-            w_enf / jobs_cov,
-            w_ace / jobs_cov,
-            w_dash / jobs_cov,
-        ));
-        done += 1;
+    for (_, row) in &rows {
+        out.push_str(row);
     }
     std::fs::write(out_path, out).with_context(|| format!("writing {out_path}"))?;
     eprintln!(
-        "od-exposure: {done} home BGs ({skipped} skipped), top-{top_k} dests, \
-         {routed} pairs routed ({no_path} no-path), {} dest walksheds cached -> {out_path}",
-        dest_cache.len()
+        "od-exposure: {} home BGs ({} skipped), top-{top_k} dests, \
+         {} pairs routed ({} no-path), {} dest walksheds cached -> {out_path}",
+        done.load(std::sync::atomic::Ordering::Relaxed),
+        skipped.load(std::sync::atomic::Ordering::Relaxed),
+        routed.load(std::sync::atomic::Ordering::Relaxed),
+        no_path.load(std::sync::atomic::Ordering::Relaxed),
+        dest_exp.len()
     );
     Ok(())
 }

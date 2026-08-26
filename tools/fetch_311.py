@@ -11,7 +11,7 @@ non-emergency police matters. Dataset erm2-nwe9, YTD 2026 (parallels the crime Y
 
 Out: data/snapshots/crime/nyc311_disorder_points.csv  (lat,lon)
 """
-import csv, os, sys, urllib.parse, urllib.request
+import csv, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 DATASET = "erm2-nwe9"
 BASE = f"https://data.cityofnewyork.us/resource/{DATASET}.csv"
@@ -35,12 +35,21 @@ def where_clause() -> str:
             f"AND complaint_type in ({types})")
 
 
-def fetch_page(offset: int):
+def fetch_page(offset: int, attempts: int = 5):
     q = {"$select": "latitude,longitude", "$where": where_clause(),
          "$order": "unique_key", "$limit": PAGE, "$offset": offset}
     url = BASE + "?" + urllib.parse.urlencode(q, quote_via=urllib.parse.quote)
-    with urllib.request.urlopen(url, timeout=180) as r:
-        return list(csv.reader(line.decode("utf-8") for line in r))[1:]
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=180) as r:
+                return list(csv.reader(line.decode("utf-8") for line in r))[1:]
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt == attempts:
+                raise
+            wait = 30 * attempt
+            print(f"  page @{offset:,} failed ({e}); retry {attempt}/{attempts - 1}"
+                  f" in {wait} s", file=sys.stderr)
+            time.sleep(wait)
 
 
 def main() -> int:
@@ -49,10 +58,20 @@ def main() -> int:
     with open(OUT, "w", newline="") as f:
         w = csv.writer(f); w.writerow(["lat", "lon"])
         offset = 0
+        empty_pages = 0
         while True:
             rows = fetch_page(offset)
             if not rows:
+                # An empty FIRST page is almost always a throttled/failed request,
+                # not a truly empty dataset — retry before believing it.
+                empty_pages += 1
+                if offset == 0 and empty_pages < 3:
+                    print(f"  empty page at offset {offset} (attempt {empty_pages}/3);"
+                          " retrying in 30 s", file=sys.stderr)
+                    time.sleep(30)
+                    continue
                 break
+            empty_pages = 0
             for lat, lon in rows:
                 try:
                     w.writerow([f"{float(lat):.6f}", f"{float(lon):.6f}"]); n += 1
@@ -62,6 +81,10 @@ def main() -> int:
             offset += PAGE
             if len(rows) < PAGE:
                 break
+    if n == 0:
+        print("ERROR: fetched 0 disorder points — refusing to write an empty snapshot",
+              file=sys.stderr)
+        return 1
     print(f"wrote {n:,} 311 disorder points -> {OUT}", file=sys.stderr)
     return 0
 

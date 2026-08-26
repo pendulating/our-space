@@ -5,16 +5,17 @@
 # commented and just run `./tools/cluster_rebake.sh`. This script never calls
 # sbatch itself; SLURM reads the #SBATCH directives at submit time.
 # ----------------------------------------------------------------------------
-# #SBATCH --job-name=ourspace-rebake
-# #SBATCH --nodes=1
-# #SBATCH --ntasks=1
-# #SBATCH --cpus-per-task=196          # the 196-CPU node; the GPU node buys nothing (CPU-only rayon)
-# #SBATCH --mem=64G                    # CPU-bound; real peak is single-digit GB, this is headroom
-# #SBATCH --time=02:00:00              # ~15 min at 196 cores; generous ceiling
-# #SBATCH --output=data/derived/logs/slurm-%j.out
-# #SBATCH --partition=cpu              # set to your CPU partition / --nodelist=<big-cpu-node>
-# # Match rayon to the SLURM allocation (otherwise rayon grabs every core on the node):
-# export RAYON_NUM_THREADS="${SLURM_CPUS_PER_TASK:-$RAYON_NUM_THREADS}"
+#SBATCH --job-name=ourspace-rebake
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16            # capped at 16 (lisbeth has 96/192; be a good neighbor)
+#SBATCH --mem=32G                     # bake peaks single-digit GB; keep the request small so it fits beside big residents
+#SBATCH --time=04:00:00               # od-exposure pair ≈ 45-60 min at 32 threads + light steps
+#SBATCH --output=data/derived/logs/slurm-%j.out
+#SBATCH --partition=default_partition
+#SBATCH --nodelist=lisbeth
+# Match rayon to the SLURM allocation (otherwise rayon grabs every core on the node):
+export RAYON_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 # ============================================================================
 #
 # Re-bake the heavy surveillance-exposure path on a compute cluster:
@@ -28,8 +29,9 @@
 set -euo pipefail
 
 # batch hardcodes repo-relative asset paths (const *_PATH in crates/batch/src/main.rs),
-# so every command must run from the workspace root.
-cd "$(dirname "$0")/.."
+# so every command must run from the workspace root. Under sbatch the script runs
+# from SLURM's spool dir ($0 is a copy) — anchor on the submit directory instead.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 ROOT="$(pwd)"
 [ -f Cargo.toml ] && [ -d crates/batch ] || {
   echo "error: must run from the workspace root; got $ROOT" >&2
@@ -44,6 +46,10 @@ SNAP=data/snapshots
 DERIV=data/derived
 EXP=$DERIV/exposure
 LOGS=$DERIV/logs
+
+# Per-pair table for M3 (incidence_inversion.py) — see docs/REBAKE_HANDOFF.md.
+# Read by the od-exposure-mnl step; without it M3 cannot run.
+export OURSPACE_EMIT_PAIRS="$EXP/od_pairs_mnl_nyc.csv"
 
 # Inputs (see docs/CLUSTER.md "Data to copy to the cluster")
 DRIVE=$PROC/graph_nyc.osgraph
@@ -115,6 +121,30 @@ run_step od-exposure-mnl "$BATCH" od-exposure-mnl \
 run_step od-exposure-modal "$BATCH" od-exposure-modal \
   "$DRIVE" "$WALK" "$CENT" "$OD" "$ACS" "$STATIONS" \
   "$EXP/A_i_modal_bg_nyc.csv" "$WALK_MIN" "$TOP_K" "$SUBWAY"
+
+# 4) Light exposure set — minutes each; completes the full re-bake in this one
+#    job (docs/CLUSTER.md checklist). All walksheds use the WALK graph. The M1
+#    mobile classes ride along via MobileLayers::load() (ace_corridors.osace +
+#    dashcam_field.osfield), producing the m_ace_* / m_dash_* columns.
+run_step bg-exposure "$BATCH" bg-exposure \
+  "$WALK" "$CENT" "$EXP/R_i_bg_nyc.csv" "$WALK_MIN"
+
+run_step counterfactual "$BATCH" counterfactual \
+  "$WALK" "$CENT" "$OD" "$EXP/counterfactual_bg_nyc.csv" "$WALK_MIN"
+
+# covariates: the 311 file is the NINTH arg, AFTER walk_min — omitting it is
+# silent and breaks the rung-4 crime+311 ladder downstream (docs/CLUSTER.md).
+CRIME=$SNAP/crime/nypd_points.csv
+DISORDER=$SNAP/crime/nyc311_disorder_points.csv
+run_step covariates "$BATCH" covariates \
+  "$WALK" "$CENT" "$OD" "$STATIONS" "$CRIME" \
+  "$EXP/covariates_bg_nyc.csv" "$WALK_MIN" "$DISORDER"
+
+# Occlusion range-sensitivity sweep (occlusion is on by default).
+for k in 1 2 4 8 16; do
+  OURSPACE_RANGE_SCALE=$k run_step "occlusion-audit-x$k" "$BATCH" occlusion-audit \
+    "$WALK" "$CENT" "$EXP/occl_audit_walk_x$k.csv" "$WALK_MIN"
+done
 
 echo "==> done. Outputs in $EXP/ ; logs in $LOGS/"
 echo "    rsync data/derived/ back to the laptop, then run tools/refresh_results.sh there."
