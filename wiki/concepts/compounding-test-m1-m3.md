@@ -27,6 +27,16 @@ Pop-weighted corr(`R_i`, `M_i^act`) across BGs. > 0 ⇒ mobile surveillance fall
 the same people already most fixed-exposed — it compounds. < 0 ⇒ it offsets. Plus:
 share of population in the top decile of both.
 
+**Definition decision (2026-09-23, Matt):** `M_i^act` stays a **dose per commute** —
+"expected dashcam/ACE encounters on one trip to work" — not a per-km or per-minute
+intensity. Rationale: every measure should be readable by the public and evoke the lived
+experience; a per-km rate is detached from the feeling of being watched on the way to
+work. Consequence to state in the paper: the dose scales with commute length, so M2 partly
+measures that long commuters from low-`R_i` places (Staten Island: `R_i` 18, `M_dash^act`
+39) accumulate more mobile encounters. With the citywide dashcam field M2 = −0.50 (dose)
+while corr(`R_i`, `M_dash^res`) = +0.47 (rate at the residence); report both and say
+which sentence each supports. See `docs/RELATED_METHODS.md` §8.
+
 ## M3 — The incidence-inversion test (the novel one)
 For each BG *j* where devices are dense, decompose the exposure it generates by
 home BG of the people captured (LODES gives this directly). Expected headline:

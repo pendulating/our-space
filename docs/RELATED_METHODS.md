@@ -467,9 +467,12 @@ route length: Staten Island has the lowest R_i (18) and the highest M_act (39). 
 statistic as defined measures "long commuters from low-R_i places accumulate more mobile
 encounters", not whether mobile surveillance falls on the same people as fixed surveillance. The
 rate-based term says the opposite: corr(R_i, M_dash_res) = +0.47, i.e. at the residence, dashcam
-intensity compounds fixed exposure. Before M2 is used in the paper, decide whether the mobile
-term is a dose (per trip) or an intensity (per km or per minute travelled); report both and say
-which the claim is about. M3 has the same length dependence (cross-borough pairs 6× the
+intensity compounds fixed exposure. **Decision (2026-09-23):** the mobile
+term stays a **dose per commute trip** — "expected encounters on one trip to work" — because the
+measures are meant to be readable by the public and to evoke the lived experience, and a per-km
+rate is detached from the feeling of being watched on the way to work. The paper must then say
+plainly that the dose scales with commute length, and report the residence-rate correlation
+(+0.47) beside the dose correlation (−0.50) so the two sentences are not confused. M3 has the same length dependence (cross-borough pairs 6× the
 same-borough median) on top of the work-borough attribution problem, so 85% is still not the
 statistic the headline describes.
 
