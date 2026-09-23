@@ -57,6 +57,13 @@ uv run python tools/incidence_inversion.py    # -> incidence_inversion.json (M3;
                                               #    OURSPACE_PAIRS=... od_pairs CSV emitted via
                                               #    OURSPACE_EMIT_PAIRS=<path> batch od-exposure-mnl)
 uv run python tools/crime_ladder.py           # -> crime_ladder.json
+uv run python tools/activity_space_inference.py  # -> activity_space_inference.json (clustered /
+                                              #    Conley / wild-cluster-bootstrap SEs on the
+                                              #    crime_ladder specs; asserts against its JSON;
+                                              #    needs data/snapshots/geo/ -- fetch geo_clusters)
+uv run python tools/inference_montecarlo.py   # -> inference_montecarlo.json (size/SE-ratio of the
+                                              #    above under iid / spatial / shared-destination
+                                              #    errors; reads od_pairs_mnl_nyc.csv)
 uv run python tools/analyze_counterfactual.py # -> counterfactual.json
 uv run python tools/capture_recapture.py      # -> capture_recapture.json (+ recall_draws)
 uv run python tools/sweep_recall.py           # -> recall_sensitivity.json  (needs the above)

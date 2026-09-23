@@ -253,6 +253,19 @@ def fetch_neighborhoods() -> None:
     )
 
 
+def fetch_geo_clusters() -> None:
+    # Inference clusters for the activity-space regressions (tools/activity_space_inference.py):
+    # Census 2020 tract->PUMA relationship file, and NYC DCP 2020 NTA polygons.
+    _download(
+        "https://www2.census.gov/geo/docs/maps-data/data/rel2020/2020_Census_Tract_to_2020_PUMA.txt",
+        "geo/tract_to_puma_2020.txt",
+    )
+    _download(
+        _socrata("data.cityofnewyork.us", "9nt8-h7nd.geojson", {"$limit": "500"}),
+        "geo/nta2020.geojson",
+    )
+
+
 def fetch_open_streets() -> None:
     _download(
         _socrata(
@@ -620,6 +633,11 @@ DATASETS: dict[str, tuple[list[str], object, bool]] = {
     "neighborhoods": (
         ["neighborhoods/custom-pedia-cities-nyc-Mar2018.geojson"],
         fetch_neighborhoods,
+        False,
+    ),
+    "geo_clusters": (
+        ["geo/tract_to_puma_2020.txt", "geo/nta2020.geojson"],
+        fetch_geo_clusters,
         False,
     ),
     "open_streets": (["open_streets/open_streets.geojson"], fetch_open_streets, False),

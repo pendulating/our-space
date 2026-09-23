@@ -46,9 +46,15 @@ if w.islands:  # attach islands to their single nearest neighbour, then row-stan
     knn1 = KNN.from_dataframe(df, k=1)
     w = libpysal.weights.attach_islands(w, knn1)
 w.transform = "r"
-# kernel weights for Conley/HAC SEs (triangular, 2 km fixed bandwidth)
+# kernel weights for Conley/HAC SEs (triangular, fixed bandwidth; spreg requires unit diagonal).
+# 2 km is the primary bandwidth (the one the paper's macros read); 1 and 5 km are reported
+# alongside it so the inference is not hostage to one kernel choice.
 coords = np.column_stack([df.geometry.centroid.x, df.geometry.centroid.y])
-gwk = libpysal.weights.Kernel(coords, bandwidth=2000.0, function="triangular", fixed=True)
+HAC_BW_PRIMARY = 2000.0
+HAC_BWS = (1000.0, 2000.0, 5000.0)
+GWK = {bw: libpysal.weights.Kernel(coords, bandwidth=bw, function="triangular", fixed=True, diagonal=True)
+       for bw in HAC_BWS}
+gwk = GWK[HAC_BW_PRIMARY]
 # eigenvalues of the row-standardised W (via symmetric normalisation) for LeSage-Pace impact traces
 A = Queen.from_dataframe(df, use_index=False)
 if A.islands: A = libpysal.weights.attach_islands(A, KNN.from_dataframe(df, k=1))
@@ -84,6 +90,24 @@ def impacts_lag(rho, beta, theta):
     direct = beta*tr_S + theta*tr_SW
     return direct, total-direct, total
 
+FOCAL = ("%Hisp", "%Black", "income")
+
+def hac_fits(y, X, names, keep=FOCAL):
+    """OLS coefficients with Conley/Kelejian-Prucha HAC SEs at every bandwidth in HAC_BWS, plus the
+    classical (iid) SE for contrast. spreg ignores `gwk` unless robust='hac' is passed, and with
+    robust='hac' it drops the LM diagnostics, so model selection uses a separate classical fit."""
+    out = {"classical": {}, "hac": {}}
+    m0 = OLS(y, X, name_x=names)
+    b = m0.betas.flatten(); se0 = np.sqrt(np.diag(m0.vm)).flatten()
+    for i, nm in enumerate(names):
+        if nm in keep: out["classical"][nm] = [float(b[i + 1]), float(se0[i + 1])]
+    for bw in HAC_BWS:
+        m = OLS(y, X, gwk=GWK[bw], robust="hac", name_x=names)
+        se = np.sqrt(np.diag(m.vm)).flatten()
+        out["hac"][f"{bw/1000:g}km"] = {nm: [float(b[i + 1]), float(se[i + 1])]
+                                        for i, nm in enumerate(names) if nm in keep}
+    return out
+
 def aic(model, kp):
     """AIC from a spreg ML model's log-likelihood; kp = # estimated parameters."""
     ll = float(model.logll)
@@ -92,7 +116,8 @@ def aic(model, kp):
 # Machine-readable mirror of everything this script prints. The paper's tables and inline
 # statistics are generated from JSON, never scraped from a text report, so a changed print
 # format can never silently change a number in the paper (tools/make_tables.py).
-REPORT: dict = {"outcomes": {}, "maup": {}}
+REPORT: dict = {"outcomes": {}, "maup": {}, "ladder_hac": {},
+                "hac": {"kernel": "triangular", "bandwidths_m": list(HAC_BWS), "primary_m": HAC_BW_PRIMARY}}
 
 
 def run(yname):
@@ -103,11 +128,16 @@ def run(yname):
     nD = names2 + ["W_"+m for m in names2]
     print("\n"+"="*72); print(f"OUTCOME {yname}  (mean {df[yname].mean():.1f} cameras; coefs = cameras/SD)")
 
-    # --- OLS with Conley HAC SEs + Anselin LM spatial diagnostics (model selection) ---
-    ols = OLS(y, X2, w=w, gwk=gwk, spat_diag=True, moran=True, name_x=names2, name_y=yname)
-    b = ols.betas.flatten(); se = np.sqrt(np.diag(ols.vm)).flatten()
-    print("  OLS (Conley HAC SEs):  " +
-          "  ".join(f"{nm} {b[i+1]:+.2f}(±{se[i+1]:.2f})" for i,nm in enumerate(names2) if nm in ("%Hisp","%Black","income")))
+    # --- OLS: Anselin LM spatial diagnostics (classical fit) + Conley HAC SEs (separate fits) ---
+    ols = OLS(y, X2, w=w, spat_diag=True, moran=True, name_x=names2, name_y=yname)
+    b = ols.betas.flatten()
+    hf = hac_fits(y, X2, names2)
+    prim = hf["hac"][f"{HAC_BW_PRIMARY/1000:g}km"]
+    print(f"  OLS (Conley HAC SEs, {HAC_BW_PRIMARY/1000:g} km):  " +
+          "  ".join(f"{nm} {prim[nm][0]:+.2f}(±{prim[nm][1]:.2f})" for nm in FOCAL))
+    print("     SE by bandwidth:  " + "   ".join(
+          f"{nm} iid {hf['classical'][nm][1]:.2f} / " +
+          " / ".join(f"{k} {v[nm][1]:.2f}" for k, v in hf["hac"].items()) for nm in FOCAL))
     print(f"  Moran's I (resid) {ols.moran_res[0]:+.3f} (p={ols.moran_res[2]:.3f}) | "
           f"LM-lag {ols.lm_lag[0]:.0f}/rob {ols.rlm_lag[0]:.0f}  LM-err {ols.lm_error[0]:.0f}/rob {ols.rlm_error[0]:.0f} "
           f"(rob-err {'>' if ols.rlm_error[0]>ols.rlm_lag[0] else '<'} rob-lag → {'ERROR' if ols.rlm_error[0]>ols.rlm_lag[0] else 'LAG'} favoured)")
@@ -136,11 +166,9 @@ def run(yname):
     rec["moran_p"] = float(ols.moran_res[2])
     rec["aic"] = {m: float(v) for m, v in tbl.items()}
     rec["selected"] = best
-    rec["ols_conley"] = {
-        nm: [float(b[i + 1]), float(se[i + 1])]
-        for i, nm in enumerate(names2)
-        if nm in ("%Hisp", "%Black", "income")
-    }
+    rec["ols_conley"] = prim                      # primary bandwidth (read by make_tables.py)
+    rec["ols_classical"] = hf["classical"]
+    rec["ols_conley_by_bw"] = hf["hac"]
 
     # --- impacts (direct/indirect/total) for the two Durbin models ---
     rho = float(np.ravel(sdm.rho)[0]); bb = sdm.betas.flatten()
@@ -220,14 +248,17 @@ for label,terms in [("rung2 demo+land-use", DEMOS+LAND),
                     ("rung3 +crime",        DEMOS+LAND+CRIME),
                     ("rung4 +crime+311",    DEMOS+LAND+CRIME+REQ311)]:
     X,names = design(terms)
-    m = OLS(y, X, w=w, gwk=gwk, name_x=names, name_y="R_i")
-    b = m.betas.flatten(); se = np.sqrt(np.diag(m.vm)).flatten()
-    idx = {nm:i+1 for i,nm in enumerate(names)}
-    parts = " ".join(f"{nm} {b[idx[nm]]:+.2f}(±{se[idx[nm]]:.2f})" for nm in ("%Hisp","income"))
-    med = "".join(f" | {k} {b[idx[k]]:+.2f}(±{se[idx[k]]:.2f})" for k in ("crime","311") if k in idx)
-    print(f"  {label:20s}: {parts}{med}")
+    keep = FOCAL + tuple(k for k in ("crime", "311") if k in names)
+    hf = hac_fits(y, X, names, keep=keep)
+    prim = hf["hac"][f"{HAC_BW_PRIMARY/1000:g}km"]
+    parts = " ".join(f"{nm} {prim[nm][0]:+.2f}(±{prim[nm][1]:.2f})" for nm in ("%Hisp","income"))
+    med = "".join(f" | {k} {prim[k][0]:+.2f}(±{prim[k][1]:.2f})" for k in ("crime","311") if k in prim)
+    bws = " ".join(f"{k} ±{v['%Hisp'][1]:.2f}" for k, v in hf["hac"].items())
+    print(f"  {label:20s}: {parts}{med}   [%Hisp SE: iid ±{hf['classical']['%Hisp'][1]:.2f} {bws}]")
+    REPORT["ladder_hac"][label.split()[0]] = {"terms": names, **hf}
 print(f"\nN = {n} block groups. W = Queen contiguity (islands attached), row-standardised.")
-print("HAC = Kelejian-Prucha/Conley kernel (triangular, 2 km). Impacts = LeSage-Pace (SDM) / β,θ (SDEM).")
+print(f"HAC = Kelejian-Prucha/Conley kernel (triangular; primary {HAC_BW_PRIMARY/1000:g} km, "
+      f"also {', '.join(f'{b/1000:g}' for b in HAC_BWS)} km). Impacts = LeSage-Pace (SDM) / β,θ (SDEM).")
 print("Crime = NYPD YTD-2026; 311 = public-disorder YTD-2026; both counted in the 10-min walkshed.")
 
 # ---------------- persist ----------------
