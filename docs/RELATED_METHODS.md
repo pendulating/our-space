@@ -476,6 +476,34 @@ plainly that the dose scales with commute length, and report the residence-rate 
 same-borough median) on top of the work-borough attribution problem, so 85% is still not the
 statistic the headline describes.
 
+### 8.1 M3 fixed: captures attributed to where they happen (2026-09-23, later the same day)
+
+`batch od-exposure-mnl` now books every 50 m route sample to the borough of its nearest block-group
+centroid and emits per-borough columns in the pairs file (`m_dash_{bx,bk,mn,qn,si,unk}`,
+`m_ace_{…}`; `MobileLeg` in `crates/batch/src/main.rs`). `incidence_inversion.py` uses them; the
+work-borough view is kept in the JSON as `legacy_work_boro_view` for comparison only. Re-bake job
+13385 (rustc 1.98.1 after the toolchain repair): every existing output file is byte-identical to
+the previous bake, all columns; the per-borough columns sum to `m_dash` within 4-decimal rounding;
+0.00% of captures fell in the "unknown" slot.
+
+| Statistic (dashcam, dose per commute, LODES-weighted) | Work-borough view (old) | Where-captured view (new) |
+|---|---|---|
+| Share of captures outside the bearer's home borough | 85.0% | **59.5%** (ACE: 44.6%) |
+| Manhattan streets' captures borne by non-Manhattan residents | 88% | **77%** (Brooklyn 25, Bronx 25, Queens 17, SI 10) |
+| Share of residents' commute captures that happen in their own borough: Mn / Bk / Qn / Bx / SI | — | 84 / 49 / 38 / **21** / **9** % |
+
+Who bears what each borough's streets generate (rows sum to 100%): Manhattan ← Bk 25, Bx 25, Mn 23,
+Qn 17, SI 10; Brooklyn ← Bk 50, SI 22, Qn 20; Queens ← Qn 70, Bk 13, Bx 10; Bronx ← Bx 74, Qn 11,
+Mn 8; Staten Island ← SI 79, Bk 11.
+
+**Reading.** The inversion is real but smaller than the flawed statistic claimed: three in five
+dashcam captures on a commute happen in a borough the person does not live in, and Manhattan's
+rideshare cameras record mostly outer-borough residents. The sharpest form is the last row:
+place-based measurement books a Bronx resident's mobile exposure to the Bronx, but four fifths of
+it happens elsewhere. The dose-per-trip definition still means long commuters weigh more (a
+deliberate choice, §8 decision); a per-person or per-borough-resident normalisation would be the
+robustness check.
+
 ---
 
 ## Audit context (2026-09-22)

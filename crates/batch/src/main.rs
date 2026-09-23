@@ -674,9 +674,51 @@ struct MobileLayers {
     dashcam: Option<sim_core::DashcamFieldLayer>,
     mobile: sim_core::MobileScenario,
     dashcam_on: bool,
+    /// Nearest-BG-centroid borough index for the M3 pair emission (where along the route a
+    /// mobile capture happens). `None` → every sample books to `BORO_UNKNOWN`.
+    boro_tree: Option<RTree<GeomWithData<[f64; 2], u8>>>,
+}
+
+/// Borough slots for the per-borough mobile terms: Bronx, Brooklyn, Manhattan, Queens,
+/// Staten Island, then "unknown" (no index, or a sample nearer to no centroid).
+const BORO_NAMES: [&str; 6] = ["bx", "bk", "mn", "qn", "si", "unk"];
+const BORO_UNKNOWN: usize = 5;
+/// County FIPS (GEOID[2..5]) → borough slot.
+fn borough_slot(geoid: &str) -> u8 {
+    match geoid.get(2..5) {
+        Some("005") => 0,
+        Some("047") => 1,
+        Some("061") => 2,
+        Some("081") => 3,
+        Some("085") => 4,
+        _ => BORO_UNKNOWN as u8,
+    }
+}
+
+/// Expected mobile encounters for one traversal of a routed leg, in total and split by the
+/// borough the capture happens in (nearest BG centroid at each 50 m sample).
+#[derive(Debug, Clone, Copy, Default)]
+struct MobileLeg {
+    ace: f64,
+    dash: f64,
+    ace_boro: [f64; 6],
+    dash_boro: [f64; 6],
 }
 
 impl MobileLayers {
+    /// Attach the borough index (BG centroid ENU + borough slot) used by
+    /// [`route_mobile_exposure`] to attribute captures to where they occur.
+    fn set_borough_index(&mut self, pts: Vec<GeomWithData<[f64; 2], u8>>) {
+        self.boro_tree = (!pts.is_empty()).then(|| RTree::bulk_load(pts));
+    }
+
+    fn borough_at(&self, p: [f64; 2]) -> usize {
+        self.boro_tree
+            .as_ref()
+            .and_then(|t| t.nearest_neighbor(&p))
+            .map_or(BORO_UNKNOWN, |g| g.data as usize)
+    }
+
     fn load() -> Result<Self> {
         let mut mobile = sim_core::MobileScenario::fields_only();
         // Only the OBSERVED fleets are enabled for the paper's tables; glasses stay
@@ -740,7 +782,7 @@ impl MobileLayers {
             }
         });
 
-        Ok(Self { ace_tree, ace_cap_r2, ace_routes, dashcam, mobile, dashcam_on })
+        Ok(Self { ace_tree, ace_cap_r2, ace_routes, dashcam, mobile, dashcam_on, boro_tree: None })
     }
 }
 
@@ -1898,9 +1940,9 @@ fn od_exposure(
                 let (rc, ra, rd, re) = route_road_cameras(&route.points, &sensors, &cam_tree, &occ, recall);
                 // M_i^act mobile terms: expected encounters for one traversal of the driven leg.
                 if mob.mobile.ace.is_some() || mob.dashcam_on {
-                    let (ma, md) = route_mobile_exposure(&route.points, &mob, &occ, recall);
-                    w_ace += jobs * ma;
-                    w_dash += jobs * md;
+                    let leg = route_mobile_exposure(&route.points, &mob, &occ, recall);
+                    w_ace += jobs * leg.ace;
+                    w_dash += jobs * leg.dash;
                 }
                 let de = dest_exp.get(&work.wnode).copied().unwrap_or(0.0);
                 w_route += jobs * rc;
@@ -1965,13 +2007,15 @@ fn od_exposure(
 /// keeps M_i^act comparable with M_i^res (same averaging convention); the AM-peak-only
 /// variant is one env knob away (`OURSPACE_COMMUTE_HOUR`).
 ///
-/// Returns (ace_encounters, dashcam_encounters) for one traversal of the polyline.
+/// Returns the expected (ACE, dashcam) encounters for one traversal of the polyline, in
+/// total and split by the borough each sample falls in (M3 needs where a capture happens,
+/// not where the trip ends).
 fn route_mobile_exposure(
     pts: &[Enu],
     mob: &MobileLayers,
     occ: &sim_core::OccluderIndex,
     recall: f64,
-) -> (f64, f64) {
+) -> MobileLeg {
     const STEP: f64 = 50.0; // smooth zone fields; no need for the fixed-camera 10 m stride
 
     let mut samples: Vec<Enu> = Vec::new();
@@ -1987,7 +2031,7 @@ fn route_mobile_exposure(
         samples.push(*last);
     }
     if samples.is_empty() {
-        return (0.0, 0.0);
+        return MobileLeg::default();
     }
 
     let weights = day_weights();
@@ -2001,7 +2045,9 @@ fn route_mobile_exposure(
     let min_per_sample = STEP / STREET_SPEED_MPS / 60.0;
 
     let mut acc = [0.0_f64; 2];
+    let mut acc_boro = [[0.0_f64; 6]; 2];
     for p in &samples {
+        let slot = mob.borough_at([p.x, p.y]);
         let near_ace = mob
             .ace_tree
             .as_ref()
@@ -2022,10 +2068,17 @@ fn route_mobile_exposure(
             );
             acc[0] += r.ace * w;
             acc[1] += r.dashcam * w;
+            acc_boro[0][slot] += r.ace * w;
+            acc_boro[1][slot] += r.dashcam * w;
         }
     }
     let scale = min_per_sample / wsum;
-    (acc[0] * scale, acc[1] * scale)
+    MobileLeg {
+        ace: acc[0] * scale,
+        dash: acc[1] * scale,
+        ace_boro: acc_boro[0].map(|v| v * scale),
+        dash_boro: acc_boro[1].map(|v| v * scale),
+    }
 }
 
 /// Fixed-camera exposure along a route, split by traveller mode. Always tallies distinct
@@ -2373,7 +2426,8 @@ fn od_exposure_modal(
                 );
                 // M_i^act mobile terms for the driven leg (expected encounters per traversal).
                 let (m_ace, m_dash) = if mob.mobile.ace.is_some() || mob.dashcam_on {
-                    route_mobile_exposure(&route.points, &mob, &occ, recall)
+                    let leg = route_mobile_exposure(&route.points, &mob, &occ, recall);
+                    (leg.ace, leg.dash)
                 } else {
                     (0.0, 0.0)
                 };
@@ -2521,6 +2575,9 @@ struct ModePair {
     /// traversal, day-averaged. Weighted by street-exposed mode share at aggregation.
     m_ace: f64,
     m_dash: f64,
+    /// The same two terms split by the borough the capture happens in (M3 emission).
+    m_ace_boro: [f64; 6],
+    m_dash_boro: [f64; 6],
     /// Destination BG (for M3 pair emission; empty in the modal command's variant).
     work_geoid: String,
     /// Walkable commute: the WALK-graph route exists and is ≤ WALK_MAX_M. Gates the
@@ -2766,7 +2823,16 @@ fn od_exposure_mnl(
     let subway = SubwayParams::from_env();
     let bus = BusParams::from_env();
     // M1 mobile layers (see od_exposure_modal): shared read-only state for the pass below.
-    let mob = std::sync::Arc::new(MobileLayers::load()?);
+    let mob = {
+        let mut m = MobileLayers::load()?;
+        // Where-it-happens borough index for the M3 pair columns: nearest BG centroid.
+        m.set_borough_index(
+            bg.iter()
+                .map(|(id, b)| GeomWithData::new([b.enu.x, b.enu.y], borough_slot(id)))
+                .collect(),
+        );
+        std::sync::Arc::new(m)
+    };
     // M3 incidence-inversion emission (OUTLINE §8): when OURSPACE_EMIT_PAIRS is set, every
     // routed (home, work) pair also appends one row — home_bg, work_bg, jobs, and the
     // per-traversal mobile encounters — so the transpose (exposure each WORK BG generates,
@@ -2828,11 +2894,12 @@ fn od_exposure_mnl(
                     (home_groups, dest_groups),
                 );
                 // M_i^act mobile terms for the driven leg (expected encounters per traversal).
-                let (m_ace, m_dash) = if mob.mobile.ace.is_some() || mob.dashcam_on {
+                let mob_leg = if mob.mobile.ace.is_some() || mob.dashcam_on {
                     route_mobile_exposure(&route.points, &mob, &occ, recall)
                 } else {
-                    (0.0, 0.0)
+                    MobileLeg::default()
                 };
+                let (m_ace, m_dash) = (mob_leg.ace, mob_leg.dash);
 
                 // The WALK alternative walks the WALK graph. Routing it on the drive geometry
                 // (the pre-2026-07-14 behavior) denied walkers park paths and promenades and
@@ -2907,6 +2974,8 @@ fn od_exposure_mnl(
                     dest,
                     m_ace,
                     m_dash,
+                    m_ace_boro: mob_leg.ace_boro,
+                    m_dash_boro: mob_leg.dash_boro,
                     short,
                     transit_ok,
                     work_geoid: wid.clone(),
@@ -3117,14 +3186,22 @@ fn od_exposure_mnl(
                     };
                     let bus_share = bus_share_of(&acs, &h.geoid);
                     let street = (pd + pt * bus_share).min(1.0);
+                    let boro_cols = p
+                        .m_dash_boro
+                        .iter()
+                        .chain(p.m_ace_boro.iter())
+                        .map(|v| format!("{:.4}", v * street))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     buf.push(format!(
-                        "{},{},{},{:.4},{:.4},{:.4}",
+                        "{},{},{},{:.4},{:.4},{:.4},{}",
                         h.geoid,
                         p.work_geoid,
                         p.flow,
                         street,
                         p.m_ace * street,
                         p.m_dash * street,
+                        boro_cols,
                     ));
                 }
             }
@@ -3142,7 +3219,13 @@ fn od_exposure_mnl(
             std::fs::File::create(pp).with_context(|| format!("creating {pp}"))?,
         );
         let mut w = pw;
-        writeln!(w, "home_bg,work_bg,jobs,street_share,m_ace,m_dash")?;
+        let boro_hdr = BORO_NAMES
+            .iter()
+            .map(|b| format!("m_dash_{b}"))
+            .chain(BORO_NAMES.iter().map(|b| format!("m_ace_{b}")))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(w, "home_bg,work_bg,jobs,street_share,m_ace,m_dash,{boro_hdr}")?;
         for line in &buf {
             writeln!(w, "{line}")?;
         }

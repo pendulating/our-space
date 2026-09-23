@@ -10,6 +10,12 @@
 # Fixed-camera columns must come out byte-identical to the previous bake; only the
 # m_dash_* columns (and m_ace_* only if the ACE input changed) may move.
 # Then run tools/refresh_results.sh.
+#
+# STEPS selects a subset (space-separated, in this order): bg drive modal mnl table.
+# Pass it through sbatch's own --export: on this cluster `sbatch` is an ssh shim to the
+# login node (~/.local/bin/_slurm_ssh_shim), so a plain `STEPS=... sbatch` env prefix
+# never reaches the job.
+#   sbatch --export=ALL,STEPS="mnl table" tools/cluster_dashcam_rebake.sh
 # ----------------------------------------------------------------------------
 #SBATCH --job-name=ourspace-dashcam-rebake
 #SBATCH --nodes=1
@@ -42,14 +48,16 @@ SUBWAY=$DERIV/subway_nyc.ossub
 WALK_MIN=10
 TOP_K=900
 export OURSPACE_EMIT_PAIRS="$EXP/od_pairs_mnl_nyc.csv"
+STEPS="${STEPS:-bg drive modal mnl table}"
+want() { case " $STEPS " in *" $1 "*) return 0;; *) return 1;; esac; }
 
-[ -x "$BATCH" ] || { echo "error: $BATCH missing; build with RUSTUP_TOOLCHAIN=1.95-x86_64-unknown-linux-gnu cargo build --release -p batch" >&2; exit 1; }
+[ -x "$BATCH" ] || { echo "error: $BATCH missing; build with: cargo build --release -p batch" >&2; exit 1; }
 [ -f "$PROC/dashcam_field.osfield" ] || { echo "error: dashcam_field.osfield missing (bake-dashcam-field first)" >&2; exit 1; }
 [ -f "$SUBWAY" ] || { echo "error: $SUBWAY missing (bake-subway first)" >&2; exit 1; }
 mkdir -p "$LOGS"
 
 # Keep the previous bake for the byte-identity check on the fixed-camera columns.
-PREV=$EXP/prev_$(date +%Y%m%d)
+PREV=$EXP/prev_$(date +%Y%m%d_%H%M)
 mkdir -p "$PREV"
 for f in R_i_bg_nyc.csv A_i_drive_bg_nyc.csv A_i_modal_bg_nyc.csv A_i_mnl_bg_nyc.csv exposure_table_nyc.csv od_pairs_mnl_nyc.csv; do
   [ -f "$EXP/$f" ] && cp -n "$EXP/$f" "$PREV/$f" || true
@@ -66,16 +74,18 @@ run_step() {
   [ "$rc" -eq 0 ] || { echo "!! $name FAILED (exit $rc) -- see $log" >&2; exit "$rc"; }
 }
 
-run_step bg-exposure "$BATCH" bg-exposure "$WALK" "$CENT" "$EXP/R_i_bg_nyc.csv" "$WALK_MIN"
-run_step od-exposure-drive "$BATCH" od-exposure "$DRIVE" "$WALK" "$CENT" "$OD" "$EXP/A_i_drive_bg_nyc.csv" "$WALK_MIN" "$TOP_K"
-run_step od-exposure-modal "$BATCH" od-exposure-modal "$DRIVE" "$WALK" "$CENT" "$OD" "$ACS" "$STATIONS" "$EXP/A_i_modal_bg_nyc.csv" "$WALK_MIN" "$TOP_K" "$SUBWAY"
-run_step od-exposure-mnl "$BATCH" od-exposure-mnl "$DRIVE" "$WALK" "$CENT" "$OD" "$ACS" "$STATIONS" "$EXP/A_i_mnl_bg_nyc.csv" "$WALK_MIN" "$TOP_K" "$SUBWAY"
-run_step exposure-table "$BATCH" exposure-table "$CENT" "$EXP/R_i_bg_nyc.csv" "$EXP/A_i_drive_bg_nyc.csv" "$ACS" "$EXP/exposure_table_nyc.csv" "$EXP/A_i_modal_bg_nyc.csv" "$EXP/A_i_mnl_bg_nyc.csv"
+want bg    && run_step bg-exposure "$BATCH" bg-exposure "$WALK" "$CENT" "$EXP/R_i_bg_nyc.csv" "$WALK_MIN"
+want drive && run_step od-exposure-drive "$BATCH" od-exposure "$DRIVE" "$WALK" "$CENT" "$OD" "$EXP/A_i_drive_bg_nyc.csv" "$WALK_MIN" "$TOP_K"
+want modal && run_step od-exposure-modal "$BATCH" od-exposure-modal "$DRIVE" "$WALK" "$CENT" "$OD" "$ACS" "$STATIONS" "$EXP/A_i_modal_bg_nyc.csv" "$WALK_MIN" "$TOP_K" "$SUBWAY"
+want mnl   && run_step od-exposure-mnl "$BATCH" od-exposure-mnl "$DRIVE" "$WALK" "$CENT" "$OD" "$ACS" "$STATIONS" "$EXP/A_i_mnl_bg_nyc.csv" "$WALK_MIN" "$TOP_K" "$SUBWAY"
+want table && run_step exposure-table "$BATCH" exposure-table "$CENT" "$EXP/R_i_bg_nyc.csv" "$EXP/A_i_drive_bg_nyc.csv" "$ACS" "$EXP/exposure_table_nyc.csv" "$EXP/A_i_modal_bg_nyc.csv" "$EXP/A_i_mnl_bg_nyc.csv"
 
 echo "==> byte-identity check on fixed-camera columns vs $PREV"
-# sbatch shells do not source the login profile; uv lives in ~/.local/bin.
-UV=$(command -v uv || echo "$HOME/.local/bin/uv")
-"$UV" run python3 - "$EXP" "$PREV" <<'EOF'
+# sbatch shells do not source the login profile, so `uv` is usually not on PATH; try the
+# known install locations, and fall back to the venv's python so the check still runs.
+UV=$(command -v uv || ls -d "$HOME/.local/bin/uv" /share/pierson/matt_ai/bin/uv 2>/dev/null | head -1 || true)
+if [ -n "$UV" ]; then PY=("$UV" run python3); else PY=(.venv/bin/python3); fi
+"${PY[@]}" - "$EXP" "$PREV" <<'EOF'
 import sys, pandas as pd
 exp, prev = sys.argv[1], sys.argv[2]
 for f in ["R_i_bg_nyc.csv", "A_i_drive_bg_nyc.csv", "A_i_modal_bg_nyc.csv", "A_i_mnl_bg_nyc.csv"]:
@@ -84,5 +94,11 @@ for f in ["R_i_bg_nyc.csv", "A_i_drive_bg_nyc.csv", "A_i_modal_bg_nyc.csv", "A_i
     same = a[fixed].equals(b[fixed])
     moved = [c for c in a.columns if c.startswith("m_") and not a[c].equals(b[c])]
     print(f"  {f}: fixed columns identical={same}; mobile columns changed={moved}")
+import os
+if os.path.exists(f"{prev}/od_pairs_mnl_nyc.csv"):
+    a, b = pd.read_csv(f"{exp}/od_pairs_mnl_nyc.csv"), pd.read_csv(f"{prev}/od_pairs_mnl_nyc.csv")
+    common = [c for c in b.columns if c in a.columns]
+    print(f"  od_pairs: rows {len(a)} vs {len(b)}; shared columns identical={a[common].equals(b[common])}; new columns={[c for c in a.columns if c not in b.columns]}")
 EOF
 echo "==> done. Now: tools/refresh_results.sh"
+exit 0

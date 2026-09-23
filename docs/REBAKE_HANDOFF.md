@@ -42,7 +42,7 @@ rsync -avz unicorn:~/our-space/data/derived/ data/derived/
 | `A_i_modal_bg_nyc.csv` | `m_ace_act`, `m_dash_act` | od-exposure-modal |
 | `A_i_mnl_bg_nyc.csv` | `m_ace_act`, `m_dash_act` | od-exposure-mnl |
 | `exposure_table_nyc.csv` | `M_ace_res`, `M_dash_res`, `M_ace_act_mnl`, `M_dash_act_mnl`, `M_ace_act_modal`, `M_dash_act_modal` | exposure-table |
-| `od_pairs_mnl_nyc.csv` (NEW file) | per-pair rows for M3 | see below |
+| `od_pairs_mnl_nyc.csv` (NEW file) | per-pair rows for M3; since 2026-09-23 also `m_dash_{bx,bk,mn,qn,si,unk}` / `m_ace_{…}` = the same dose split by the borough the capture happens in (nearest BG centroid per 50 m route sample) | see below |
 
 For the M3 pair file, add `OURSPACE_EMIT_PAIRS=$EXP/od_pairs_mnl_nyc.csv` to the env
 of the `od-exposure-mnl` step (the cluster script does not yet set it — either export

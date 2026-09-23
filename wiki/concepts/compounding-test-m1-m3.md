@@ -38,6 +38,13 @@ while corr(`R_i`, `M_dash^res`) = +0.47 (rate at the residence); report both and
 which sentence each supports. See `docs/RELATED_METHODS.md` §8.
 
 ## M3 — The incidence-inversion test (the novel one)
+**Status 2026-09-23:** computed with captures attributed to the borough where they happen
+(per-borough pair columns from `batch od-exposure-mnl`; the earlier work-borough attribution
+inflated the statistic to 85%). Dashcam: **59.5%** of commute captures happen outside the
+bearer's home borough; Manhattan's streets' captures are 77% borne by non-Manhattan residents;
+Bronx residents get 21% of their commute captures in the Bronx, Staten Islanders 9%. Details and
+matrix: `docs/RELATED_METHODS.md` §8.1; JSON `results/incidence_inversion.json`.
+
 For each BG *j* where devices are dense, decompose the exposure it generates by
 home BG of the people captured (LODES gives this directly). Expected headline:
 "Manhattan's rideshare dashcams generate X% of their captures on residents of the
