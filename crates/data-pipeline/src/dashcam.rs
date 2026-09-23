@@ -67,6 +67,23 @@ pub(crate) fn parse_zones(
     Ok(out)
 }
 
+/// `LocationID` -> `borough` from the taxi-zone GeoJSON properties (empty if absent).
+pub(crate) fn parse_boroughs(json: &[u8]) -> Result<HashMap<i64, String>> {
+    let fc: geojson::FeatureCollection =
+        serde_json::from_slice(json).context("parsing taxi-zone GeoJSON")?;
+    let mut out = HashMap::new();
+    for f in fc.features {
+        let Some(p) = f.properties.as_ref() else { continue };
+        let loc = p
+            .get("LocationID")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|x| x as i64)));
+        if let (Some(loc), Some(b)) = (loc, p.get("borough").and_then(|v| v.as_str())) {
+            out.insert(loc, b.to_string());
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn shoelace_area(ring: &[[f64; 2]]) -> f64 {
     let n = ring.len();
     if n < 3 {
@@ -106,16 +123,46 @@ pub fn bake(geojson_path: &str, trips_csv: &str, out_path: &str) -> Result<usize
         }
     }
 
-    // Median trip density (trips / m²) over zones with data — robust to airport outliers.
-    let mut densities: Vec<f64> = total_area
-        .iter()
-        .filter_map(|(loc, &area)| {
-            let t = *trips.get(loc).unwrap_or(&0.0);
-            (area > 0.0 && t > 0.0).then_some(t / area)
-        })
+    // Reference density = the MEDIAN trip-end density over MANHATTAN zones with data.
+    // Intensity 1.0 is what `DashcamConfig::vehicles_per_min_peak` is anchored to, and the
+    // field was Manhattan-only until 2026-09-23; anchoring on the Manhattan median keeps
+    // every Manhattan zone's value identical to the earlier bake while the outer boroughs
+    // now enter on the same absolute scale (mostly < 1.0). Falls back to the citywide
+    // median if the GeoJSON carries no borough attribute. Robust to airport outliers.
+    let boroughs = parse_boroughs(&std::fs::read(geojson_path)?)?;
+    let density = |loc: &i64| -> Option<f64> {
+        let area = *total_area.get(loc)?;
+        let t = *trips.get(loc).unwrap_or(&0.0);
+        (area > 0.0 && t > 0.0).then_some(t / area)
+    };
+    let mut ref_set: Vec<f64> = total_area
+        .keys()
+        .filter(|loc| boroughs.get(loc).map(|b| b == "Manhattan").unwrap_or(false))
+        .filter_map(density)
         .collect();
-    densities.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = densities.get(densities.len() / 2).copied().unwrap_or(1.0).max(1e-12);
+    let ref_label = if ref_set.is_empty() {
+        ref_set = total_area.keys().filter_map(density).collect();
+        "citywide median"
+    } else {
+        "Manhattan median"
+    };
+    ref_set.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = ref_set.get(ref_set.len() / 2).copied().unwrap_or(1.0).max(1e-12);
+    // Coverage by borough (zones with any trips / zones), so a truncated input is loud.
+    let mut cov: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for loc in total_area.keys() {
+        let b = boroughs.get(loc).cloned().unwrap_or_else(|| "?".into());
+        let e = cov.entry(b).or_default();
+        e.1 += 1;
+        if trips.get(loc).copied().unwrap_or(0.0) > 0.0 {
+            e.0 += 1;
+        }
+    }
+    eprintln!(
+        "dashcam field: reference density ({ref_label}) = {:.1} trip-ends/km² over the input period; zones with trips by borough: {}",
+        median * 1e6,
+        cov.iter().map(|(b, (n, d))| format!("{b} {n}/{d}")).collect::<Vec<_>>().join(", ")
+    );
 
     let mut out_zones = Vec::new();
     let mut max_intensity = 0.0_f64;
@@ -147,9 +194,10 @@ pub fn bake(geojson_path: &str, trips_csv: &str, out_path: &str) -> Result<usize
             source: "NYC TLC High-Volume FHV trip records (rideshare) + NYC taxi zones".into(),
             url: "https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page".into(),
             license: "NYC OpenData / TLC terms".into(),
-            as_of: "2024-12".into(),
-            notes: "Per-zone Uber/Lyft trip density (PU+DO), normalized to the median zone; \
-                    dashcams ride in for-hire vehicles the city requires to carry cameras."
+            as_of: "TLC HVFHV 2024-06 (monthly file); zones citywide since 2026-09-23".into(),
+            notes: "Per-zone Uber/Lyft trip-END density (pickups + dropoffs, all five boroughs), \
+                    normalized to the median Manhattan zone and clamped at 8x; dashcams ride in \
+                    for-hire vehicles the city requires to carry cameras."
                 .into(),
         },
     };

@@ -413,6 +413,68 @@ be swept; (6) ACE uses synthetic headways although GTFS timetables exist.
 
 ---
 
+## 8. Change made 2026-09-23: citywide dashcam field
+
+**Bug.** `tools/fetch_snapshots.py` built `tlc/zone_trips.csv` from pickups in Manhattan taxi
+zones only. `bake-dashcam-field` then gave every non-Manhattan zone intensity 0, so the dashcam
+class contributed nothing to any trip that stayed outside Manhattan. The M2 compounding
+correlation (−0.38) and the M3 incidence inversion (87% "outside the home borough") were both
+consequences of this.
+
+**Fix.**
+- Fetch: count trip **ends** (pickups + dropoffs) for all zones 2–263 (EWR excluded; 264/265 are
+  TLC "unknown"), from the same June 2024 HVFHV monthly file. 39.2 M trip-ends = 19.6 M trips.
+  Share by borough: Manhattan 37%, Brooklyn 28%, Queens 21%, Bronx 12%, Staten Island 1.5%.
+- Bake (`crates/data-pipeline/src/dashcam.rs`): the intensity anchor is now explicitly the
+  **median Manhattan zone** (329,183 trip-ends/km² over the month), which `DashcamConfig::
+  vehicles_per_min_peak = 12` was implicitly calibrated to. Manhattan intensities are therefore
+  nearly unchanged (zone-level corr 0.995 with the old field, median ratio 0.997, peak 2.7× at
+  Times Sq), while the other boroughs enter on the same absolute scale: Bronx mean 0.18,
+  Brooklyn 0.24 (Williamsburg 0.94, Downtown Brooklyn 0.74), Queens 0.11, Staten Island 0.01.
+  The bake now logs the reference density and zones-with-trips per borough so a truncated input
+  is loud. Provenance `as_of` corrected from "2024-12" to the 2024-06 file.
+- Built with `RUSTUP_TOOLCHAIN=1.95-x86_64-unknown-linux-gnu` (the shared `stable` toolchain is
+  half-updated and has no `rustc`; left untouched).
+- `tools/cluster_dashcam_rebake.sh` (new, sbatch) re-runs bg-exposure, od-exposure (drive, modal,
+  mnl + pair emission) and exposure-table, keeps the previous CSVs under
+  `data/derived/exposure/prev_<date>/`, and checks that the fixed-camera columns are
+  byte-identical. Then `tools/refresh_results.sh`.
+
+**Remaining limitation (state in the paper).** Trip-end density is a presence proxy for where
+vehicles start and finish, not where they drive in between; through-traffic corridors (e.g.
+Queens expressways, bridge approaches) are under-weighted relative to a routed, O'Keeffe-style
+segment field. The citywide routed `taxi_day` bake exists and is the natural upgrade
+(recommendation 14). Penetration 0.40 and capture 0.40 remain unsourced constants.
+
+**Re-bake results (SLURM job 990636, 1 h 47 min at 16 threads; `refresh_results.sh` clean).**
+Fixed-camera and ACE columns byte-identical in all four exposure files and the pairs file; only
+`m_dash_*` changed. Of 16 result JSONs, only `compounding.json` and `incidence_inversion.json`
+moved.
+
+| | Before (Manhattan-only) | After (citywide) |
+|---|---|---|
+| M_dash_res, pop-wtd mean: Bronx / Brooklyn / Manhattan / Queens / SI | 0.00 / 0.00 / 1.21 / 0.00 / 0.00 | 0.30 / 0.33 / 1.16 / 0.17 / 0.02 |
+| M_dash_act (per commute), same order | — | 23.9 / 15.2 / 11.8 / 17.3 / 39.3 |
+| M2: pop-wtd corr(R_i, M_act) | −0.378 | **−0.495** |
+| M2: corr(R_i, M_dash_act) / corr(R_i, M_ace_act) | −0.333 / −0.461 | −0.485 / −0.461 |
+| corr(R_i, M_dash_res) | (undefined: zeros) | **+0.466** |
+| M3: dash captures with work borough ≠ home borough | 0.867 | 0.850 |
+| M3: median m_dash, same-borough vs cross-borough pair | 0.00 vs 15.8 | 3.1 vs 20.0 |
+
+**Reading.** The citywide field did not change the sign of M2; it made it more negative, and the
+borough table shows why. `M_act` is expected encounters per commute *traversal*, so it scales with
+route length: Staten Island has the lowest R_i (18) and the highest M_act (39). The compounding
+statistic as defined measures "long commuters from low-R_i places accumulate more mobile
+encounters", not whether mobile surveillance falls on the same people as fixed surveillance. The
+rate-based term says the opposite: corr(R_i, M_dash_res) = +0.47, i.e. at the residence, dashcam
+intensity compounds fixed exposure. Before M2 is used in the paper, decide whether the mobile
+term is a dose (per trip) or an intensity (per km or per minute travelled); report both and say
+which the claim is about. M3 has the same length dependence (cross-borough pairs 6× the
+same-borough median) on top of the work-borough attribution problem, so 85% is still not the
+statistic the headline describes.
+
+---
+
 ## Audit context (2026-09-22)
 
 Issues found in our own pipeline that motivate the recommendations above:

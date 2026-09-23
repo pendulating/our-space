@@ -545,12 +545,19 @@ def fetch_tlc() -> None:
             "GROUP BY 1,2 HAVING COUNT(*) >= 200 ORDER BY trips DESC) "
             f"TO '{os.path.join(SNAP, 'tlc', 'zone_od.csv')}' (HEADER)",
         ),
-        # per-zone pickup counts for the dashcam density field (`loc,trips`)
+        # per-zone TRIP-END counts (pickups + dropoffs) for the dashcam density field
+        # (`loc,trips`), CITYWIDE. A vehicle is present at both ends of every trip, so
+        # PU+DO is the presence proxy the bake's provenance note describes. Until
+        # 2026-09-23 this counted Manhattan pickups only, which left every other
+        # borough with zero dashcam intensity (see docs/RELATED_METHODS.md).
+        # Zone 1 (Newark Airport) is outside the city and excluded; 264/265 are the
+        # TLC "unknown" codes.
         (
             "tlc/zone_trips.csv",
-            "COPY (SELECT PULocationID AS loc, COUNT(*) AS trips "
-            f"FROM read_parquet('{pq}') "
-            f"WHERE PULocationID IN ({ids_sql}) GROUP BY 1 ORDER BY 1) "
+            "COPY (SELECT loc, COUNT(*) AS trips FROM ("
+            f"SELECT PULocationID AS loc FROM read_parquet('{pq}') "
+            f"UNION ALL SELECT DOLocationID AS loc FROM read_parquet('{pq}')) "
+            "WHERE loc BETWEEN 2 AND 263 GROUP BY 1 ORDER BY 1) "
             f"TO '{os.path.join(SNAP, 'tlc', 'zone_trips.csv')}' (HEADER)",
         ),
     ]

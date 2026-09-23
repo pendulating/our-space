@@ -64,6 +64,14 @@ over-count).
 Defensible for fixed 24/7 CCTV; DOT monitoring and enforcement are
 schedule-sensitive. App-vs-paper number comparisons will diverge.
 
+**A7a. (found and fixed 2026-09-23) The dashcam field was Manhattan-only.**
+`fetch_snapshots.py` counted pickups in Manhattan taxi zones only, so every other borough had
+dashcam intensity 0; the 2026-08-25 M2 (corr −0.38) and M3 (87% outside home borough) numbers are
+artifacts of that. Fixed: citywide trip-end (PU+DO) counts, intensity anchored to the median
+Manhattan zone so Manhattan values are unchanged (corr 0.995). Re-bake via
+`tools/cluster_dashcam_rebake.sh`; details in `docs/RELATED_METHODS.md` §8. The trip-end proxy
+still under-weights through-traffic corridors; a routed segment field is the upgrade.
+
 **A7. One Tuesday of TLC data (2024-06-25)** drives all rideshare intensity;
 penetration 0.40 and capture 0.40 unvalidated. Fine while Tier C; becomes
 load-bearing when A1 ships — ship the sweep band with it.
