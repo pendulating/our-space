@@ -64,6 +64,13 @@ uv run python tools/activity_space_inference.py  # -> activity_space_inference.j
 uv run python tools/inference_montecarlo.py   # -> inference_montecarlo.json (size/SE-ratio of the
                                               #    above under iid / spatial / shared-destination
                                               #    errors; reads od_pairs_mnl_nyc.csv)
+if ls data/derived/null/A_i_mnl_null_jobs_*.csv >/dev/null 2>&1; then
+  uv run python tools/null_destinations.py analyze   # -> null_destinations.json (random-destination
+                                              #    null; needs the routed draws from
+                                              #    tools/cluster_null_od.sh, a cluster-level artifact)
+else
+  echo "  (skip null_destinations: no routed null draws in data/derived/null/)"
+fi
 uv run python tools/analyze_counterfactual.py # -> counterfactual.json
 uv run python tools/capture_recapture.py      # -> capture_recapture.json (+ recall_draws)
 uv run python tools/sweep_recall.py           # -> recall_sensitivity.json  (needs the above)

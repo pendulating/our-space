@@ -506,6 +506,100 @@ robustness check.
 
 ---
 
+## 9. Random-destination null model (2026-09-24)
+
+**Why.** Two results above leave the activity-space claims without valid inference: the NEAP
+literature says the R→A dispersion drop is expected mechanically (§2), and no analytic SE survives
+the shared-destination dependence in A_i (§6). The design-based fix (Abadie et al. 2020, 2023;
+Borusyak, Hull & Jaravel 2022) is to randomize the one thing the paper is about — which
+destinations a block group's workers go to — and re-run the instrument. The observed statistic is
+then compared with its distribution under "commuting without geography".
+
+**Null.** For every home block group, keep its number of commuters (the LODES home marginal) and
+draw each worker's destination from the **citywide job distribution**, independent of home (the
+LODES work marginal is preserved in expectation). This removes only the home→work pairing; it is
+the "random-destination baseline" of Wang et al. 2018 and the shuffle of Moro et al. 2021, done at
+the worker level. A uniform-over-block-groups variant (`--mode bgs`) also erases the job geography
+and is kept as a switch, not the headline. Kept simple on purpose: distance-matched and gravity
+nulls (Duran-Sala et al. 2026) answer a narrower question — "given how far people commute" — and
+are the next step only if a reviewer asks.
+
+**Machinery.** `tools/null_destinations.py make` writes 20 seeded OD files in the `bg_od_nyc.csv`
+schema (≈2.16 M pairs each vs 1.87 M observed; 3,088,833 jobs preserved exactly).
+`tools/cluster_null_od.sh` (SLURM array, 4 concurrent × 16 threads, ~45 min per draw) routes each
+with the **real** `batch od-exposure-mnl` — same walksheds, A* commute legs, MNL mode choice, subway
+matrix — with `top_k` lifted so no null destination is truncated. Nothing in the null is
+approximated. `analyze` compares observed vs null for: pop-weighted Gini, top-decile share and
+P90:P10 of A_mnl, A_dest, the commute term, A+R, and A_lived; income-quintile means; and the
+crime_ladder rung-1 coefficient of A on each focal demographic. Monte Carlo p =
+(1 + #{null at least as extreme}) / (N + 1); with N = 20 the resolution is 1/21 ≈ 0.048, enough to
+say "outside the null range" or not, which is the question.
+
+**Reading rule (decided before seeing results).**
+- *Gini(A) observed vs null.* If the observed Gini sits inside the null range, the R→A drop is the
+  mechanical averaging the NEAP literature predicts and "equalization" is not a finding. If the
+  observed Gini is **above** the null, real commuting geography preserves more inequality than
+  random commuting would — the defensible sentence is then "commuting equalizes exposure less than
+  it would if people worked anywhere". Observed **below** the null would mean real pairings are more
+  equalizing than random ones.
+- *Gradients (β on %Hispanic, %Black, %White, income).* Under the null the destination term is the
+  same in expectation for every block group, so any null gradient comes from the commute leg and
+  sampling noise. An observed β outside the null's two-sided range is a group gap that real
+  commuting geography produces; that is the design-based p-value for the A_mnl regressions that
+  §6 could not deliver.
+
+**Results (20 draws; jobs 48092 tasks 0–15 and 91277 tasks 16–19; 55–65 min each; every draw
+routed all 6,521 home BGs).** The null is extremely tight — 3.09 M workers are redrawn per draw, so
+the Gini's null SD is ~0.0002 — and every observed statistic lies outside the entire null range
+(MC p = 1/21 = 0.048, the floor at N = 20; z-scores carry the magnitude). `results/null_destinations.json`.
+
+| Statistic (pop-weighted) | Observed | Null mean (SD) | z | Reading |
+|---|---|---|---|---|
+| Gini(A_mnl) | 0.0480 | 0.0424 (0.0002) | +35 | Real commuting is slightly **less** equalizing than random |
+| Gini(A_dest) | 0.0671 | **0.0131** (0.0001) | +390 | Where people actually work carries 5× the inequality random destinations give |
+| Gini(commute term) | 0.2048 | 0.2126 (0.0002) | −47 | The commute leg's inequality does not come from the pairing |
+| Gini(A + R) | 0.1467 | 0.1170 | +263 | |
+| Gini(A_lived) | 0.1809 | 0.1555 | +280 | |
+| Top-decile share of A | 0.114 | 0.122 | −71 | |
+| P90/P10 of A | 1.26 | 1.17 | +58 | |
+| Mean A (cameras) | 126.5 | 134.2 | −308 | Real commutes see fewer cameras than random ones: people work closer to home |
+| Q5 − Q1 income gap in A | +7.2 | +1.5 (0.09) | +61 | Real geography creates the income gap |
+| β income | +3.08 | +0.36 (0.02) | +111 | Same, in regression form |
+| β %White | +3.35 | **+2.05** (0.04) | +31 | Two thirds of the White gradient exists without geography (commute leg: mode and route) |
+| β %Black | −1.22 | −0.67 (0.04) | −14 | Real geography lowers Black BGs' exposure further |
+| β %Hispanic | −0.84 | −1.10 (0.03) | +10 | No Hispanic gradient beyond the null; the null's is larger |
+
+Income quintiles Q1→Q5, observed 125.6 / 123.6 / 124.3 / 125.4 / 132.8 vs null 132.6 / 133.1 /
+134.6 / 136.3 / 134.1. By borough, observed vs null: Manhattan 134 vs 128, Brooklyn 130 vs 132,
+Bronx 124 vs 135, Queens 118 vs 132, **Staten Island 131 vs 174** — random destinations would send
+Staten Islanders across the whole city; real ones mostly stay on the island or go to Brooklyn.
+
+**What is now defensible.**
+1. **"Equalization" is not a finding.** Random destinations give Gini 0.042; the observed 0.048 is
+   *above* it. The sentence the data support: commuting collapses residential inequality
+   mechanically (the NEAP prediction, §2), and real commuting geography preserves slightly more
+   inequality than "working anywhere" would, not less. Drop "converged" from the thesis.
+2. **The income gradient in activity-space exposure is real and comes from where people work**
+   (z = 111 against the null): higher-income block groups commute to more surveilled places. This
+   replaces the clustered-SE p-values in §6 with a design-based one for A_mnl.
+3. **The %White gradient is mostly not a destination story.** +2.05 of +3.35 appears under random
+   destinations, i.e. it comes from the commute leg: mode choice (VOT rises with income, so
+   drive legs pass more ALPR/DOT cameras) and route length. The paper should decompose it, not read
+   it as placement.
+4. **No Hispanic gradient in activity space** beyond what random commuting gives, consistent with
+   the clustered result (§6, p = 0.28) and now with a design-based basis. The Black gradient is
+   negative beyond the null.
+5. **Real commutes are less exposed than random ones** (126.5 vs 134.2 cameras), because people
+   work closer to home than the job distribution alone would imply; the Staten Island row makes the
+   mechanism visible.
+
+One null suffices here: every statistic is tens to hundreds of null SDs away, so distance-matched
+or gravity variants (Duran-Sala et al. 2026) would sharpen the *mechanism* (how much of the
+income gradient is commute distance vs destination character) but cannot change the verdicts above.
+Kept as the next step only if a reviewer asks.
+
+---
+
 ## Audit context (2026-09-22)
 
 Issues found in our own pipeline that motivate the recommendations above:

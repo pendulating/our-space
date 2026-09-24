@@ -10,6 +10,18 @@ confidence: high
 
 # The Equalization Finding
 
+> **Status 2026-09-24 — superseded as a finding.** The random-destination null
+> (`tools/null_destinations.py`, 20 draws routed with the real instrument) gives
+> Gini(A_mnl) = 0.042 when every worker's destination is drawn from the citywide job
+> distribution independent of home. The observed 0.048 is *above* that: real commuting
+> geography preserves slightly more inequality than "working anywhere" would. The R→A
+> collapse below is the mechanical averaging the NEAP literature predicts (Kwan 2018; Cai &
+> Kwan 2024), not equalization. What survives the null: the income gradient in A (β +3.08
+> vs null +0.36), a Black gradient more negative than random, no Hispanic gradient beyond
+> random, and a %White gradient two thirds of which exists without geography (commute
+> leg). Full table: `docs/RELATED_METHODS.md` §9. The numbers below are pre-re-bake and
+> kept for the record.
+
 Computed by `tools/inequality_stats.py` →
 `data/derived/results/inequality_stats.json`. All population-weighted — statements
 about *people*, not block groups.
