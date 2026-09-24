@@ -146,9 +146,10 @@ ten Broeke et al. 2016, *JASSS*, doi:10.18564/jasss.2857 (method choice for ABMs
    destinations (Midtown, Downtown Brooklyn) — non-local, not distance-decaying. Cluster by origin
    PUMA (55 in NYC; use a wild cluster bootstrap at that count) or NTA (~195), and run a
    permutation/placebo that reshuffles LODES destinations.
-3. **Keep Moran's I and LM diagnostics; present the AIC-selected spatial model as a robustness
-   layer**, with LeSage–Pace impacts. Resolve the SDM-vs-SDEM contradiction (AIC now selects SDM;
-   footnote and wiki say SDEM) on stated grounds.
+3. **Keep Moran's I and LM diagnostics; present the ML spatial models as a robustness layer**,
+   with LeSage–Pace impacts. *Resolved 2026-09-24:* the headline is **SLX with Conley HAC SEs**, by
+   the stated rule in §10 (walkshed overlap is measurement structure, so no endogenous lag); SDM and
+   SDEM stay in the table as robustness.
 4. **Pre-empt spatial-noise critiques**: Conley 1999, *J. Econometrics* 92(1),
    doi:10.1016/S0304-4076(98)00084-0; Müller & Watson 2022, *Econometrica*, doi:10.3982/ECTA19465
    (SCPC); Kelly, "The Standard Errors of Persistence", now published in *J. International
@@ -241,9 +242,9 @@ post-treatment reading of those controls (§4 item 7). The SEs grow monotonicall
 have not plateaued by 5 km, so report the sweep, not one number. Items 2 (clustered or permutation
 inference for A_i) and 4 (SCPC) are still open.
 
-Not changed (flagged): the `spatial.tex` footnote in `make_tables.py:612–623` says we "rely on the
-AIC-selected error specification", but AIC now selects SDM (46092 vs SDEM 46102). The LM tests
-favour the error model, so the model-selection rule needs deciding.
+The `spatial.tex` footnote's "AIC-selected error specification" wording (AIC had moved to SDM,
+46092 vs SDEM 46102, while the LM tests favour the error model) was replaced on 2026-09-24 by the
+stated-rule SLX headline; see §10.
 
 ---
 
@@ -367,8 +368,8 @@ zero SE if one did.
 - **"Dashcam field is Manhattan-only."** Verified from `fetch_snapshots.py:480–541` and the pairs
   file (intra-borough median m_dash = 0.00 outside Manhattan). The compounding and inversion
   results follow from it.
-- **Model-selection footnote.** Still inconsistent (AIC → SDM; footnote and wiki → SDEM). Not
-  changed; needs a decision.
+- **Model-selection footnote.** Was inconsistent (AIC → SDM; footnote and wiki → SDEM). Resolved
+  2026-09-24 in favour of SLX by a stated rule (§10).
 - **Dropped estimator.** The destination-overlap HAC was removed because it failed the iid
   check (ratio 0.78). The failure is the documented downward bias of wide kernels (the residuals
   are orthogonal to X, so a near-constant kernel subtracts variance), not a coding error.
@@ -597,6 +598,52 @@ One null suffices here: every statistic is tens to hundreds of null SDs away, so
 or gravity variants (Duran-Sala et al. 2026) would sharpen the *mechanism* (how much of the
 income gradient is commute distance vs destination character) but cannot change the verdicts above.
 Kept as the next step only if a reviewer asks.
+
+---
+
+## 10. Spatial specification decision: SLX with Conley HAC (2026-09-24)
+
+**The two rules that disagreed.** AIC picked the Spatial Durbin lag model (SDM 46,092 vs SDEM
+46,102, ΔAIC 10; before the August re-bake the order was reversed). Anselin's robust LM diagnostics
+on the OLS residuals picked the error model (robust LM-error 1,054 vs robust LM-lag 104). AIC asks
+which model *fits*; the LM tests ask what kind of dependence the residuals *look like*. Both can be
+true at once when ρ ≈ 0.9: a lag term that strong absorbs almost any smooth spatial pattern, which
+buys fit without meaning anything.
+
+**The rule adopted (Matt, 2026-09-24).** R_i counts cameras in a 10-minute walkshed, and adjacent
+walksheds share cameras by construction. The dependence among neighbouring R_i is therefore
+*measurement structure we built*, not a causal ripple, and it must not be used as an amplifier. An
+endogenous lag (SAR/SDM) does exactly that: the total effect becomes (β+θ)/(1−ρ) with a multiplier
+≈ 11 at ρ = 0.91 (%Hispanic total +14.30 under SDM vs +5.59 under SDEM). The headline is therefore
+**SLX**, R = Xβ + WXθ + ε (Halleck Vega & Elhorst 2015): local spillovers through neighbours'
+covariates only, total effect β + θ with no multiplier, residual dependence left to the Conley HAC
+SEs (1/2/5 km). SDM, SDEM, AIC and the LM tests remain in the table so the reader can see the
+alternatives and why they were not chosen.
+
+**Results (R_i, N = 5,547, cameras per SD, Conley 2 km in parentheses).**
+
+| | direct β | neighbours θ (WX) | total β+θ | t at 2 / 5 km |
+|---|---|---|---|---|
+| %Hispanic | +2.09 (0.71) | +10.14 (2.49) | **+12.22 (2.82)** | 4.3 / 3.8 |
+| %Black | +0.97 (0.78) | +8.13 (1.85) | **+9.10 (2.00)** | 4.6 / 3.5 |
+| income | +0.05 (0.63) | −1.47 (2.53) | −1.43 (3.00) | −0.5 / −0.4 |
+
+For comparison in the same table: OLS without WX (Conley) %Hisp +8.98 (2.01); SDEM total +5.59;
+SDM total +14.30. On E_i the SLX totals are %Hisp +7.29 (1.74), %Black +5.87 (1.24), income +0.91
+(1.96). Most of the association loads on the neighbourhood term, as a walkshed that spans into
+adjacent block groups should; X and WX are collinear, so the total is the quantity to read, not
+the β/θ split. The crime/311 ladder is also estimated as SLX with HAC SEs (`ladder_hac[*].slx` in
+the JSON). %Hispanic SLX total on R_i: rung 2 (demographics + land use) **+12.22 (2.82)**; rung 3
+(+ crime) **+6.86 (2.90)**; rung 4 (+ crime + 311) **+6.20 (2.80)** at 2 km, (3.30) at 5 km, so
+t = 2.2 / 1.9. %Black: +9.10 → +2.43 → +4.48 (2.26). Same shape as the OLS-HAC ladder (§5): the
+total disparity is robust to spatial inference; after the crime and 311 controls it is marginal,
+and those controls are plausibly post-treatment, so the ladder is a descriptive decomposition.
+
+**Implementation.** `tools/spatial_econometrics.py` (`slx_fits`, `rec["slx"]`, `rec["aic_best"]`,
+`rec["selection_rule"]`); `tools/make_tables.py` (`t_spatial` rows "SLX direct / neighbours /
+total", "AIC minimum" and "Headline specification" rows, rewritten note; new macros `HispSLXTotal`,
+`HispSLXTotalSE`, `HispSLXDirect`, `HispSLXIndirect`, `BlackSLXTotal(SE)`, `IncomeSLXTotal(SE)`).
+`make_tables.py --check` green. `wiki/concepts/spatial-econometrics.md` rewritten.
 
 ---
 

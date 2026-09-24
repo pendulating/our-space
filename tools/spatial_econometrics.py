@@ -13,6 +13,14 @@ does the full §6 program on real TIGER-2020 block-group polygons:
   4. Conley / Kelejian-Prucha spatial-HAC SEs (kernel weights) as a spec-robust cross-check.
   5. Spatial lag (SAR) and Spatial Durbin (SDM = SAR + WX) by ML, with the LeSage-Pace
      direct / indirect (spillover) / total impact decomposition.
+  6. SLX (R = Xβ + WXθ + ε) with Conley HAC SEs — the HEADLINE specification (decided
+     2026-09-24). Rule, stated rather than data-mined: R_i is a count over 10-minute walksheds,
+     and adjacent walksheds share cameras by construction, so the spatial dependence in R_i
+     is measurement structure, not a causal ripple. An endogenous lag (SAR/SDM) reads that
+     structure as spillover and multiplies every effect by 1/(1-ρ) ≈ 11 at ρ = 0.91; SLX keeps
+     only local spillovers (WXθ), leaves the residual dependence to the HAC SEs, and its total
+     effect is simply β + θ (Halleck Vega & Elhorst 2015). AIC and the LM diagnostics are
+     still reported; SDM/SDEM stay in the table as robustness.
 
 Outcome: R_i (residential exposure — the placement disparity). Demographic coefficients are in
 cameras per SD; skewed land-use densities are log1p'd; everything z-scored (pop-unweighted here, as
@@ -108,6 +116,25 @@ def hac_fits(y, X, names, keep=FOCAL):
                                         for i, nm in enumerate(names) if nm in keep}
     return out
 
+def slx_fits(y, X, names, keep=FOCAL):
+    """SLX = OLS on [X, WX]. Per bandwidth: direct β, neighbours' θ, total β+θ with the HAC
+    covariance term. Coefficients are identical across bandwidths."""
+    WX = np.asarray(w.sparse @ X); Xd = np.column_stack([X, WX])
+    nD = list(names) + ["W_" + m for m in names]
+    ix = {nm: i + 1 for i, nm in enumerate(nD)}
+    b = OLS(y, Xd, name_x=nD).betas.flatten()
+    out = {}
+    for bw in HAC_BWS:
+        V = OLS(y, Xd, gwk=GWK[bw], robust="hac", name_x=nD).vm
+        cell = {}
+        for nm in keep:
+            i, j = ix[nm], ix["W_" + nm]
+            cell[nm] = {"direct": [float(b[i]), float(np.sqrt(V[i, i]))],
+                        "indirect": [float(b[j]), float(np.sqrt(V[j, j]))],
+                        "total": [float(b[i] + b[j]), float(np.sqrt(V[i, i] + V[j, j] + 2 * V[i, j]))]}
+        out[f"{bw/1000:g}km"] = cell
+    return out, Xd, nD
+
 def aic(model, kp):
     """AIC from a spreg ML model's log-likelihood; kp = # estimated parameters."""
     ll = float(model.logll)
@@ -156,16 +183,48 @@ def run(yname):
     aic_sem,_  = aic(sem,  k+2)
     aic_sdm,_  = aic(sdm,  2*k+2)
     aic_sdem,_ = aic(sdem, 2*k+2)
-    tbl = {"OLS":aic_ols,"SAR(lag)":aic_sar,"SEM(error)":aic_sem,"SDM(Durbin-lag)":aic_sdm,"SDEM(Durbin-err)":aic_sdem}
+    # --- SLX (headline): OLS on [X, WX]; HAC SEs at every bandwidth; total = β+θ with the
+    #     HAC covariance term. Same coefficient vector at every bandwidth.
+    m_slx = OLS(y, Xd, name_x=nD)
+    b_slx = m_slx.betas.flatten()
+    e_slx = y.flatten() - np.column_stack([np.ones(len(y)), Xd]) @ b_slx
+    s2_slx = e_slx @ e_slx / len(e_slx)
+    aic_slx = -2 * (-0.5 * len(e_slx) * (np.log(2 * np.pi * s2_slx) + 1)) + 2 * (2 * k + 2)
+    ix = {nm: i + 1 for i, nm in enumerate(nD)}
+    slx = {"aic": float(aic_slx), "by_bw": {}}
+    for bw in HAC_BWS:
+        V = OLS(y, Xd, gwk=GWK[bw], robust="hac", name_x=nD).vm
+        cell = {}
+        for nm in FOCAL:
+            i, j = ix[nm], ix["W_" + nm]
+            cell[nm] = {
+                "direct": [float(b_slx[i]), float(np.sqrt(V[i, i]))],
+                "indirect": [float(b_slx[j]), float(np.sqrt(V[j, j]))],
+                "total": [float(b_slx[i] + b_slx[j]), float(np.sqrt(V[i, i] + V[j, j] + 2 * V[i, j]))],
+            }
+        slx["by_bw"][f"{bw/1000:g}km"] = cell
+    slx["primary"] = slx["by_bw"][f"{HAC_BW_PRIMARY/1000:g}km"]
+    print(f"  SLX (Conley HAC {HAC_BW_PRIMARY/1000:g} km):  " + "  ".join(
+        f"{nm} β {c['direct'][0]:+.2f}(±{c['direct'][1]:.2f}) θ {c['indirect'][0]:+.2f}(±{c['indirect'][1]:.2f}) "
+        f"total {c['total'][0]:+.2f}(±{c['total'][1]:.2f})" for nm, c in slx["primary"].items()))
+    print("     SLX total SE by bandwidth:  " + "   ".join(
+        f"{nm} " + " / ".join(f"{bwk} {v[nm]['total'][1]:.2f}" for bwk, v in slx["by_bw"].items()) for nm in FOCAL))
+
+    tbl = {"OLS":aic_ols,"SLX(WX)":float(aic_slx),"SAR(lag)":aic_sar,"SEM(error)":aic_sem,"SDM(Durbin-lag)":aic_sdm,"SDEM(Durbin-err)":aic_sdem}
     best = min(tbl, key=tbl.get)
     print("  model AIC (lower=better):  " + "   ".join(f"{m} {v:.0f}" for m,v in tbl.items()))
-    print(f"  → selected by AIC: {best}")
+    print(f"  → AIC minimum: {best}; headline specification: SLX (stated rule, see module docstring)")
     rec = REPORT["outcomes"].setdefault(yname, {})
     rec["mean"] = float(df[yname].mean())
     rec["moran_i"] = float(ols.moran_res[0])
     rec["moran_p"] = float(ols.moran_res[2])
     rec["aic"] = {m: float(v) for m, v in tbl.items()}
-    rec["selected"] = best
+    rec["aic_best"] = best
+    rec["selected"] = "SLX"
+    rec["selection_rule"] = ("SLX by stated rule: R_i's spatial dependence is induced by overlapping walksheds "
+                             "(measurement), so no endogenous lag; local spillovers via WX; residual dependence "
+                             "handled by Conley HAC SEs. SAR/SDM/SDEM reported as robustness.")
+    rec["slx"] = slx
     rec["ols_conley"] = prim                      # primary bandwidth (read by make_tables.py)
     rec["ols_classical"] = hf["classical"]
     rec["ols_conley_by_bw"] = hf["hac"]
@@ -255,7 +314,11 @@ for label,terms in [("rung2 demo+land-use", DEMOS+LAND),
     med = "".join(f" | {k} {prim[k][0]:+.2f}(±{prim[k][1]:.2f})" for k in ("crime","311") if k in prim)
     bws = " ".join(f"{k} ±{v['%Hisp'][1]:.2f}" for k, v in hf["hac"].items())
     print(f"  {label:20s}: {parts}{med}   [%Hisp SE: iid ±{hf['classical']['%Hisp'][1]:.2f} {bws}]")
-    REPORT["ladder_hac"][label.split()[0]] = {"terms": names, **hf}
+    slx_l, _, _ = slx_fits(y, X, names, keep=FOCAL)
+    prim_s = slx_l[f"{HAC_BW_PRIMARY/1000:g}km"]
+    print(f"  {'':20s}  SLX total: " + " ".join(f"{nm} {prim_s[nm]['total'][0]:+.2f}(±{prim_s[nm]['total'][1]:.2f})" for nm in FOCAL)
+          + "   [%Hisp total SE: " + " ".join(f"{k} ±{v['%Hisp']['total'][1]:.2f}" for k, v in slx_l.items()) + "]")
+    REPORT["ladder_hac"][label.split()[0]] = {"terms": names, **hf, "slx": slx_l}
 print(f"\nN = {n} block groups. W = Queen contiguity (islands attached), row-standardised.")
 print(f"HAC = Kelejian-Prucha/Conley kernel (triangular; primary {HAC_BW_PRIMARY/1000:g} km, "
       f"also {', '.join(f'{b/1000:g}' for b in HAC_BWS)} km). Impacts = LeSage-Pace (SDM) / β,θ (SDEM).")

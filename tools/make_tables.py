@@ -579,19 +579,28 @@ def t_spatial() -> str:
     body += f"    Moran's $I$ of residuals & \\multicolumn{{3}}{{r}}{{{signed(R['moran_i'], 3)} ($p<0.001$)}} \\\\\n"
     aics = R["aic"]
     body += "    AIC & \\multicolumn{3}{r}{" + ", ".join(f"{m} {v:.0f}" for m, v in aics.items()) + "} \\\\\n"
-    body += f"    Selected & \\multicolumn{{3}}{{r}}{{{R['selected']}}} \\\\\n"
+    body += f"    AIC minimum & \\multicolumn{{3}}{{r}}{{{R.get('aic_best', R['selected'])}}} \\\\\n"
+    body += f"    Headline specification & \\multicolumn{{3}}{{r}}{{{R['selected']} (stated rule; see note)}} \\\\\n"
 
     body += "    \\midrule\n    \\multicolumn{4}{l}{\\emph{(b) Estimates, cameras per SD}} \\\\\n    \\midrule\n"
     body += "    & " + " & ".join(t for _, t in focals) + " \\\\\n"
+    slx = R.get("slx", {}).get("primary")
+    if slx:
+        for part, lbl in [("direct", "SLX direct ($\\beta$)"), ("indirect", "SLX neighbors ($\\theta$, $WX$)"), ("total", "SLX total ($\\beta+\\theta$)")]:
+            body += (
+                f"    {lbl}, Conley HAC SE & "
+                + " & ".join(f"{signed(slx[k][part][0])} ({se(slx[k][part][1])})" for k, _ in focals)
+                + " \\\\\n"
+            )
     conley = R["ols_conley"]
     body += (
-        "    OLS, Conley HAC SE & "
+        "    OLS (no $WX$), Conley HAC SE & "
         + " & ".join(f"{signed(conley[k][0])} ({se(conley[k][1])})" for k, _ in focals)
         + " \\\\\n"
     )
     imp = R.get("impacts", {})
     if imp:
-        for model, lbl in [("sdem", "SDEM total impact"), ("sdm", "SDM total impact")]:
+        for model, lbl in [("sdem", "SDEM total impact (robustness)"), ("sdm", "SDM total impact (robustness)")]:
             body += (
                 f"    {lbl} & "
                 + " & ".join(signed(imp[k][model][2]) if k in imp else "--" for k, _ in focals)
@@ -611,21 +620,25 @@ def t_spatial() -> str:
 
     note = (
         "Panel (a): $R_i$ is strongly spatially autocorrelated, so OLS standard errors are not "
-        "trustworthy. We fit the full ladder (OLS, spatial lag, spatial error, and both Durbin "
-        "variants) and select on AIC. Panel (b): the Conley HAC row uses a triangular kernel with a "
-        "2\\,km bandwidth, which requires no model of the spatial process; the impact rows are the "
-        "LeSage--Pace decomposition, in which the total impact includes the effect of a block group's "
-        "neighbors on itself. The spatial-lag models attribute much of the effect to the lag term "
-        "($\\rho$ near 0.9), which inflates the implied total; we report both and rely on the "
-        "AIC-selected error specification. Panel (c): re-estimating after aggregating upward gives "
-        "coefficients close to the block-group estimate, so the disparity is not an artifact of the "
-        "zoning we happened to choose."
+        "trustworthy. We fit OLS, SLX, spatial lag, spatial error, and both Durbin variants and report "
+        "AIC, but the headline specification is chosen by a stated rule, not by fit: $R_i$ counts "
+        "cameras in a 10-minute walkshed, and adjacent walksheds share cameras by construction, so the "
+        "dependence among neighboring $R_i$ is measurement structure rather than a causal ripple. An "
+        "endogenous lag reads that structure as spillover and multiplies every effect by "
+        "$1/(1-\\rho)\\approx 11$ at $\\rho\\approx 0.9$. SLX ($R = X\\beta + WX\\theta + \\varepsilon$) keeps "
+        "only local spillovers, its total effect is simply $\\beta+\\theta$, and the residual dependence "
+        "is left to the standard errors. Panel (b): all SEs are Conley HAC (triangular kernel, 2\\,km; "
+        "1 and 5\\,km in the JSON), which require no model of the spatial process. The SDEM and SDM "
+        "totals are LeSage--Pace decompositions shown for comparison; the SDM total carries the "
+        "$1/(1-\\rho)$ multiplier. Panel (c): re-estimating after aggregating upward gives coefficients "
+        "close to the block-group estimate, so the disparity is not an artifact of the zoning we "
+        "happened to choose."
     )
     return wrap(
         body,
         caption=(
-            "Spatial specification and scale. The disparity survives spatial inference and is stable "
-            "across aggregation scales."
+            "Spatial specification and scale. The placement disparity under local-spillover (SLX) "
+            "estimation with spatial HAC standard errors, and across aggregation scales."
         ),
         label="tab:spatial",
         colspec="lrrr",
@@ -649,7 +662,9 @@ def t_macros() -> str:
     det = load_json("detection_model")["detection_model"]
     sw = load_json("subway_sweep")
     pm = load_json("population_mixed")
-    spa = load_json("spatial_econometrics")["outcomes"]["R_i"]["ols_conley"]
+    spa_R = load_json("spatial_econometrics")["outcomes"]["R_i"]
+    spa = spa_R["ols_conley"]
+    slx = spa_R.get("slx", {}).get("primary", {})
     df = _table()
 
     R, A = ineq["R_i"], ineq["A_mnl"]
@@ -742,6 +757,16 @@ def t_macros() -> str:
         # spatial inference (joint demographic spec, NO crime controls -- app:spatial)
         "HispConley": signed(spa["%Hisp"][0]),
         "HispConleySE": se(spa["%Hisp"][1]),
+        # SLX headline (app:spatial): direct beta, neighbors' theta, total beta+theta, all Conley 2 km
+        "HispSLXDirect": signed(slx["%Hisp"]["direct"][0]) if slx else "",
+        "HispSLXDirectSE": se(slx["%Hisp"]["direct"][1]) if slx else "",
+        "HispSLXIndirect": signed(slx["%Hisp"]["indirect"][0]) if slx else "",
+        "HispSLXTotal": signed(slx["%Hisp"]["total"][0]) if slx else "",
+        "HispSLXTotalSE": se(slx["%Hisp"]["total"][1]) if slx else "",
+        "BlackSLXTotal": signed(slx["%Black"]["total"][0]) if slx else "",
+        "BlackSLXTotalSE": se(slx["%Black"]["total"][1]) if slx else "",
+        "IncomeSLXTotal": signed(slx["income"]["total"][0]) if slx else "",
+        "IncomeSLXTotalSE": se(slx["income"]["total"][1]) if slx else "",
         # detection model: is the undercount non-differential? (detection_model.json)
         "DetectN": f"{det['n_detections']:,}",
         "DetectPHisp": f"{det['terms']['hisp']['p']:.2f}",

@@ -10,6 +10,14 @@ confidence: high
 
 # Placement Bias Is Real, Racialized, and Robust
 
+> **Status 2026-09-24.** Inference below predates two fixes: the "Conley" SEs were iid SEs
+> until 2026-09-23 (true HAC SEs are ~3.5× larger), and the spatial headline moved to **SLX with
+> Conley HAC** on 2026-09-24 ([[spatial-econometrics]]). Current headline: `R_i` on %Hispanic,
+> SLX total **+12.22 (±2.82)**, t = 4.3 at 2 km / 3.8 at 5 km; %Black **+9.10 (±2.00)**; income
+> null. The total (rung 1) disparity also survives the PUMA wild cluster bootstrap (p = 0.006);
+> the crime+311-controlled rung does not (p = 0.18) — read the ladder as a descriptive
+> decomposition, not "survives every control". Sources: `docs/RELATED_METHODS.md` §5–§7, §10.
+
 Pop-weighted `R_i` (cameras per 10-min walkshed): Manhattan **101.7** ·
 Brooklyn **97.0** · Bronx **83.2** · Queens **63.6** · Staten Island **17.7**.
 Citywide **82.0**. The top decile of people holds **22.6%** of all exposure.
